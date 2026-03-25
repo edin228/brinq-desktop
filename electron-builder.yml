@@ -1,0 +1,40 @@
+appId: com.brinq.desktop
+productName: Brinq
+copyright: Copyright © 2026 Brinq
+
+directories:
+  output: dist
+
+files:
+  - src/**/*
+  - assets/**/*
+  - package.json
+
+win:
+  icon: assets/icon.ico
+  target:
+    - nsis
+  artifactName: Brinq-Setup-${version}.${ext}
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+mac:
+  icon: assets/icon.png
+  target:
+    - dmg
+  artifactName: Brinq-${version}.${ext}
+  category: public.app-category.productivity
+
+linux:
+  icon: assets/icon.png
+  target:
+    - AppImage
+  artifactName: Brinq-${version}.${ext}
+  category: Office
+
+publish:
+  provider: github
+  owner: edin228
+  repo: brinq-desktop
