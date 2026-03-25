@@ -257,10 +257,18 @@ function createWindow() {
 // Tray
 // ---------------------------------------------------------------------------
 function createTray() {
+  // Windows needs ICO or a properly sized PNG; macOS/Linux use PNG
+  const iconFile =
+    process.platform === 'win32' ? 'icon.ico' : 'tray-icon.png'
   const trayIcon = nativeImage.createFromPath(
-    path.join(__dirname, '../assets/tray-icon.png'),
+    path.join(__dirname, '../assets/', iconFile),
   )
-  tray = new Tray(trayIcon)
+  // Resize for tray (16x16 on Windows, 22x22 on macOS/Linux)
+  const resized =
+    process.platform === 'win32'
+      ? trayIcon.resize({ width: 16, height: 16 })
+      : trayIcon
+  tray = new Tray(resized)
   tray.setToolTip('Brinq Mail')
 
   updateTrayMenu()
