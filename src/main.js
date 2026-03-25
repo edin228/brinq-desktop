@@ -12,6 +12,11 @@ const path = require('path')
 const { autoUpdater } = require('electron-updater')
 const config = require('./config')
 
+// Enable GPU acceleration for backdrop-filter, smooth animations, and compositing
+app.commandLine.appendSwitch('enable-gpu-rasterization')
+app.commandLine.appendSwitch('enable-zero-copy')
+app.commandLine.appendSwitch('enable-features', 'BackdropFilter')
+
 const PRELOAD_PATH = path.join(__dirname, 'preload.js')
 const BASE_URL = config.getBaseUrl()
 const BASE_ORIGIN = new URL(BASE_URL).origin
@@ -171,11 +176,18 @@ function createWindow() {
     y: bounds.y,
     autoHideMenuBar: true,
     icon: path.join(__dirname, '../assets/icon.png'),
+    backgroundColor: '#0a0a0f',
+    show: false,
     webPreferences: {
       preload: PRELOAD_PATH,
       contextIsolation: true,
       nodeIntegration: false,
     },
+  })
+
+  // Show window once content is ready (avoids white flash)
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show()
   })
 
   mainWindow.loadURL(getModeUrl())
