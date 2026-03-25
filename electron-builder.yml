@@ -14,7 +14,7 @@ win:
   icon: assets/icon.ico
   target:
     - nsis
-  artifactName: Brinq-Setup-${version}.${ext}
+  artifactName: Brinq-Setup.${ext}
 
 nsis:
   oneClick: false
