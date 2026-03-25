@@ -12,7 +12,12 @@ const path = require('path')
 const { autoUpdater } = require('electron-updater')
 const config = require('./config')
 
-// Enable GPU acceleration for backdrop-filter, smooth animations, and compositing
+// GPU / rendering flags
+// --ignore-gpu-blocklist: force GPU compositing even on blocklisted drivers
+//   (fixes backdrop-filter, smooth animations on most systems)
+// --enable-features=BackdropFilter: explicitly enable CSS backdrop-filter
+// Falls back to software rendering gracefully if GPU still fails
+app.commandLine.appendSwitch('ignore-gpu-blocklist')
 app.commandLine.appendSwitch('enable-gpu-rasterization')
 app.commandLine.appendSwitch('enable-zero-copy')
 app.commandLine.appendSwitch('enable-features', 'BackdropFilter')
@@ -413,10 +418,13 @@ app.on('ready', () => {
   if (protocolArg) handleProtocolUrl(protocolArg)
 
   // Auto-update: check silently on launch, download in background
-  autoUpdater.logger = require('electron-log')
-  autoUpdater.autoDownload = true
-  autoUpdater.autoInstallOnAppQuit = true
-  autoUpdater.checkForUpdatesAndNotify().catch(() => {})
+  // Skip in dev mode — no packaged app to update
+  if (process.env.NODE_ENV !== 'development') {
+    autoUpdater.logger = require('electron-log')
+    autoUpdater.autoDownload = true
+    autoUpdater.autoInstallOnAppQuit = true
+    autoUpdater.checkForUpdatesAndNotify().catch(() => {})
+  }
 })
 
 // macOS: re-show window when dock icon clicked
