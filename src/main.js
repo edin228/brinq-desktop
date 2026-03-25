@@ -376,6 +376,14 @@ ipcMain.on('notify', (event, title, body, data) => {
   notif.show()
 })
 
+ipcMain.on('set-mode', (event, mode) => {
+  if (!validateSender(event)) return
+  if (mode === 'email' || mode === 'full') {
+    config.setMode(mode)
+    updateTrayMenu()
+  }
+})
+
 ipcMain.on('badge-count', (event, count) => {
   if (!validateSender(event)) return
   const n =

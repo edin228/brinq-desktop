@@ -5,6 +5,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   setBadgeCount: (count) => ipcRenderer.send('badge-count', count),
 
+  setMode: (mode) => ipcRenderer.send('set-mode', mode),
+
   onNavigateEmail: (callback) => {
     const handler = (_, uid) => callback(uid)
     ipcRenderer.on('navigate-email', handler)
