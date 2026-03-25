@@ -9,6 +9,7 @@ const {
   nativeImage,
 } = require('electron')
 const path = require('path')
+const { autoUpdater } = require('electron-updater')
 const config = require('./config')
 
 const PRELOAD_PATH = path.join(__dirname, 'preload.js')
@@ -390,6 +391,12 @@ app.on('ready', () => {
     (a) => a.startsWith('mailto:') || a.startsWith('brinq:'),
   )
   if (protocolArg) handleProtocolUrl(protocolArg)
+
+  // Auto-update: check silently on launch, download in background
+  autoUpdater.logger = require('electron-log')
+  autoUpdater.autoDownload = true
+  autoUpdater.autoInstallOnAppQuit = true
+  autoUpdater.checkForUpdatesAndNotify().catch(() => {})
 })
 
 // macOS: re-show window when dock icon clicked
