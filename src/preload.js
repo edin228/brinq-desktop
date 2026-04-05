@@ -19,10 +19,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('mailto', handler)
   },
 
-  // EML file viewer — async IPC bridges
+  // EML file viewer — static IPC channels with viewerId as argument
   getFileEmail: (viewerId) =>
-    ipcRenderer.invoke(`get-file-email-${viewerId}`),
+    ipcRenderer.invoke('get-file-email', viewerId),
 
   saveFileAttachment: (viewerId, attachmentIndex) =>
-    ipcRenderer.invoke(`save-file-attachment-${viewerId}`, attachmentIndex),
+    ipcRenderer.invoke('save-file-attachment', viewerId, attachmentIndex),
 })

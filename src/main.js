@@ -35,6 +35,7 @@ let rendererReady = false
 // EML File Viewer — in-memory store and parser
 // ---------------------------------------------------------------------------
 const MAX_EML_BYTES = 25 * 1024 * 1024
+const MAX_CONCURRENT_VIEWERS = 10
 const fileViewerStore = new Map()
 
 function sanitizeDownloadName(filename, index) {
@@ -114,13 +115,83 @@ function isAllowedExternalUrl(url) {
 }
 
 // ---------------------------------------------------------------------------
+// EML File Viewer — static IPC handlers (registered once at startup)
+// ---------------------------------------------------------------------------
+ipcMain.handle('get-file-email', (event, viewerId) => {
+  if (
+    typeof viewerId !== 'string' ||
+    !validateFileViewerSender(event, viewerId)
+  )
+    return null
+  return fileViewerStore.get(viewerId)?.metadata || null
+})
+
+ipcMain.handle(
+  'save-file-attachment',
+  async (event, viewerId, attachmentIndex) => {
+    if (
+      typeof viewerId !== 'string' ||
+      !validateFileViewerSender(event, viewerId)
+    ) {
+      return { ok: false, canceled: false, error: 'Unauthorized sender.' }
+    }
+
+    if (
+      typeof attachmentIndex !== 'number' ||
+      !Number.isInteger(attachmentIndex) ||
+      attachmentIndex < 0
+    ) {
+      return { ok: false, canceled: false, error: 'Invalid attachment index.' }
+    }
+
+    const stored = fileViewerStore.get(viewerId)
+    const att = stored?.rawAttachments?.[attachmentIndex]
+    if (!att) {
+      return { ok: false, canceled: false, error: 'Attachment not found.' }
+    }
+
+    const viewer = BrowserWindow.fromWebContents(event.sender)
+    if (!viewer || viewer.isDestroyed()) {
+      return { ok: false, canceled: false, error: 'Viewer window closed.' }
+    }
+
+    const { canceled, filePath: savePath } = await dialog.showSaveDialog(
+      viewer,
+      {
+        defaultPath: sanitizeDownloadName(att.filename, attachmentIndex),
+      },
+    )
+    if (canceled || !savePath) {
+      return { ok: false, canceled: true }
+    }
+
+    try {
+      await fs.promises.writeFile(savePath, att.content)
+      return { ok: true, canceled: false }
+    } catch (err) {
+      return {
+        ok: false,
+        canceled: false,
+        error: err?.message || 'Failed to save attachment.',
+      }
+    }
+  },
+)
+
+// ---------------------------------------------------------------------------
 // EML File Viewer — open file in popup window
 // ---------------------------------------------------------------------------
 async function openEmailFile(filePath) {
+  if (fileViewerStore.size >= MAX_CONCURRENT_VIEWERS) {
+    dialog.showErrorBox(
+      'Too many viewers open',
+      `Please close some email viewer windows first (max ${MAX_CONCURRENT_VIEWERS}).`,
+    )
+    return
+  }
+
   let viewer = null
   let viewerId = null
-  let getChannel = null
-  let saveChannel = null
 
   try {
     const result = await parseEmailFile(filePath)
@@ -144,47 +215,6 @@ async function openEmailFile(filePath) {
     fileViewerStore.set(viewerId, {
       ...result,
       windowId: viewer.webContents.id,
-    })
-
-    // Register IPC handlers BEFORE loadURL to prevent race with renderer mount
-    getChannel = `get-file-email-${viewerId}`
-    ipcMain.handle(getChannel, (event) => {
-      if (!validateFileViewerSender(event, viewerId)) return null
-      return fileViewerStore.get(viewerId)?.metadata || null
-    })
-
-    saveChannel = `save-file-attachment-${viewerId}`
-    ipcMain.handle(saveChannel, async (event, attachmentIndex) => {
-      if (!validateFileViewerSender(event, viewerId)) {
-        return { ok: false, canceled: false, error: 'Unauthorized sender.' }
-      }
-
-      const stored = fileViewerStore.get(viewerId)
-      const att = stored?.rawAttachments?.[attachmentIndex]
-      if (!att) {
-        return { ok: false, canceled: false, error: 'Attachment not found.' }
-      }
-
-      const { canceled, filePath: savePath } = await dialog.showSaveDialog(
-        viewer,
-        {
-          defaultPath: sanitizeDownloadName(att.filename, attachmentIndex),
-        },
-      )
-      if (canceled || !savePath) {
-        return { ok: false, canceled: true }
-      }
-
-      try {
-        await fs.promises.writeFile(savePath, att.content)
-        return { ok: true, canceled: false }
-      } catch (err) {
-        return {
-          ok: false,
-          canceled: false,
-          error: err?.message || 'Failed to save attachment.',
-        }
-      }
     })
 
     viewer.once('ready-to-show', () => viewer.show())
@@ -226,19 +256,11 @@ async function openEmailFile(filePath) {
 
     viewer.once('closed', () => {
       fileViewerStore.delete(viewerId)
-      ipcMain.removeHandler(getChannel)
-      ipcMain.removeHandler(saveChannel)
       maybeQuitAfterFileViewerClose()
     })
   } catch (err) {
-    if (viewerId) {
-      fileViewerStore.delete(viewerId)
-      if (getChannel) ipcMain.removeHandler(getChannel)
-      if (saveChannel) ipcMain.removeHandler(saveChannel)
-    }
-    if (viewer && !viewer.isDestroyed()) {
-      viewer.destroy()
-    }
+    if (viewerId) fileViewerStore.delete(viewerId)
+    if (viewer && !viewer.isDestroyed()) viewer.destroy()
     dialog.showErrorBox(
       'Could not open email file',
       err.message || 'Unknown error.',
