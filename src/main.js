@@ -533,8 +533,10 @@ async function openEmailFile(filePath) {
       }
     })
 
-    // Block ALL navigation — loadURL is a top-level load and does not trigger will-navigate
+    const viewerUrl = `${BASE_URL}/email/file-viewer?viewerId=${viewerId}`
     viewer.webContents.on('will-navigate', (event, url) => {
+      // Allow same-page navigation (Next.js client-side routing during load)
+      if (url.startsWith(viewerUrl) || url === viewerUrl) return
       event.preventDefault()
       if (isAllowedExternalUrl(url)) {
         shell.openExternal(url)
@@ -548,9 +550,10 @@ async function openEmailFile(filePath) {
       return { action: 'deny' }
     })
 
-    await viewer.loadURL(
-      `${BASE_URL}/email/file-viewer?viewerId=${viewerId}`,
-    )
+    viewer.loadURL(viewerUrl).catch(() => {
+      // loadURL can reject on subresource failures (fonts, favicons, API 401s)
+      // even though the page itself renders fine — ignore these
+    })
 
     viewer.once('closed', () => {
       fileViewerStore.delete(viewerId)
