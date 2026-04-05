@@ -515,7 +515,11 @@ async function openEmailFile(filePath) {
     pendingViewerCount--
     registered = true
 
-    viewer.once('ready-to-show', () => viewer.show())
+    let viewerRendered = false
+    viewer.once('ready-to-show', () => {
+      viewerRendered = true
+      viewer.show()
+    })
 
     // Keyboard shortcuts for document viewer
     viewer.webContents.on('before-input-event', (event, input) => {
@@ -534,11 +538,6 @@ async function openEmailFile(filePath) {
     })
 
     const viewerUrl = `${BASE_URL}/email/file-viewer?viewerId=${viewerId}`
-    let mainFrameLoaded = false
-
-    viewer.webContents.on('did-finish-load', () => {
-      mainFrameLoaded = true
-    })
 
     viewer.webContents.on('will-navigate', (event, url) => {
       if (url === viewerUrl) return
@@ -558,14 +557,14 @@ async function openEmailFile(filePath) {
     try {
       await viewer.loadURL(viewerUrl)
     } catch (loadErr) {
-      // loadURL rejects on any did-fail-load, including ERR_ABORTED (-3)
-      // from will-navigate blocking a post-render redirect. Only suppress
-      // if the main frame already loaded AND the error is the specific abort.
+      // loadURL rejects on did-fail-load. Suppress only when BOTH:
+      // 1. ready-to-show already fired (page painted and shown to user)
+      // 2. error is ERR_ABORTED (-3) from will-navigate blocking a redirect
       const isAbort =
         loadErr &&
         (String(loadErr.message || '').includes('ERR_ABORTED') ||
           String(loadErr.code) === '-3')
-      if (!(mainFrameLoaded && isAbort)) throw loadErr
+      if (!(viewerRendered && isAbort)) throw loadErr
     }
 
     viewer.once('closed', () => {
