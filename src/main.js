@@ -458,6 +458,7 @@ function handleProtocolUrl(url) {
   if (url.startsWith('mailto:')) {
     const data = parseMailtoUrl(url)
     if (mainWindow) {
+      launchedForFileViewerOnly = false
       mainWindow.show()
       mainWindow.focus()
     }
@@ -467,6 +468,7 @@ function handleProtocolUrl(url) {
     queuePayload({ type: 'mailto', data })
   } else if (url.startsWith('brinq:')) {
     if (mainWindow) {
+      launchedForFileViewerOnly = false
       mainWindow.show()
       mainWindow.focus()
     }
@@ -666,6 +668,7 @@ ipcMain.on('notify', (event, title, body, data) => {
     icon: path.join(__dirname, '../assets/icon.png'),
   })
   notif.on('click', () => {
+    launchedForFileViewerOnly = false
     mainWindow.show()
     mainWindow.focus()
     if (data?.uid && typeof data.uid === 'string') {
