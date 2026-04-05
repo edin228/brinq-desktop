@@ -25,4 +25,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   saveFileAttachment: (viewerId, attachmentIndex) =>
     ipcRenderer.invoke('save-file-attachment', viewerId, attachmentIndex),
+
+  openFileAttachment: (viewerId, attachmentIndex) =>
+    ipcRenderer.invoke('open-file-attachment', viewerId, attachmentIndex),
 })

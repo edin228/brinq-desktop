@@ -376,6 +376,47 @@ ipcMain.handle(
   },
 )
 
+ipcMain.handle(
+  'open-file-attachment',
+  async (event, viewerId, attachmentIndex) => {
+    if (
+      typeof viewerId !== 'string' ||
+      !validateFileViewerSender(event, viewerId)
+    ) {
+      return { ok: false, error: 'Unauthorized sender.' }
+    }
+
+    if (
+      typeof attachmentIndex !== 'number' ||
+      !Number.isInteger(attachmentIndex) ||
+      attachmentIndex < 0
+    ) {
+      return { ok: false, error: 'Invalid attachment index.' }
+    }
+
+    const stored = fileViewerStore.get(viewerId)
+    const att = stored?.rawAttachments?.[attachmentIndex]
+    if (!att) {
+      return { ok: false, error: 'Attachment not found.' }
+    }
+
+    const tempDir = path.join(app.getPath('temp'), 'brinq-viewer')
+    try {
+      await fs.promises.mkdir(tempDir, { recursive: true })
+      const safeName = sanitizeDownloadName(att.filename, attachmentIndex)
+      const tempPath = path.join(tempDir, `${Date.now()}-${safeName}`)
+      await fs.promises.writeFile(tempPath, att.content)
+      const errorMessage = await shell.openPath(tempPath)
+      if (errorMessage) {
+        return { ok: false, error: errorMessage }
+      }
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, error: err?.message || 'Failed to open attachment.' }
+    }
+  },
+)
+
 // ---------------------------------------------------------------------------
 // EML File Viewer — open file in popup window
 // ---------------------------------------------------------------------------
