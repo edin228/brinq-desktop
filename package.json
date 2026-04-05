@@ -1,7 +1,7 @@
 {
   "name": "brinq-desktop",
   "version": "1.2.3",
-  "description": "Brinq Desktop — email client and full app wrapper",
+  "description": "Brinq",
   "main": "src/main.js",
   "scripts": {
     "dev": "NODE_ENV=development electron .",
