@@ -550,10 +550,18 @@ async function openEmailFile(filePath) {
       return { action: 'deny' }
     })
 
-    viewer.loadURL(viewerUrl).catch(() => {
-      // loadURL can reject on subresource failures (fonts, favicons, API 401s)
-      // even though the page itself renders fine — ignore these
-    })
+    try {
+      await viewer.loadURL(viewerUrl)
+    } catch (loadErr) {
+      // loadURL rejects on did-fail-load, which can include ERR_ABORTED (-3)
+      // when will-navigate blocks a post-render redirect (e.g. Next.js auth check).
+      // If the viewer is alive and has the correct URL, the page rendered fine.
+      const loaded =
+        viewer &&
+        !viewer.isDestroyed() &&
+        viewer.webContents.getURL().startsWith(BASE_URL + '/email/file-viewer')
+      if (!loaded) throw loadErr
+    }
 
     viewer.once('closed', () => {
       fileViewerStore.delete(viewerId)
