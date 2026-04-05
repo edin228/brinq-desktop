@@ -380,7 +380,7 @@ ipcMain.handle(
 const SAFE_OPEN_EXTENSIONS = new Set([
   '.pdf',
   '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff',
-  '.txt', '.csv',
+  '.txt',
 ])
 
 const BRINQ_TEMP_DIR = path.join(app.getPath('temp'), 'brinq-viewer')
@@ -390,14 +390,21 @@ function cleanupTempDir() {
   fs.rm(BRINQ_TEMP_DIR, { recursive: true, force: true }, () => {})
 }
 
+function retryUnlink(filePath, attemptsLeft) {
+  fs.unlink(filePath, (err) => {
+    if (!err || attemptsLeft <= 1) return
+    setTimeout(() => retryUnlink(filePath, attemptsLeft - 1), 15000)
+  })
+}
+
 function cleanupViewerTempFiles(viewerId) {
   const files = viewerTempFiles.get(viewerId)
   if (!files) return
   viewerTempFiles.delete(viewerId)
-  // Best-effort delayed cleanup — external app may still have the file open
+  // Retry up to 4 times over ~1 minute (5s + 15s + 15s + 15s)
   setTimeout(() => {
     for (const tempPath of files) {
-      fs.unlink(tempPath, () => {})
+      retryUnlink(tempPath, 4)
     }
   }, 5000)
 }
