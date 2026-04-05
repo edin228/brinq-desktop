@@ -376,6 +376,20 @@ ipcMain.handle(
   },
 )
 
+const SAFE_OPEN_EXTENSIONS = new Set([
+  '.pdf', '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg',
+  '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  '.txt', '.csv', '.rtf', '.htm', '.html',
+  '.mp3', '.mp4', '.wav', '.avi', '.mov', '.mkv',
+  '.zip', '.7z', '.rar',
+])
+
+const BRINQ_TEMP_DIR = path.join(app.getPath('temp'), 'brinq-viewer')
+
+function cleanupTempDir() {
+  fs.rm(BRINQ_TEMP_DIR, { recursive: true, force: true }, () => {})
+}
+
 ipcMain.handle(
   'open-file-attachment',
   async (event, viewerId, attachmentIndex) => {
@@ -383,7 +397,7 @@ ipcMain.handle(
       typeof viewerId !== 'string' ||
       !validateFileViewerSender(event, viewerId)
     ) {
-      return { ok: false, error: 'Unauthorized sender.' }
+      return { ok: false, error: 'Unauthorized sender.', unsafe: false }
     }
 
     if (
@@ -391,28 +405,41 @@ ipcMain.handle(
       !Number.isInteger(attachmentIndex) ||
       attachmentIndex < 0
     ) {
-      return { ok: false, error: 'Invalid attachment index.' }
+      return { ok: false, error: 'Invalid attachment index.', unsafe: false }
     }
 
     const stored = fileViewerStore.get(viewerId)
     const att = stored?.rawAttachments?.[attachmentIndex]
     if (!att) {
-      return { ok: false, error: 'Attachment not found.' }
+      return { ok: false, error: 'Attachment not found.', unsafe: false }
     }
 
-    const tempDir = path.join(app.getPath('temp'), 'brinq-viewer')
+    const safeName = sanitizeDownloadName(att.filename, attachmentIndex)
+    const ext = path.extname(safeName).toLowerCase()
+
+    if (!SAFE_OPEN_EXTENSIONS.has(ext)) {
+      return {
+        ok: false,
+        unsafe: true,
+        error: `Cannot open .${ext.slice(1)} files directly. Use "Save As" instead.`,
+      }
+    }
+
     try {
-      await fs.promises.mkdir(tempDir, { recursive: true })
-      const safeName = sanitizeDownloadName(att.filename, attachmentIndex)
-      const tempPath = path.join(tempDir, `${Date.now()}-${safeName}`)
+      await fs.promises.mkdir(BRINQ_TEMP_DIR, { recursive: true })
+      const tempPath = path.join(BRINQ_TEMP_DIR, `${Date.now()}-${safeName}`)
       await fs.promises.writeFile(tempPath, att.content)
       const errorMessage = await shell.openPath(tempPath)
       if (errorMessage) {
-        return { ok: false, error: errorMessage }
+        return { ok: false, error: errorMessage, unsafe: false }
       }
       return { ok: true }
     } catch (err) {
-      return { ok: false, error: err?.message || 'Failed to open attachment.' }
+      return {
+        ok: false,
+        unsafe: false,
+        error: err?.message || 'Failed to open attachment.',
+      }
     }
   },
 )
@@ -965,6 +992,7 @@ function clearBadge() {
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.on('ready', () => {
+  cleanupTempDir()
   createWindow({ showOnReady: !launchedForFileViewerOnly })
   createTray()
 
