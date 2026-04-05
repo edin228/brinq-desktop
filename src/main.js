@@ -515,11 +515,7 @@ async function openEmailFile(filePath) {
     pendingViewerCount--
     registered = true
 
-    let viewerRendered = false
-    viewer.once('ready-to-show', () => {
-      viewerRendered = true
-      viewer.show()
-    })
+    viewer.once('ready-to-show', () => viewer.show())
 
     // Keyboard shortcuts for document viewer
     viewer.webContents.on('before-input-event', (event, input) => {
@@ -557,14 +553,16 @@ async function openEmailFile(filePath) {
     try {
       await viewer.loadURL(viewerUrl)
     } catch (loadErr) {
-      // loadURL rejects on did-fail-load. Suppress only when BOTH:
-      // 1. ready-to-show already fired (page painted and shown to user)
-      // 2. error is ERR_ABORTED (-3) from will-navigate blocking a redirect
+      // ERR_ABORTED (-3) means our will-navigate handler blocked a navigation.
+      // This can only happen AFTER the page's JavaScript ran (triggering the
+      // redirect we blocked), so the page loaded successfully. Non-abort errors
+      // (ERR_CONNECTION_REFUSED, ERR_NAME_NOT_RESOLVED, etc.) indicate real
+      // failures where the page never loaded.
       const isAbort =
         loadErr &&
         (String(loadErr.message || '').includes('ERR_ABORTED') ||
           String(loadErr.code) === '-3')
-      if (!(viewerRendered && isAbort)) throw loadErr
+      if (!isAbort) throw loadErr
     }
 
     viewer.once('closed', () => {
