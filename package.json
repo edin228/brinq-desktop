@@ -1,6 +1,6 @@
 {
   "name": "brinq-desktop",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Brinq Desktop — email client and full app wrapper",
   "main": "src/main.js",
   "scripts": {
