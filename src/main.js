@@ -376,11 +376,12 @@ ipcMain.handle(
   },
 )
 
-// Only truly inert formats — no active content, no macros, no script execution
+// Formats safe for direct open — passive renderers or Office Protected View
 const SAFE_OPEN_EXTENSIONS = new Set([
   '.pdf',
   '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff',
-  '.txt',
+  '.txt', '.csv',
+  '.docx', '.xlsx', '.pptx',
 ])
 
 const BRINQ_TEMP_DIR = path.join(app.getPath('temp'), 'brinq-viewer')
