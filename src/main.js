@@ -38,6 +38,7 @@ const MAX_EML_BYTES = 25 * 1024 * 1024
 const MAX_CONCURRENT_VIEWERS = 10
 const fileViewerStore = new Map()
 let pendingViewerCount = 0
+let viewerCapErrorShown = false
 
 function sanitizeDownloadName(filename, index) {
   const base = path.basename(filename || `attachment-${index}`)
@@ -184,10 +185,14 @@ ipcMain.handle(
 // ---------------------------------------------------------------------------
 async function openEmailFile(filePath) {
   if (fileViewerStore.size + pendingViewerCount >= MAX_CONCURRENT_VIEWERS) {
-    dialog.showErrorBox(
-      'Too many viewers open',
-      `Please close some email viewer windows first (max ${MAX_CONCURRENT_VIEWERS}).`,
-    )
+    if (!viewerCapErrorShown) {
+      viewerCapErrorShown = true
+      dialog.showErrorBox(
+        'Too many viewers open',
+        `Please close some email viewer windows first (max ${MAX_CONCURRENT_VIEWERS}).`,
+      )
+      process.nextTick(() => { viewerCapErrorShown = false })
+    }
     return
   }
 
