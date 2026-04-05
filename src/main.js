@@ -7,16 +7,16 @@ const {
   ipcMain,
   shell,
   nativeImage,
+  dialog,
 } = require('electron')
+const { randomUUID } = require('crypto')
+const fs = require('fs')
 const path = require('path')
 const { autoUpdater } = require('electron-updater')
+const { simpleParser } = require('mailparser')
 const config = require('./config')
 
 // GPU / rendering flags
-// --ignore-gpu-blocklist: force GPU compositing even on blocklisted drivers
-//   (fixes backdrop-filter, smooth animations on most systems)
-// --enable-features=BackdropFilter: explicitly enable CSS backdrop-filter
-// Falls back to software rendering gracefully if GPU still fails
 app.commandLine.appendSwitch('ignore-gpu-blocklist')
 app.commandLine.appendSwitch('enable-gpu-rasterization')
 app.commandLine.appendSwitch('enable-zero-copy')
@@ -28,8 +28,282 @@ const BASE_ORIGIN = new URL(BASE_URL).origin
 
 let mainWindow = null
 let tray = null
-let pendingPayloads = [] // FIFO queue for protocol/notification intents during startup
-let rendererReady = false // true once BrowserWindow is on /emails and authenticated
+let pendingPayloads = []
+let rendererReady = false
+
+// ---------------------------------------------------------------------------
+// EML File Viewer — in-memory store and parser
+// ---------------------------------------------------------------------------
+const MAX_EML_BYTES = 25 * 1024 * 1024
+const fileViewerStore = new Map()
+
+function sanitizeDownloadName(filename, index) {
+  const base = path.basename(filename || `attachment-${index}`)
+  return base.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_') || `attachment-${index}`
+}
+
+function escapeHtml(text = '') {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+async function parseEmailFile(filePath) {
+  const stats = await fs.promises.stat(filePath)
+  if (!stats.isFile()) throw new Error('Selected path is not a file.')
+  if (stats.size > MAX_EML_BYTES) {
+    throw new Error(
+      `Email file exceeds ${MAX_EML_BYTES / (1024 * 1024)} MB limit.`,
+    )
+  }
+
+  const buffer = await fs.promises.readFile(filePath)
+  let parsed
+  try {
+    parsed = await simpleParser(buffer)
+  } catch {
+    throw new Error(
+      'This email file could not be parsed. It may be malformed or use an unsupported format.',
+    )
+  }
+
+  const attachments = (parsed.attachments || []).map((a, index) => ({
+    index,
+    filename: sanitizeDownloadName(a.filename, index),
+    size: a.size || 0,
+    contentType: a.contentType || 'application/octet-stream',
+  }))
+
+  return {
+    metadata: {
+      subject: parsed.subject || '(No Subject)',
+      from: parsed.from?.value || [],
+      to: parsed.to?.value || [],
+      cc: parsed.cc?.value || [],
+      bcc: parsed.bcc?.value || [],
+      date: parsed.date?.toISOString() || null,
+      bodyHtml:
+        parsed.html ||
+        parsed.textAsHtml ||
+        `<pre>${escapeHtml(parsed.text || '')}</pre>`,
+      text: parsed.text || '',
+      attachments,
+    },
+    rawAttachments: parsed.attachments || [],
+  }
+}
+
+// ---------------------------------------------------------------------------
+// EML File Viewer — IPC validation and URL helpers
+// ---------------------------------------------------------------------------
+function validateFileViewerSender(event, viewerId) {
+  if (!validateSender(event)) return false
+  const stored = fileViewerStore.get(viewerId)
+  return !!stored && event.sender.id === stored.windowId
+}
+
+function isAllowedExternalUrl(url) {
+  try {
+    const parsed = new URL(url)
+    return ['http:', 'https:', 'mailto:', 'tel:'].includes(parsed.protocol)
+  } catch {
+    return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// EML File Viewer — open file in popup window
+// ---------------------------------------------------------------------------
+async function openEmailFile(filePath) {
+  let viewer = null
+  let viewerId = null
+  let getChannel = null
+  let saveChannel = null
+
+  try {
+    const result = await parseEmailFile(filePath)
+    viewerId = randomUUID()
+
+    viewer = new BrowserWindow({
+      width: 1100,
+      height: 700,
+      title: result.metadata.subject,
+      autoHideMenuBar: true,
+      icon: path.join(__dirname, '../assets/icon.png'),
+      backgroundColor: '#0a0a0f',
+      show: false,
+      webPreferences: {
+        preload: PRELOAD_PATH,
+        contextIsolation: true,
+        nodeIntegration: false,
+      },
+    })
+
+    fileViewerStore.set(viewerId, {
+      ...result,
+      windowId: viewer.webContents.id,
+    })
+
+    // Register IPC handlers BEFORE loadURL to prevent race with renderer mount
+    getChannel = `get-file-email-${viewerId}`
+    ipcMain.handle(getChannel, (event) => {
+      if (!validateFileViewerSender(event, viewerId)) return null
+      return fileViewerStore.get(viewerId)?.metadata || null
+    })
+
+    saveChannel = `save-file-attachment-${viewerId}`
+    ipcMain.handle(saveChannel, async (event, attachmentIndex) => {
+      if (!validateFileViewerSender(event, viewerId)) {
+        return { ok: false, canceled: false, error: 'Unauthorized sender.' }
+      }
+
+      const stored = fileViewerStore.get(viewerId)
+      const att = stored?.rawAttachments?.[attachmentIndex]
+      if (!att) {
+        return { ok: false, canceled: false, error: 'Attachment not found.' }
+      }
+
+      const { canceled, filePath: savePath } = await dialog.showSaveDialog(
+        viewer,
+        {
+          defaultPath: sanitizeDownloadName(att.filename, attachmentIndex),
+        },
+      )
+      if (canceled || !savePath) {
+        return { ok: false, canceled: true }
+      }
+
+      try {
+        await fs.promises.writeFile(savePath, att.content)
+        return { ok: true, canceled: false }
+      } catch (err) {
+        return {
+          ok: false,
+          canceled: false,
+          error: err?.message || 'Failed to save attachment.',
+        }
+      }
+    })
+
+    viewer.once('ready-to-show', () => viewer.show())
+
+    // Keyboard shortcuts for document viewer
+    viewer.webContents.on('before-input-event', (event, input) => {
+      if (input.type !== 'keyDown') return
+      const isAccel = input.control || input.meta
+      if (!isAccel) return
+
+      const key = input.key.toLowerCase()
+      if (key === 'w') {
+        event.preventDefault()
+        viewer.close()
+      } else if (key === 'p') {
+        event.preventDefault()
+        viewer.webContents.print()
+      }
+    })
+
+    // Block ALL navigation — loadURL is a top-level load and does not trigger will-navigate
+    viewer.webContents.on('will-navigate', (event, url) => {
+      event.preventDefault()
+      if (isAllowedExternalUrl(url)) {
+        shell.openExternal(url)
+      }
+    })
+
+    viewer.webContents.setWindowOpenHandler(({ url }) => {
+      if (isAllowedExternalUrl(url)) {
+        shell.openExternal(url)
+      }
+      return { action: 'deny' }
+    })
+
+    await viewer.loadURL(
+      `${BASE_URL}/email/file-viewer?viewerId=${viewerId}`,
+    )
+
+    viewer.once('closed', () => {
+      fileViewerStore.delete(viewerId)
+      ipcMain.removeHandler(getChannel)
+      ipcMain.removeHandler(saveChannel)
+      maybeQuitAfterFileViewerClose()
+    })
+  } catch (err) {
+    if (viewerId) {
+      fileViewerStore.delete(viewerId)
+      if (getChannel) ipcMain.removeHandler(getChannel)
+      if (saveChannel) ipcMain.removeHandler(saveChannel)
+    }
+    if (viewer && !viewer.isDestroyed()) {
+      viewer.destroy()
+    }
+    dialog.showErrorBox(
+      'Could not open email file',
+      err.message || 'Unknown error.',
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// EML File Viewer — OS file-open event wiring
+// ---------------------------------------------------------------------------
+const pendingEmailFiles = []
+const pendingEmailFileSet = new Set()
+let launchedForFileViewerOnly = false
+
+function normalizeEmailFilePath(candidate) {
+  if (!candidate || typeof candidate !== 'string') return null
+  const resolved = path.resolve(candidate)
+  if (path.extname(resolved).toLowerCase() !== '.eml') return null
+  try {
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile())
+      return null
+  } catch {
+    return null
+  }
+  return resolved
+}
+
+function extractEmailFilesFromArgv(argv) {
+  return [...new Set(argv.map(normalizeEmailFilePath).filter(Boolean))]
+}
+
+function queueEmailFiles(filePaths) {
+  for (const filePath of filePaths) {
+    if (pendingEmailFileSet.has(filePath)) continue
+    pendingEmailFileSet.add(filePath)
+    pendingEmailFiles.push(filePath)
+  }
+}
+
+function maybeQuitAfterFileViewerClose() {
+  if (!launchedForFileViewerOnly) return
+  if (fileViewerStore.size > 0) return
+  if (mainWindow && mainWindow.isVisible()) return
+  app.quit()
+}
+
+// Check for .eml file paths in argv before app is ready
+const startupFiles = extractEmailFilesFromArgv(process.argv)
+if (startupFiles.length > 0) {
+  launchedForFileViewerOnly = true
+  queueEmailFiles(startupFiles)
+}
+
+// macOS: open-file event — register before app.on('ready'), just like open-url
+app.on('open-file', (event, filePath) => {
+  event.preventDefault()
+  const normalized = normalizeEmailFilePath(filePath)
+  if (!normalized) return
+  if (app.isReady()) {
+    openEmailFile(normalized)
+  } else {
+    launchedForFileViewerOnly = true
+    queueEmailFiles([normalized])
+  }
+})
 
 // ---------------------------------------------------------------------------
 // Single instance lock
@@ -39,6 +313,13 @@ if (!gotLock) {
   app.quit()
 } else {
   app.on('second-instance', (_event, argv) => {
+    // Check for .eml file paths first — open viewers without showing main window
+    const emlFiles = extractEmailFilesFromArgv(argv)
+    if (emlFiles.length > 0) {
+      for (const fp of emlFiles) openEmailFile(fp)
+      return
+    }
+
     // Windows: protocol URLs arrive via argv on second instance
     const protocolArg = argv.find(
       (a) => a.startsWith('mailto:') || a.startsWith('brinq:'),
@@ -57,7 +338,9 @@ if (!gotLock) {
 function isSameOriginEmailPopout(url) {
   try {
     const parsed = new URL(url)
-    return parsed.origin === BASE_ORIGIN && parsed.pathname.startsWith('/email/')
+    return (
+      parsed.origin === BASE_ORIGIN && parsed.pathname.startsWith('/email/')
+    )
   } catch {
     return false
   }
@@ -144,13 +427,11 @@ function handleProtocolUrl(url) {
       mainWindow.show()
       mainWindow.focus()
     }
-    // Ensure we're on /emails before dispatching
     if (!isOnEmailsRoute() && mainWindow) {
       mainWindow.loadURL(getModeUrl())
     }
     queuePayload({ type: 'mailto', data })
   } else if (url.startsWith('brinq:')) {
-    // brinq://auth?token=xxx — Step 4 (optional, deferred)
     if (mainWindow) {
       mainWindow.show()
       mainWindow.focus()
@@ -171,7 +452,7 @@ app.on('open-url', (event, url) => {
 // ---------------------------------------------------------------------------
 // Window creation
 // ---------------------------------------------------------------------------
-function createWindow() {
+function createWindow({ showOnReady = true } = {}) {
   const bounds = config.getWindowBounds()
 
   mainWindow = new BrowserWindow({
@@ -190,9 +471,8 @@ function createWindow() {
     },
   })
 
-  // Show window once content is ready (avoids white flash)
   mainWindow.once('ready-to-show', () => {
-    mainWindow.show()
+    if (showOnReady) mainWindow.show()
   })
 
   mainWindow.loadURL(getModeUrl())
@@ -206,7 +486,7 @@ function createWindow() {
   mainWindow.on('resize', saveBounds)
   mainWindow.on('move', saveBounds)
 
-  // Hide to tray on close (all platforms) — keep background notifications alive
+  // Hide to tray on close — keep background notifications alive
   mainWindow.on('close', (event) => {
     if (!app.isQuitting) {
       event.preventDefault()
@@ -217,7 +497,6 @@ function createWindow() {
   // Track when the renderer is on /emails and ready for IPC payloads
   mainWindow.webContents.on('did-finish-load', () => {
     if (isOnLoginPage()) {
-      // Clear stale badge when landing on login
       clearBadge()
     }
     if (isOnEmailsRoute()) {
@@ -230,9 +509,7 @@ function createWindow() {
   mainWindow.webContents.on('will-navigate', (event, url) => {
     try {
       const parsed = new URL(url)
-      // Allow same-origin navigation (login, dashboard, emails, etc.)
       if (parsed.origin === BASE_ORIGIN) return
-      // Off-origin: open in system browser
       event.preventDefault()
       shell.openExternal(url)
     } catch {
@@ -242,7 +519,6 @@ function createWindow() {
 
   // Handle window.open() from the web app
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    // Email pop-out: open as native Electron window
     if (isSameOriginEmailPopout(url)) {
       return {
         action: 'allow',
@@ -258,11 +534,9 @@ function createWindow() {
         },
       }
     }
-    // Off-origin URLs: open in system browser
     if (isOffOriginHttp(url)) {
       shell.openExternal(url)
     }
-    // Same-origin non-email (downloads, print helpers): allow
     if (url && !isOffOriginHttp(url) && !isSameOriginEmailPopout(url)) {
       return { action: 'allow' }
     }
@@ -274,13 +548,11 @@ function createWindow() {
 // Tray
 // ---------------------------------------------------------------------------
 function createTray() {
-  // Windows needs ICO or a properly sized PNG; macOS/Linux use PNG
   const iconFile =
     process.platform === 'win32' ? 'icon.ico' : 'tray-icon.png'
   const trayIcon = nativeImage.createFromPath(
     path.join(__dirname, '../assets/', iconFile),
   )
-  // Resize for tray (16x16 on Windows, 22x22 on macOS/Linux)
   const resized =
     process.platform === 'win32'
       ? trayIcon.resize({ width: 16, height: 16 })
@@ -365,7 +637,6 @@ ipcMain.on('notify', (event, title, body, data) => {
       if (isOnEmailsRoute()) {
         mainWindow.webContents.send('navigate-email', data.uid)
       } else {
-        // Navigate to /emails with the email UID as a query param
         const mode = config.getMode()
         mainWindow.loadURL(
           `${BASE_URL}/emails?standalone=${mode}&open_email_uid=${encodeURIComponent(data.uid)}`,
@@ -387,7 +658,9 @@ ipcMain.on('set-mode', (event, mode) => {
 ipcMain.on('badge-count', (event, count) => {
   if (!validateSender(event)) return
   const n =
-    typeof count === 'number' ? Math.max(0, Math.min(Math.floor(count), 9999)) : 0
+    typeof count === 'number'
+      ? Math.max(0, Math.min(Math.floor(count), 9999))
+      : 0
 
   if (process.platform === 'darwin' && app.dock) {
     app.dock.setBadge(n > 0 ? String(n) : '')
@@ -416,8 +689,14 @@ function clearBadge() {
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.on('ready', () => {
-  createWindow()
+  createWindow({ showOnReady: !launchedForFileViewerOnly })
   createTray()
+
+  // Drain any .eml files queued before app was ready
+  for (const fp of pendingEmailFiles.splice(0)) {
+    pendingEmailFileSet.delete(fp)
+    openEmailFile(fp)
+  }
 
   // Check for protocol URLs passed via argv on cold start (Windows)
   const protocolArg = process.argv.find(
@@ -426,7 +705,6 @@ app.on('ready', () => {
   if (protocolArg) handleProtocolUrl(protocolArg)
 
   // Auto-update: check silently on launch, download in background
-  // Skip in dev mode — no packaged app to update
   if (process.env.NODE_ENV !== 'development') {
     autoUpdater.logger = require('electron-log')
     autoUpdater.autoDownload = true
@@ -443,13 +721,11 @@ app.on('activate', () => {
   }
 })
 
-// Ensure app.isQuitting is set for the close handler
 app.on('before-quit', () => {
   app.isQuitting = true
 })
 
 app.on('window-all-closed', () => {
-  // On macOS, apps stay active until explicit quit
   if (process.platform !== 'darwin') {
     app.quit()
   }

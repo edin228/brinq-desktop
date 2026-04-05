@@ -15,10 +15,16 @@ win:
   target:
     - nsis
   artifactName: Brinq-Setup.${ext}
+  fileAssociations:
+    - ext: eml
+      name: "Email Message"
+      description: "Email Message File"
+      role: Viewer
 
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
+  perMachine: true
 
 mac:
   icon: assets/icon.png
@@ -26,6 +32,10 @@ mac:
     - dmg
   artifactName: Brinq-${version}.${ext}
   category: public.app-category.productivity
+  fileAssociations:
+    - ext: eml
+      name: "Email Message"
+      role: Viewer
 
 linux:
   icon: assets/icon.png
