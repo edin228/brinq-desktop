@@ -20,6 +20,10 @@ win:
       name: "Email Message"
       description: "Email Message File"
       role: Viewer
+    - ext: msg
+      name: "Outlook Message"
+      description: "Outlook Message File"
+      role: Viewer
 
 nsis:
   oneClick: false
@@ -35,6 +39,9 @@ mac:
   fileAssociations:
     - ext: eml
       name: "Email Message"
+      role: Viewer
+    - ext: msg
+      name: "Outlook Message"
       role: Viewer
 
 linux:
