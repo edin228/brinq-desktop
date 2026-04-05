@@ -37,6 +37,7 @@ let rendererReady = false
 const MAX_EML_BYTES = 25 * 1024 * 1024
 const MAX_CONCURRENT_VIEWERS = 10
 const fileViewerStore = new Map()
+let pendingViewerCount = 0
 
 function sanitizeDownloadName(filename, index) {
   const base = path.basename(filename || `attachment-${index}`)
@@ -182,7 +183,7 @@ ipcMain.handle(
 // EML File Viewer — open file in popup window
 // ---------------------------------------------------------------------------
 async function openEmailFile(filePath) {
-  if (fileViewerStore.size >= MAX_CONCURRENT_VIEWERS) {
+  if (fileViewerStore.size + pendingViewerCount >= MAX_CONCURRENT_VIEWERS) {
     dialog.showErrorBox(
       'Too many viewers open',
       `Please close some email viewer windows first (max ${MAX_CONCURRENT_VIEWERS}).`,
@@ -190,8 +191,10 @@ async function openEmailFile(filePath) {
     return
   }
 
+  pendingViewerCount++
   let viewer = null
   let viewerId = null
+  let registered = false
 
   try {
     const result = await parseEmailFile(filePath)
@@ -216,6 +219,8 @@ async function openEmailFile(filePath) {
       ...result,
       windowId: viewer.webContents.id,
     })
+    pendingViewerCount--
+    registered = true
 
     viewer.once('ready-to-show', () => viewer.show())
 
@@ -259,6 +264,7 @@ async function openEmailFile(filePath) {
       maybeQuitAfterFileViewerClose()
     })
   } catch (err) {
+    if (!registered) pendingViewerCount--
     if (viewerId) fileViewerStore.delete(viewerId)
     if (viewer && !viewer.isDestroyed()) viewer.destroy()
     dialog.showErrorBox(
@@ -348,6 +354,7 @@ if (!gotLock) {
     )
     if (protocolArg) handleProtocolUrl(protocolArg)
     if (mainWindow) {
+      launchedForFileViewerOnly = false
       mainWindow.show()
       mainWindow.focus()
     }
@@ -591,6 +598,7 @@ function updateTrayMenu() {
     {
       label: 'Open Brinq',
       click: () => {
+        launchedForFileViewerOnly = false
         mainWindow.show()
         mainWindow.focus()
       },
@@ -738,6 +746,7 @@ app.on('ready', () => {
 // macOS: re-show window when dock icon clicked
 app.on('activate', () => {
   if (mainWindow) {
+    launchedForFileViewerOnly = false
     mainWindow.show()
     mainWindow.focus()
   }
