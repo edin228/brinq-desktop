@@ -534,9 +534,14 @@ async function openEmailFile(filePath) {
     })
 
     const viewerUrl = `${BASE_URL}/email/file-viewer?viewerId=${viewerId}`
+    let mainFrameLoaded = false
+
+    viewer.webContents.on('did-finish-load', () => {
+      mainFrameLoaded = true
+    })
+
     viewer.webContents.on('will-navigate', (event, url) => {
-      // Allow same-page navigation (Next.js client-side routing during load)
-      if (url.startsWith(viewerUrl) || url === viewerUrl) return
+      if (url === viewerUrl) return
       event.preventDefault()
       if (isAllowedExternalUrl(url)) {
         shell.openExternal(url)
@@ -553,14 +558,14 @@ async function openEmailFile(filePath) {
     try {
       await viewer.loadURL(viewerUrl)
     } catch (loadErr) {
-      // loadURL rejects on did-fail-load, which can include ERR_ABORTED (-3)
-      // when will-navigate blocks a post-render redirect (e.g. Next.js auth check).
-      // If the viewer is alive and has the correct URL, the page rendered fine.
-      const loaded =
-        viewer &&
-        !viewer.isDestroyed() &&
-        viewer.webContents.getURL().startsWith(BASE_URL + '/email/file-viewer')
-      if (!loaded) throw loadErr
+      // loadURL rejects on any did-fail-load, including ERR_ABORTED (-3)
+      // from will-navigate blocking a post-render redirect. Only suppress
+      // if the main frame already loaded AND the error is the specific abort.
+      const isAbort =
+        loadErr &&
+        (String(loadErr.message || '').includes('ERR_ABORTED') ||
+          String(loadErr.code) === '-3')
+      if (!(mainFrameLoaded && isAbort)) throw loadErr
     }
 
     viewer.once('closed', () => {
