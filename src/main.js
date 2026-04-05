@@ -376,18 +376,30 @@ ipcMain.handle(
   },
 )
 
+// Only truly inert formats — no active content, no macros, no script execution
 const SAFE_OPEN_EXTENSIONS = new Set([
-  '.pdf', '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg',
-  '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
-  '.txt', '.csv', '.rtf', '.htm', '.html',
-  '.mp3', '.mp4', '.wav', '.avi', '.mov', '.mkv',
-  '.zip', '.7z', '.rar',
+  '.pdf',
+  '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff',
+  '.txt', '.csv',
 ])
 
 const BRINQ_TEMP_DIR = path.join(app.getPath('temp'), 'brinq-viewer')
+const viewerTempFiles = new Map() // viewerId -> Set<tempPath>
 
 function cleanupTempDir() {
   fs.rm(BRINQ_TEMP_DIR, { recursive: true, force: true }, () => {})
+}
+
+function cleanupViewerTempFiles(viewerId) {
+  const files = viewerTempFiles.get(viewerId)
+  if (!files) return
+  viewerTempFiles.delete(viewerId)
+  // Best-effort delayed cleanup — external app may still have the file open
+  setTimeout(() => {
+    for (const tempPath of files) {
+      fs.unlink(tempPath, () => {})
+    }
+  }, 5000)
 }
 
 ipcMain.handle(
@@ -429,6 +441,10 @@ ipcMain.handle(
       await fs.promises.mkdir(BRINQ_TEMP_DIR, { recursive: true })
       const tempPath = path.join(BRINQ_TEMP_DIR, `${Date.now()}-${safeName}`)
       await fs.promises.writeFile(tempPath, att.content)
+
+      if (!viewerTempFiles.has(viewerId)) viewerTempFiles.set(viewerId, new Set())
+      viewerTempFiles.get(viewerId).add(tempPath)
+
       const errorMessage = await shell.openPath(tempPath)
       if (errorMessage) {
         return { ok: false, error: errorMessage, unsafe: false }
@@ -530,6 +546,7 @@ async function openEmailFile(filePath) {
 
     viewer.once('closed', () => {
       fileViewerStore.delete(viewerId)
+      cleanupViewerTempFiles(viewerId)
       maybeQuitAfterFileViewerClose()
     })
   } catch (err) {
