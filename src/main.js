@@ -20,6 +20,11 @@ const { deEncapsulateSync } = require('rtf-stream-parser')
 const iconv = require('iconv-lite')
 const config = require('./config')
 
+// Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
+if (process.platform === 'win32') {
+  app.setAppUserModelId('Brinq')
+}
+
 // GPU / rendering flags
 app.commandLine.appendSwitch('ignore-gpu-blocklist')
 app.commandLine.appendSwitch('enable-gpu-rasterization')
