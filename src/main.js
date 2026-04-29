@@ -778,8 +778,8 @@ function handleProtocolUrl(url) {
   }
 }
 
-// Register protocol handlers
-app.setAsDefaultProtocolClient('mailto')
+// Register Brinq-owned deep links only. Do not register as the system
+// mailto: handler; Outlook and AMS360 depend on that association.
 app.setAsDefaultProtocolClient('brinq')
 
 // macOS: protocol URLs arrive via open-url event
