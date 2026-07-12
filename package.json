@@ -4,6 +4,7 @@
   "description": "Brinq",
   "main": "src/main.js",
   "scripts": {
+    "test": "node --test",
     "dev": "NODE_ENV=development electron .",
     "dev:win": "set NODE_ENV=development&& electron .",
     "build:win": "electron-builder --win",

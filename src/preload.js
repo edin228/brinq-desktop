@@ -28,4 +28,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   openFileAttachment: (viewerId, attachmentIndex) =>
     ipcRenderer.invoke('open-file-attachment', viewerId, attachmentIndex),
+
+  openEmailAttachment: (emailUid, attachmentId, filename) =>
+    ipcRenderer.invoke(
+      'open-email-attachment',
+      emailUid,
+      attachmentId,
+      filename,
+    ),
+
+  saveEmailAttachment: (emailUid, attachmentId, filename) =>
+    ipcRenderer.invoke(
+      'save-email-attachment',
+      emailUid,
+      attachmentId,
+      filename,
+    ),
 })
