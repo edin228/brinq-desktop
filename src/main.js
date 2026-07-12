@@ -438,6 +438,12 @@ async function markFileAsInternetOrigin(filePath, sourceUrl) {
 }
 
 function requiresInternetOriginProtection(filename) {
+  // Linux has no interoperable Internet-zone/quarantine metadata that native
+  // viewers enforce. Its safety boundary remains the macro-free extension
+  // allowlist; Windows and macOS additionally require their OS provenance.
+  if (process.platform !== 'win32' && process.platform !== 'darwin') {
+    return false
+  }
   return INTERNET_PROTECTION_REQUIRED_EXTENSIONS.has(
     path.extname(filename).toLowerCase(),
   )
