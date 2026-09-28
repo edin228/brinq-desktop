@@ -1,15 +1,17 @@
-name: Windows test installer
+name: Windows installer
 
 on:
   push:
     branches:
       - feature/desktop-file-opening
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,10 +21,21 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
-      - run: npx electron-builder --win --publish never -c.extraMetadata.version=1.2.6-test.1
+      - run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            npx electron-builder --win --publish never -c.extraMetadata.version=1.2.6-test.1
+          else
+            npx electron-builder --win --publish never
+          fi
+          test -s dist/Brinq-Setup.exe
+          test -s dist/Brinq-Setup.exe.blockmap
+          test -s dist/latest.yml
         shell: bash
       - uses: actions/upload-artifact@v4
         with:
-          name: brinq-desktop-test-installer-${{ github.sha }}
-          path: dist/Brinq-Setup.exe
+          name: brinq-desktop-windows-${{ github.sha }}
+          path: |
+            dist/Brinq-Setup.exe
+            dist/Brinq-Setup.exe.blockmap
+            dist/latest.yml
           if-no-files-found: error
