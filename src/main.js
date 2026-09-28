@@ -1055,15 +1055,27 @@ function desktopState() {
   return { mode: config.getMode(), version: app.getVersion() }
 }
 
+let modeChangeInProgress = false
+
 async function switchMode(mode) {
   if (!isMode(mode)) return { ok: false, error: 'Choose Mail Mode or Full App Mode.' }
+  if (modeChangeInProgress) {
+    return { ok: false, state: desktopState(), error: 'A mode change is already in progress. Please try again after it finishes.' }
+  }
+  const previousMode = config.getMode()
+  modeChangeInProgress = true
   try {
-    await mainWindow.loadURL(modeUrl(BASE_URL, mode))
+    // The destination reads Desktop state while mounting, before loadURL resolves.
     config.setMode(mode)
     updateTrayMenu()
+    await mainWindow.loadURL(modeUrl(BASE_URL, mode))
     return { ok: true, state: desktopState() }
   } catch {
+    config.setMode(previousMode)
+    updateTrayMenu()
     return { ok: false, state: desktopState(), error: 'Could not open the selected mode. Please try again.' }
+  } finally {
+    modeChangeInProgress = false
   }
 }
 

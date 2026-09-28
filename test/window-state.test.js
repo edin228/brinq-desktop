@@ -62,16 +62,17 @@ test('pending actions wait for their channel and current document, survive reloa
 })
 
 
-test('failed mode navigation retains the saved choice and successful navigation commits it', async () => {
-  // Exercise the actual main-process transition with controllable navigation.
+test('destination sees selected Desktop mode during load, with rollback on failure and guarded overlapping changes', async () => {
+  // Exercise the main-process state getter as a mounting destination would.
   const fs = require('node:fs')
   const vm = require('node:vm')
   const source = fs.readFileSync(require.resolve('../src/main'), 'utf8')
   const transition = source.slice(source.indexOf('function desktopState()'), source.indexOf('// IPC handlers'))
   let mode = 'email'
-  let fail = true
   let resolveNavigation
-  let trayUpdates = 0
+  let rejectNavigation
+  const trayModes = []
+  const destinationModes = []
   const targets = []
   const context = {
     isMode: require('../src/window-state').isMode,
@@ -79,28 +80,38 @@ test('failed mode navigation retains the saved choice and successful navigation 
     BASE_URL: 'https://brinq.io',
     config: { getMode: () => mode, setMode: (value) => { mode = value } },
     app: { getVersion: () => '1.2.5' },
-    updateTrayMenu: () => { trayUpdates++ },
+    updateTrayMenu: () => { trayModes.push(mode) },
     mainWindow: { loadURL: (url) => {
       targets.push(url)
-      if (fail) return Promise.reject(new Error('Navigation failed'))
-      return new Promise((resolve) => { resolveNavigation = resolve })
+      destinationModes.push(context.desktopState().mode)
+      return new Promise((resolve, reject) => { resolveNavigation = resolve; rejectNavigation = reject })
     } },
   }
   vm.createContext(context)
   vm.runInContext(transition, context)
-  const failed = await context.switchMode('full')
+  const failedNavigation = context.switchMode('full')
+  assert.equal(context.desktopState().mode, 'full')
+  assert.deepEqual(destinationModes, ['full'])
+  assert.equal((await context.switchMode('email')).ok, false)
+  assert.equal(targets.length, 1)
+  rejectNavigation(new Error('Navigation failed'))
+  const failed = await failedNavigation
   assert.equal(failed.ok, false)
   assert.equal(failed.state.mode, 'email')
-  assert.equal(mode, 'email')
-  assert.equal(trayUpdates, 0)
+  assert.equal(context.desktopState().mode, 'email')
+  assert.deepEqual(trayModes, ['full', 'email'])
   assert.deepEqual(targets, ['https://brinq.io/dashboard?standalone=full'])
-  fail = false
   const pending = context.switchMode('full')
-  assert.equal(mode, 'email')
+  assert.equal(context.desktopState().mode, 'full')
   resolveNavigation()
   const success = await pending
   assert.equal(success.ok, true)
   assert.equal(success.state.mode, 'full')
   assert.equal(mode, 'full')
-  assert.equal(trayUpdates, 1)
+  assert.deepEqual(trayModes, ['full', 'email', 'full'])
+  const mailMode = context.switchMode('email')
+  assert.equal(context.desktopState().mode, 'email')
+  assert.deepEqual(destinationModes, ['full', 'full', 'email'])
+  resolveNavigation()
+  assert.equal((await mailMode).state.mode, 'email')
 })
