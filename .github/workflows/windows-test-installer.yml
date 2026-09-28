@@ -1,0 +1,27 @@
+name: Windows test installer
+
+on:
+  push:
+    branches:
+      - feature/desktop-file-opening
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npx electron-builder --win --publish never -c.extraMetadata.version=1.2.6-test.1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brinq-desktop-test-installer-${{ github.sha }}
+          path: dist/Brinq-Setup.exe
+          if-no-files-found: error

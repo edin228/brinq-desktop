@@ -61,8 +61,10 @@ test('Open streams complete private bytes and invokes the OS once using server f
   assert.equal(f.opens.length, 1)
   assert.match(f.opens[0], /server\.pdf$/)
   assert.deepEqual(await fs.readFile(f.opens[0]), PDF)
-  assert.equal((await fs.stat(f.opens[0])).mode & 0o777, 0o600)
-  assert.equal((await fs.stat(f.tempDir)).mode & 0o777, 0o700)
+  if (process.platform !== 'win32') {
+    assert.equal((await fs.stat(f.opens[0])).mode & 0o777, 0o600)
+    assert.equal((await fs.stat(f.tempDir)).mode & 0o777, 0o700)
+  }
   assert.equal(f.requests.length, 1)
   assert.equal(f.requests[0][1].credentials, 'include')
   assert.equal(f.requests[0][1].redirect, 'error')
