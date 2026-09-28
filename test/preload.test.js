@@ -17,13 +17,18 @@ function load(protocol = 'http:', isMainFrame = true) {
   return { api, ipc, calls }
 }
 
-test('preload exposes only fixed legacy methods and strips IPC events', async () => {
+test('preload exposes fixed file and legacy methods and strips IPC events', async () => {
   const { api, ipc, calls } = load()
-  assert.deepEqual(Object.keys(api).sort(), ['notify', 'setBadgeCount', 'setMode', 'onNavigateEmail', 'onMailto', 'getFileEmail', 'saveFileAttachment', 'openFileAttachment', 'openEmailAttachment', 'saveEmailAttachment'].sort())
+  assert.deepEqual(Object.keys(api).sort(), ['getFileCapabilities', 'openFile', 'saveFileAs', 'cancelFileOperation', 'notify', 'setBadgeCount', 'setMode', 'onNavigateEmail', 'onMailto', 'getFileEmail', 'saveFileAttachment', 'openFileAttachment', 'openEmailAttachment', 'saveEmailAttachment'].sort())
   api.notify('Title', 'Body', { uid: 'one' }); api.setBadgeCount(2); api.setMode('email')
   await api.getFileEmail('viewer'); await api.saveFileAttachment('viewer', 1); await api.openFileAttachment('viewer', 2)
   await api.openEmailAttachment('email', 'attachment', 'test.pdf'); await api.saveEmailAttachment('email', 'attachment', 'test.pdf')
   assert.deepEqual(calls.map(call => call[0]), ['notify', 'badge-count', 'set-mode', 'get-file-email', 'save-file-attachment', 'open-file-attachment', 'open-email-attachment', 'save-email-attachment'])
+  await api.getFileCapabilities()
+  await api.openFile({ kind: 'brinq-file', uid: 'one' }, 'operation')
+  await api.saveFileAs({ kind: 'brinq-file', uid: 'one' }, 'operation')
+  await api.cancelFileOperation('operation')
+  assert.deepEqual(calls.slice(-4).map(call => call[0]), ['file-capabilities', 'open-file', 'save-file-as', 'cancel-file-operation'])
   for (const [method, channel] of [['onNavigateEmail', 'navigate-email'], ['onMailto', 'mailto']]) {
     const received = []
     const off = api[method]((...args) => received.push(args))

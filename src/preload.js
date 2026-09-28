@@ -22,6 +22,14 @@ if (process.isMainFrame && ['http:', 'https:'].includes(location.protocol)) {
       return () => ipcRenderer.removeListener('mailto', handler)
     },
 
+    getFileCapabilities: () => ipcRenderer.invoke('file-capabilities'),
+
+    openFile: (source, operationId) => ipcRenderer.invoke('open-file', source, operationId),
+
+    saveFileAs: (source, operationId) => ipcRenderer.invoke('save-file-as', source, operationId),
+
+    cancelFileOperation: (operationId) => ipcRenderer.invoke('cancel-file-operation', operationId),
+
     // EML file viewer — static IPC channels with viewerId as argument
     getFileEmail: (viewerId) =>
       ipcRenderer.invoke('get-file-email', viewerId),

@@ -10,10 +10,8 @@ const {
   dialog,
 } = require('electron')
 const { randomUUID } = require('crypto')
-const { execFile } = require('child_process')
 const fs = require('fs')
 const path = require('path')
-const { promisify } = require('util')
 const { autoUpdater } = require('electron-updater')
 const { simpleParser } = require('mailparser')
 const MsgReader = require('@kenjiuno/msgreader').default
@@ -23,15 +21,16 @@ const iconv = require('iconv-lite')
 const config = require('./config')
 const { createWindowSecurity } = require('./window-security')
 const {
-  buildSyncedAttachmentUrl,
-  filenameFromContentDisposition,
   isSafeOpenFilename,
-  readResponseWithLimit,
   sanitizeDownloadName,
   truncateFilenameBytes,
+  profileTempDir,
+  ensurePrivateDirectory,
+  cleanupProfileTemp,
+  markFileAsInternetOrigin,
+  requiresInternetOriginProtection,
 } = require('./attachment-files')
-
-const execFileAsync = promisify(execFile)
+const { createFileActions, CAPABILITIES } = require('./file-actions')
 
 // Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
 if (process.platform === 'win32') {
@@ -382,70 +381,11 @@ ipcMain.handle(
   },
 )
 
-const BRINQ_TEMP_DIR = path.join(app.getPath('temp'), 'brinq-viewer')
+const BRINQ_TEMP_DIR = profileTempDir(app.getPath('temp'), app.getPath('userData'))
 const viewerTempFiles = new Map() // viewerId -> Set<tempPath>
 
-function cleanupTempDir() {
-  return fs.promises.rm(BRINQ_TEMP_DIR, { recursive: true, force: true })
-}
-
-async function ensurePrivateTempDir() {
-  await fs.promises.mkdir(BRINQ_TEMP_DIR, { recursive: true, mode: 0o700 })
-  const stats = await fs.promises.lstat(BRINQ_TEMP_DIR)
-  if (!stats.isDirectory() || stats.isSymbolicLink()) {
-    throw new Error('Attachment temp path is not a private directory.')
-  }
-  if (typeof process.getuid === 'function' && stats.uid !== process.getuid()) {
-    throw new Error('Attachment temp directory has an unexpected owner.')
-  }
-  if (process.platform !== 'win32') {
-    await fs.promises.chmod(BRINQ_TEMP_DIR, 0o700)
-  }
-}
-
-const INTERNET_PROTECTION_REQUIRED_EXTENSIONS = new Set([
-  '.csv',
-  '.docx',
-  '.xlsx',
-  '.pptx',
-])
-
-async function markFileAsInternetOrigin(filePath, sourceUrl) {
-  if (process.platform === 'win32') {
-    const zoneData = [
-      '[ZoneTransfer]',
-      'ZoneId=3',
-      `HostUrl=${sourceUrl}`,
-      '',
-    ].join('\r\n')
-    await fs.promises.writeFile(`${filePath}:Zone.Identifier`, zoneData, {
-      mode: 0o600,
-    })
-    return true
-  } else if (process.platform === 'darwin') {
-    const timestamp = Math.floor(Date.now() / 1000).toString(16)
-    const quarantine = `0083;${timestamp};Brinq;${randomUUID()}`
-    await execFileAsync('/usr/bin/xattr', [
-      '-w',
-      'com.apple.quarantine',
-      quarantine,
-      filePath,
-    ])
-    return true
-  }
-  return false
-}
-
-function requiresInternetOriginProtection(filename) {
-  // Linux has no interoperable Internet-zone/quarantine metadata that native
-  // viewers enforce. Its safety boundary remains the macro-free extension
-  // allowlist; Windows and macOS additionally require their OS provenance.
-  if (process.platform !== 'win32' && process.platform !== 'darwin') {
-    return false
-  }
-  return INTERNET_PROTECTION_REQUIRED_EXTENSIONS.has(
-    path.extname(filename).toLowerCase(),
-  )
+function ensurePrivateTempDir() {
+  return ensurePrivateDirectory(BRINQ_TEMP_DIR)
 }
 
 function retryUnlink(filePath, attemptsLeft) {
@@ -511,16 +451,21 @@ ipcMain.handle(
       }
     }
 
+    let tempPath
+    let tempCreated = false
     try {
       await ensurePrivateTempDir()
-      const tempPath = path.join(
+      tempPath = path.join(
         BRINQ_TEMP_DIR,
         `${randomUUID()}-${truncateFilenameBytes(safeName, 180)}`,
       )
-      await fs.promises.writeFile(tempPath, att.content, {
-        flag: 'wx',
-        mode: 0o600,
-      })
+      const handle = await fs.promises.open(tempPath, 'wx', 0o600)
+      tempCreated = true
+      try {
+        await handle.writeFile(att.content)
+      } finally {
+        await handle.close()
+      }
 
       try {
         const protectedByOs = await markFileAsInternetOrigin(
@@ -556,10 +501,12 @@ ipcMain.handle(
       }
       const errorMessage = await shell.openPath(tempPath)
       if (errorMessage) {
-        return { ok: false, error: errorMessage, unsafe: false }
+        retryUnlink(tempPath, 1)
+        return { ok: false, error: 'No application could open this file. Use Save As instead.', unsafe: false }
       }
       return { ok: true }
     } catch (err) {
+      if (tempCreated) retryUnlink(tempPath, 1)
       return {
         ok: false,
         unsafe: false,
@@ -569,208 +516,29 @@ ipcMain.handle(
   },
 )
 
-// ---------------------------------------------------------------------------
-// Synced inbox attachments — authenticated download, native open, and save
-// ---------------------------------------------------------------------------
-const MAX_SYNCED_ATTACHMENT_BYTES = 50 * 1024 * 1024
-
-async function cancelResponseBody(response) {
-  if (!response?.body) return
-  try {
-    await response.body.cancel()
-  } catch {
-    // The request may already have closed while handling the user action.
-  }
-}
-
-async function fetchSyncedAttachmentResponse(
-  event,
-  emailUid,
-  attachmentId,
-  fallbackFilename,
-) {
-  if (!validateSender(event)) {
-    return { ok: false, error: 'Unauthorized sender.' }
-  }
-
-  const url = buildSyncedAttachmentUrl(BASE_URL, emailUid, attachmentId)
-  if (!url) return { ok: false, error: 'Invalid attachment request.' }
-
-  try {
-    const response = await event.sender.session.fetch(url, {
-      credentials: 'include',
-      redirect: 'error',
-    })
-    if (!response.ok) {
-      await cancelResponseBody(response)
-      return {
-        ok: false,
-        error:
-          response.status === 401 || response.status === 403
-            ? 'Your session expired. Sign in and try again.'
-            : 'Failed to download attachment.',
-      }
-    }
-
-    const declaredBytes = Number(response.headers.get('content-length') || 0)
-    if (declaredBytes > MAX_SYNCED_ATTACHMENT_BYTES) {
-      await cancelResponseBody(response)
-      return { ok: false, error: 'Attachment exceeds the 50MB limit.' }
-    }
-
-    return {
-      ok: true,
-      response,
-      filename: filenameFromContentDisposition(
-        response.headers.get('content-disposition'),
-        sanitizeDownloadName(fallbackFilename),
-      ),
-    }
-  } catch (err) {
-    return {
-      ok: false,
-      error: err?.message || 'Failed to download attachment.',
-    }
-  }
-}
-
-ipcMain.handle(
-  'open-email-attachment',
-  async (event, emailUid, attachmentId, fallbackFilename) => {
-    const stillAuthorized = windowSecurity.captureSender(event)
-    const result = await fetchSyncedAttachmentResponse(
-      event,
-      emailUid,
-      attachmentId,
-      fallbackFilename,
-    )
-    if (!result.ok) return { ...result, unsafe: false }
-
-    if (!isSafeOpenFilename(result.filename)) {
-      await cancelResponseBody(result.response)
-      return {
-        ok: false,
-        unsafe: true,
-        error: 'This file type must be saved before it can be opened.',
-      }
-    }
-
-    try {
-      const content = await readResponseWithLimit(
-        result.response,
-        MAX_SYNCED_ATTACHMENT_BYTES,
-      )
-      await ensurePrivateTempDir()
-      const tempPath = path.join(
-        BRINQ_TEMP_DIR,
-        `${randomUUID()}-${truncateFilenameBytes(result.filename, 180)}`,
-      )
-      await fs.promises.writeFile(tempPath, content, {
-        flag: 'wx',
-        mode: 0o600,
-      })
-      try {
-        const protectedByOs = await markFileAsInternetOrigin(
-          tempPath,
-          BASE_ORIGIN,
-        )
-        if (
-          !protectedByOs &&
-          requiresInternetOriginProtection(result.filename)
-        ) {
-          retryUnlink(tempPath, 1)
-          return {
-            ok: false,
-            unsafe: true,
-            error: 'This file type must be saved before it can be opened.',
-          }
-        }
-      } catch (err) {
-        if (requiresInternetOriginProtection(result.filename)) {
-          retryUnlink(tempPath, 1)
-          return {
-            ok: false,
-            unsafe: true,
-            error: 'Could not apply OS security protections. Use "Save As" instead.',
-          }
-        }
-        console.warn('Could not mark attachment as Internet-originated:', err)
-      }
-      scheduleSyncedAttachmentCleanup(tempPath)
-      if (!stillAuthorized()) {
-        retryUnlink(tempPath, 1)
-        return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
-      }
-      const errorMessage = await shell.openPath(tempPath)
-      if (errorMessage) {
-        return { ok: false, unsafe: false, error: errorMessage }
-      }
-      return { ok: true, unsafe: false }
-    } catch (err) {
-      return {
-        ok: false,
-        unsafe: false,
-        error: err?.message || 'Failed to open attachment.',
-      }
-    }
+// Authenticated remote files share one cancellable streaming owner.
+const fileActions = createFileActions({
+  baseUrl: BASE_URL,
+  security: windowSecurity,
+  tempDir: BRINQ_TEMP_DIR,
+  showSaveDialog: (contents, options) => {
+    const owner = BrowserWindow.fromWebContents(contents)
+    if (!owner || owner.isDestroyed()) return { canceled: true }
+    return dialog.showSaveDialog(owner, options)
   },
-)
+  openPath: (file) => shell.openPath(file),
+  scheduleCleanup: scheduleSyncedAttachmentCleanup,
+})
+ipcMain.handle('open-file', (event, source, id) => fileActions.open(event, source, id))
+ipcMain.handle('save-file-as', (event, source, id) => fileActions.save(event, source, id))
+ipcMain.handle('cancel-file-operation', (event, id) => fileActions.cancel(event, id))
+ipcMain.handle('file-capabilities', (event) => validateSender(event) ? CAPABILITIES : null)
 
-ipcMain.handle(
-  'save-email-attachment',
-  async (event, emailUid, attachmentId, fallbackFilename) => {
-    const stillAuthorized = windowSecurity.captureSender(event)
-    const result = await fetchSyncedAttachmentResponse(
-      event,
-      emailUid,
-      attachmentId,
-      fallbackFilename,
-    )
-    if (!result.ok) return { ...result, canceled: false }
-    if (!stillAuthorized()) {
-      await cancelResponseBody(result.response)
-      return { ok: false, canceled: true }
-    }
-
-    const owner = BrowserWindow.fromWebContents(event.sender)
-    if (!owner || owner.isDestroyed()) {
-      await cancelResponseBody(result.response)
-      return { ok: false, canceled: false, error: 'Email window closed.' }
-    }
-
-    const { canceled, filePath: savePath } = await dialog.showSaveDialog(
-      owner,
-      { defaultPath: result.filename },
-    )
-    if (canceled || !savePath) {
-      await cancelResponseBody(result.response)
-      return { ok: false, canceled: true }
-    }
-
-    try {
-      const content = await readResponseWithLimit(
-        result.response,
-        MAX_SYNCED_ATTACHMENT_BYTES,
-      )
-      if (!stillAuthorized()) {
-        return { ok: false, canceled: true, error: 'Window navigated or closed.' }
-      }
-      await fs.promises.writeFile(savePath, content)
-      try {
-        await markFileAsInternetOrigin(savePath, BASE_ORIGIN)
-      } catch (err) {
-        console.warn('Could not mark saved attachment as Internet-originated:', err)
-      }
-      return { ok: true, canceled: false }
-    } catch (err) {
-      return {
-        ok: false,
-        canceled: false,
-        error: err?.message || 'Failed to save attachment.',
-      }
-    }
-  },
-)
+// Old frontend versions retain their result fields and fixed email methods.
+for (const [channel, action] of [['open-email-attachment', 'open'], ['save-email-attachment', 'save']]) {
+  ipcMain.handle(channel, (event, emailUid, attachmentId, filename) =>
+    fileActions[action](event, { kind: 'synced-email-attachment', emailUid, attachmentId, filename }, randomUUID()))
+}
 
 // ---------------------------------------------------------------------------
 // EML File Viewer — open file in popup window
@@ -1258,8 +1026,9 @@ function clearBadge() {
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.on('ready', async () => {
+  if (!gotLock) return
   try {
-    await cleanupTempDir()
+    await cleanupProfileTemp(BRINQ_TEMP_DIR, gotLock)
   } catch (err) {
     console.warn('Could not clean attachment temp directory:', err)
   }
