@@ -48,6 +48,8 @@ test('preserves semicolons and quoted pairs in quoted filenames', () => {
 test('recognizes only the direct-open extension allowlist', () => {
   assert.equal(isSafeOpenFilename('POLICY.DOCX'), true)
   assert.equal(isSafeOpenFilename('scan.pdf'), true)
+  assert.equal(isSafeOpenFilename('received-email.EML'), true)
+  assert.equal(isSafeOpenFilename('Outlook message.MSG'), true)
   assert.equal(isSafeOpenFilename('macro.docm'), false)
   assert.equal(isSafeOpenFilename('installer.exe'), false)
   assert.equal(isSafeOpenFilename('archive.zip'), false)
@@ -115,6 +117,13 @@ test('server names and compatible MIME govern opening, including extensionless A
   assert.equal(info('text/html', 'attachment; filename="server.pdf"').canOpen, false)
   assert.equal(info('image/png', 'attachment; filename="server.pdf"').canOpen, false)
   assert.equal(info('application/pdf', 'attachment; filename="server.pdf"', 'hint.exe').canOpen, true)
+  assert.equal(info('message/rfc822', undefined, 'received-email.eml').canOpen, true)
+  assert.equal(info('application/vnd.ms-outlook', 'attachment; filename="Outlook message.MSG"').canOpen, true)
+  assert.equal(info('application/octet-stream', 'attachment; filename="fax.EML"').canOpen, true)
+  assert.equal(info('application/octet-stream', 'attachment; filename="fax.MSG"').canOpen, true)
+  assert.equal(info('application/octet-stream', undefined, 'fax.msg').canOpen, false)
+  assert.equal(info('text/html', 'attachment; filename="fax.eml"').canOpen, false)
+  assert.equal(info('application/pdf', 'attachment; filename="fax.msg"').canOpen, false)
 })
 
 test('profile cleanup cannot affect another profile or run without the instance lock', async t => {

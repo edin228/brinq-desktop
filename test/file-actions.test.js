@@ -6,6 +6,7 @@ const os = require('node:os')
 const { EventEmitter } = require('node:events')
 const { randomUUID } = require('node:crypto')
 const { createFileActions, MAX_OPEN_BYTES } = require('../src/file-actions')
+const { MAX_EMAIL_BYTES } = require('../src/attachment-files')
 const { createWindowSecurity } = require('../src/window-security')
 const BASE = 'http://localhost:3004'
 const SOURCE = { kind: 'ams360-document', clientId: 'client', documentId: 'document', filename: 'hint.pdf' }
@@ -17,7 +18,7 @@ async function fixture(t, overrides = {}) {
   t.after(() => fs.rm(root, { recursive: true, force: true }))
   const tempDir = path.join(root, 'private')
   const target = path.join(root, 'saved.pdf')
-  const requests = [], opens = [], marks = [], retained = []
+  const requests = [], opens = [], emailOpens = [], marks = [], retained = []
   let fetcher = () => pdf()
   const security = createWindowSecurity({ baseUrl: BASE, preloadPath: '/preload', openExternal() {} })
   function addWindow() {
@@ -41,17 +42,129 @@ async function fixture(t, overrides = {}) {
     baseUrl: BASE, security, tempDir, platform: 'linux',
     showSaveDialog: async () => ({ canceled: false, filePath: target }),
     openPath: async file => { opens.push(file); return '' },
+    openEmailFile: async file => { emailOpens.push([path.basename(file), await fs.readFile(file)]); return { ok: true } },
     markOrigin: async (file, origin) => { marks.push([file, origin]); return false },
     scheduleCleanup: file => retained.push(file),
     ...overrides,
   })
   async function tempFiles() { try { return await fs.readdir(tempDir) } catch (e) { if (e.code === 'ENOENT') return []; throw e } }
-  return { root, tempDir, target, actions, event, addWindow, requests, opens, marks, retained, tempFiles,
+  return { root, tempDir, target, actions, event, addWindow, requests, opens, emailOpens, marks, retained, tempFiles,
     fetchWith(fn) { fetcher = fn },
     open(source = SOURCE, id = randomUUID()) { return actions.open(event, source, id) },
     save(source = SOURCE, id = randomUUID()) { return actions.save(event, source, id) },
   }
 }
+
+test('EML and MSG from Brinq and AMS open in the email viewer and leave no downloaded copy', async t => {
+  const cases = [
+    { source: { kind: 'brinq-file', uid: 'file', filename: 'received-email.eml' },
+      mime: 'message/rfc822', name: 'received-email.eml', body: 'From: sender@example.com\r\nSubject: Test\r\n\r\nHello' },
+    { source: { kind: 'ams360-activity-attachment', clientId: 'client', activityId: 'activity', ref: 'email-data', refKind: 'data', filename: 'fax.EML' },
+      mime: 'application/octet-stream', name: 'fax.EML', body: 'From: sender@example.com\r\nSubject: Fax\r\n\r\nHello' },
+    { source: { ...SOURCE, filename: 'Outlook message.MSG' },
+      mime: 'application/vnd.ms-outlook', name: 'Outlook message.MSG', body: 'MSG fixture bytes' },
+  ]
+  for (const item of cases) {
+    const f = await fixture(t)
+    f.fetchWith(url => url.includes('/api/files/')
+      ? Response.json({ url: 'https://cdn.brinq.io/email?signature=token' })
+      : new Response(item.body, { headers: {
+        'content-type': item.mime,
+        'content-disposition': `attachment; filename="${item.name}"`,
+      } }))
+    const result = await f.open(item.source)
+    assert.equal(result.ok, true)
+    assert.equal(f.emailOpens.length, 1)
+    assert.equal(f.emailOpens[0][0].endsWith(item.name), true)
+    assert.equal(f.emailOpens[0][1].toString(), item.body)
+    assert.deepEqual(f.opens, [])
+    assert.deepEqual(f.retained, [])
+    assert.deepEqual(await f.tempFiles(), [])
+  }
+})
+
+test('email viewer failures are reported safely and a later retry succeeds', async t => {
+  let attempts = 0
+  const f = await fixture(t, { openEmailFile: async () => {
+    if (++attempts === 1) throw new Error('private parser detail')
+    return { ok: true }
+  } })
+  f.fetchWith(() => new Response('From: a@example.com\r\n\r\nHello', { headers: {
+    'content-type': 'message/rfc822',
+    'content-disposition': 'attachment; filename="mail.eml"',
+  } }))
+  const first = await f.open()
+  assert.equal(first.code, 'email-open')
+  assert.equal(first.error.includes('private parser detail'), false)
+  assert.deepEqual(await f.tempFiles(), [])
+  assert.equal((await f.open()).ok, true)
+  assert.deepEqual(await f.tempFiles(), [])
+  assert.deepEqual(f.opens, [])
+})
+
+test('cancel or navigation while an email loads closes a viewer created at the handoff', async t => {
+  for (const trigger of ['cancel', 'navigation']) {
+    let entered
+    const started = new Promise(resolve => { entered = resolve })
+    let release
+    const waiting = new Promise(resolve => { release = resolve })
+    let closeCount = 0
+    let isAuthorized
+    const f = await fixture(t, { openEmailFile: async (_file, guard) => {
+      isAuthorized = guard
+      entered()
+      await waiting
+      return { ok: true, close: () => { closeCount++ } }
+    } })
+    f.fetchWith(() => new Response('From: a@example.com\r\n\r\nHello', { headers: {
+      'content-type': 'message/rfc822',
+      'content-disposition': 'attachment; filename="mail.eml"',
+    } }))
+    const id = randomUUID()
+    const opening = f.open(SOURCE, id)
+    await started
+    if (trigger === 'cancel') assert.equal(f.actions.cancel(f.event, id), true)
+    else f.event.sender.emit('did-start-navigation', {}, `${BASE}/other`, false, true)
+    assert.equal(isAuthorized(), false)
+    release()
+    assert.equal((await opening).canceled, true)
+    assert.equal(closeCount, 1)
+    assert.deepEqual(await f.tempFiles(), [])
+  }
+})
+
+test('viewer capacity failure explains the limit and recovery', async t => {
+  const f = await fixture(t, { openEmailFile: async () => ({
+    ok: false, code: 'viewer-limit', limit: 10, observed: 10,
+    error: 'There are 10 email viewers open or loading (limit 10). Close an email viewer and try again.',
+  }) })
+  f.fetchWith(() => new Response('From: a@example.com\r\n\r\nHello', { headers: {
+    'content-type': 'message/rfc822',
+    'content-disposition': 'attachment; filename="mail.eml"',
+  } }))
+  const result = await f.open()
+  assert.equal(result.code, 'viewer-limit')
+  assert.equal(result.limit, 10)
+  assert.equal(result.observed, 10)
+  assert.match(result.error, /Close an email viewer/)
+  assert.deepEqual(await f.tempFiles(), [])
+})
+
+test('email Open uses the existing 25 MiB viewer cap before downloading', async t => {
+  const f = await fixture(t)
+  f.fetchWith(() => new Response('small', { headers: {
+    'content-type': 'application/vnd.ms-outlook',
+    'content-disposition': 'attachment; filename="large.msg"',
+    'content-length': String(MAX_EMAIL_BYTES + 1),
+  } }))
+  const result = await f.open()
+  assert.equal(result.code, 'limit')
+  assert.equal(result.limitBytes, MAX_EMAIL_BYTES)
+  assert.equal(result.observedBytes, MAX_EMAIL_BYTES + 1)
+  assert.match(result.error, /Save As/)
+  assert.deepEqual(f.emailOpens, [])
+  assert.deepEqual(await f.tempFiles(), [])
+})
 
 test('Open streams complete private bytes and invokes the OS once using server filename authority', async t => {
   const f = await fixture(t)

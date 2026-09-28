@@ -7,6 +7,7 @@ const { SOURCE_KINDS, resolveSource, storageProxyUrl } = require('./file-sources
 const {
   responseFileInfo, ensurePrivateDirectory, markFileAsInternetOrigin,
   requiresInternetOriginProtection, readResponseWithLimit,
+  isEmailFilename, MAX_EMAIL_BYTES,
 } = require('./attachment-files')
 
 // Preserve the existing email Open envelope. Save As streams without this cap.
@@ -27,7 +28,7 @@ async function cancelBody(response) {
   try { await response?.body?.cancel() } catch { /* Pipeline may already own or close the body. */ }
 }
 
-function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPath,
+function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPath, openEmailFile,
   markOrigin = markFileAsInternetOrigin, platform = process.platform,
   scheduleCleanup,
 }) {
@@ -101,6 +102,8 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
         await fetchResponse(proxyUrl)
       }
       const info = responseFileInfo(response.headers, resolved.filename)
+      const emailOpen = mode === 'open' && isEmailFilename(info.filename)
+      const openLimit = emailOpen ? MAX_EMAIL_BYTES : MAX_OPEN_BYTES
       const activeMime = info.mime === 'text/html' || info.mime === 'application/xhtml+xml' || info.mime === 'application/json' || info.mime.endsWith('+json')
       if (!resolved.storageLink && activeMime && !info.attachment) fail('session', 'The server returned a page instead of a file. Sign in and try again.')
       if (mode === 'open' && !info.canOpen) fail('unsupported', 'This file type cannot be opened directly. Use Save As to save this file.')
@@ -108,7 +111,7 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
       const headerLength = response.headers.get('content-length')
       const declared = headerLength === null ? null : Number(headerLength)
       if (declared !== null && (!Number.isSafeInteger(declared) || declared < 0)) fail('network', 'The file size was invalid. Try again.')
-      if (mode === 'open' && declared > MAX_OPEN_BYTES) limit(declared)
+      if (mode === 'open' && declared > openLimit) limit(declared, openLimit)
       let target
       if (mode === 'save') {
         const selection = await showSaveDialog(event.sender, { defaultPath: info.filename })
@@ -130,8 +133,8 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
         transform(chunk, _encoding, callback) {
           total += chunk.length
           if (prefix.length < 512) prefix = Buffer.concat([prefix, chunk.subarray(0, 512 - prefix.length)])
-          if (mode === 'open' && total > MAX_OPEN_BYTES) {
-            callback(new FileFailure('limit', 'This file exceeds the 50 MiB Open limit. Use Save As to save this file.', { limitBytes: MAX_OPEN_BYTES, observedBytes: total }))
+          if (mode === 'open' && total > openLimit) {
+            callback(new FileFailure('limit', limitMessage(openLimit, total), { limitBytes: openLimit, observedBytes: total }))
           } else callback(null, chunk)
         },
       })
@@ -149,6 +152,18 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
       } catch { fail('protection', 'OS security protection could not be applied. Try Save As on a supported disk.') }
       check()
       if (mode === 'open') {
+        if (emailOpen) {
+          let outcome
+          try { outcome = await openEmailFile(stagingPath, () => !signal.aborted && stillAuthorized()) }
+          catch { /* Keep parser details out of the renderer. */ }
+          if (signal.aborted || !stillAuthorized()) {
+            outcome?.close?.()
+            canceled()
+          }
+          if (outcome?.code === 'viewer-limit') fail('viewer-limit', outcome.error, { limit: outcome.limit, observed: outcome.observed })
+          if (!outcome?.ok) fail('email-open', 'Brinq could not open this email file. Try again or use Save As to save it.')
+          return { ok: true, code: 'ok', canceled: false, unsafe: false }
+        }
         let error
         try { error = await openPath(stagingPath) } catch { error = true }
         if (error) fail('os-open', 'No application could open this file. Install an application for this file type or use Save As.')
@@ -186,8 +201,11 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
 function result(code, error, extra = {}) {
   return { ok: false, code, error, canceled: code === 'canceled', unsafe: code === 'unsupported', ...extra }
 }
-function limit(observedBytes) {
-  fail('limit', 'This file exceeds the 50 MiB Open limit. Use Save As to save this file.', { limitBytes: MAX_OPEN_BYTES, observedBytes })
+function limitMessage(limitBytes, observedBytes) {
+  return `This file is ${observedBytes.toLocaleString('en-US')} bytes and exceeds the ${limitBytes / (1024 * 1024)} MiB (${limitBytes.toLocaleString('en-US')} byte) Open limit. Use Save As to save this file.`
+}
+function limit(observedBytes, limitBytes) {
+  fail('limit', limitMessage(limitBytes, observedBytes), { limitBytes, observedBytes })
 }
 
 module.exports = { createFileActions, CAPABILITIES, MAX_OPEN_BYTES }

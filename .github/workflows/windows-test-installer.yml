@@ -1,9 +1,9 @@
 name: Windows installer
 
 on:
-  push:
+  pull_request:
     branches:
-      - feature/desktop-file-opening
+      - main
   workflow_dispatch:
 
 permissions:
@@ -11,7 +11,6 @@ permissions:
 
 jobs:
   build:
-    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,11 +21,7 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: |
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            npx electron-builder --win --publish never -c.extraMetadata.version=1.2.6-test.1
-          else
-            npx electron-builder --win --publish never
-          fi
+          npx electron-builder --win --publish never
           test -s dist/Brinq-Setup.exe
           test -s dist/Brinq-Setup.exe.blockmap
           test -s dist/latest.yml
