@@ -32,6 +32,8 @@ const {
   cleanupProfileTemp,
   markFileAsInternetOrigin,
   requiresInternetOriginProtection,
+  isEmailFilename,
+  MAX_EMAIL_BYTES,
 } = require('./attachment-files')
 const { createFileActions, CAPABILITIES } = require('./file-actions')
 const { createUpdateStatus } = require('./update-status')
@@ -84,7 +86,6 @@ const updates = createUpdateStatus({
 // ---------------------------------------------------------------------------
 // EML File Viewer — in-memory store and parser
 // ---------------------------------------------------------------------------
-const MAX_EML_BYTES = 25 * 1024 * 1024
 const MAX_CONCURRENT_VIEWERS = 10
 const fileViewerStore = new Map()
 let pendingViewerCount = 0
@@ -126,6 +127,12 @@ function parseMsgFile(buffer) {
     reader = new MsgReader(buffer)
     data = reader.getFileData()
   } catch {
+    throw new Error(
+      'This email file could not be parsed. It may be malformed or use an unsupported format.',
+    )
+  }
+
+  if (!data || data.error) {
     throw new Error(
       'This email file could not be parsed. It may be malformed or use an unsupported format.',
     )
@@ -281,9 +288,9 @@ function parseMsgFile(buffer) {
 async function parseEmailFile(filePath) {
   const stats = await fs.promises.stat(filePath)
   if (!stats.isFile()) throw new Error('Selected path is not a file.')
-  if (stats.size > MAX_EML_BYTES) {
+  if (stats.size > MAX_EMAIL_BYTES) {
     throw new Error(
-      `Email file exceeds ${MAX_EML_BYTES / (1024 * 1024)} MB limit.`,
+      `Email file exceeds ${MAX_EMAIL_BYTES / (1024 * 1024)} MiB limit.`,
     )
   }
 
@@ -475,6 +482,10 @@ ipcMain.handle(
       }
     }
 
+    if (isEmailFilename(safeName) && att.content.length > MAX_EMAIL_BYTES) {
+      return { ok: false, unsafe: false, error: `This email file is ${att.content.length.toLocaleString('en-US')} bytes and exceeds the ${MAX_EMAIL_BYTES / (1024 * 1024)} MiB (${MAX_EMAIL_BYTES.toLocaleString('en-US')} byte) Open limit. Use Save As instead.` }
+    }
+
     let tempPath
     let tempCreated = false
     try {
@@ -516,13 +527,22 @@ ipcMain.handle(
         console.warn('Could not mark attachment as Internet-originated:', err)
       }
 
-      if (!viewerTempFiles.has(viewerId)) viewerTempFiles.set(viewerId, new Set())
-      viewerTempFiles.get(viewerId).add(tempPath)
-
       if (!stillAuthorized()) {
         retryUnlink(tempPath, 1)
         return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
       }
+      if (isEmailFilename(safeName)) {
+        const outcome = await openEmailFile(tempPath, { showError: false, stillAuthorized })
+        retryUnlink(tempPath, 1)
+        if (!stillAuthorized()) {
+          outcome.close?.()
+          return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
+        }
+        if (outcome.code === 'viewer-limit') return { ok: false, unsafe: false, error: outcome.error }
+        return outcome.ok ? { ok: true } : { ok: false, unsafe: false, error: 'Brinq could not open this email file. Use Save As instead.' }
+      }
+      if (!viewerTempFiles.has(viewerId)) viewerTempFiles.set(viewerId, new Set())
+      viewerTempFiles.get(viewerId).add(tempPath)
       const errorMessage = await shell.openPath(tempPath)
       if (errorMessage) {
         retryUnlink(tempPath, 1)
@@ -551,6 +571,7 @@ const fileActions = createFileActions({
     return dialog.showSaveDialog(owner, options)
   },
   openPath: (file) => shell.openPath(file),
+  openEmailFile: (file, stillAuthorized) => openEmailFile(file, { showError: false, stillAuthorized }),
   scheduleCleanup: scheduleSyncedAttachmentCleanup,
 })
 ipcMain.handle('open-file', (event, source, id) => fileActions.open(event, source, id))
@@ -567,17 +588,16 @@ for (const [channel, action] of [['open-email-attachment', 'open'], ['save-email
 // ---------------------------------------------------------------------------
 // EML File Viewer — open file in popup window
 // ---------------------------------------------------------------------------
-async function openEmailFile(filePath) {
+async function openEmailFile(filePath, { showError = true, stillAuthorized = () => true } = {}) {
   if (fileViewerStore.size + pendingViewerCount >= MAX_CONCURRENT_VIEWERS) {
-    if (!viewerCapErrorShown) {
+    const observed = fileViewerStore.size + pendingViewerCount
+    const error = `There are ${observed} email viewers open or loading (limit ${MAX_CONCURRENT_VIEWERS}). Close an email viewer and try again.`
+    if (showError && !viewerCapErrorShown) {
       viewerCapErrorShown = true
-      dialog.showErrorBox(
-        'Too many viewers open',
-        `Please close some email viewer windows first (max ${MAX_CONCURRENT_VIEWERS}).`,
-      )
+      dialog.showErrorBox('Too many viewers open', error)
       process.nextTick(() => { viewerCapErrorShown = false })
     }
-    return
+    return { ok: false, code: 'viewer-limit', error, limit: MAX_CONCURRENT_VIEWERS, observed }
   }
 
   pendingViewerCount++
@@ -587,6 +607,7 @@ async function openEmailFile(filePath) {
 
   try {
     const result = await parseEmailFile(filePath)
+    if (!stillAuthorized()) throw new Error('File operation canceled.')
     viewerId = randomUUID()
 
     viewer = new BrowserWindow({
@@ -612,7 +633,12 @@ async function openEmailFile(filePath) {
     pendingViewerCount--
     registered = true
 
-    viewer.once('ready-to-show', () => viewer.show())
+    let ready = false
+    let loaded = false
+    viewer.once('ready-to-show', () => {
+      ready = true
+      if (loaded) viewer.show()
+    })
 
     // Keyboard shortcuts for document viewer
     viewer.webContents.on('before-input-event', (event, input) => {
@@ -649,19 +675,27 @@ async function openEmailFile(filePath) {
       if (!isAbort) throw loadErr
     }
 
+    if (!stillAuthorized()) throw new Error('File operation canceled.')
+    loaded = true
+    if (ready) viewer.show()
+
     viewer.once('closed', () => {
       fileViewerStore.delete(viewerId)
       cleanupViewerTempFiles(viewerId)
       maybeQuitAfterFileViewerClose()
     })
+    return { ok: true, close: () => { if (!viewer.isDestroyed()) viewer.destroy() } }
   } catch (err) {
     if (!registered) pendingViewerCount--
     if (viewerId) fileViewerStore.delete(viewerId)
     if (viewer && !viewer.isDestroyed()) viewer.destroy()
-    dialog.showErrorBox(
-      'Could not open email file',
-      err.message || 'Unknown error.',
-    )
+    if (showError) {
+      dialog.showErrorBox(
+        'Could not open email file',
+        err.message || 'Unknown error.',
+      )
+    }
+    return { ok: false, code: 'email-open' }
   }
 }
 

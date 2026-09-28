@@ -5,7 +5,15 @@ const SAFE_OPEN_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff',
   '.txt', '.csv',
   '.docx', '.xlsx', '.pptx',
+  '.eml', '.msg',
 ])
+
+// The email viewer parses the complete file in memory and already enforces this cap.
+const MAX_EMAIL_BYTES = 25 * 1024 * 1024
+
+function isEmailFilename(filename) {
+  return ['.eml', '.msg'].includes(path.extname(filename).toLowerCase())
+}
 
 function sanitizeDownloadName(filename, fallback = 'attachment') {
   const fallbackName =
@@ -113,6 +121,8 @@ module.exports = {
   readResponseWithLimit,
   sanitizeDownloadName,
   truncateFilenameBytes,
+  isEmailFilename,
+  MAX_EMAIL_BYTES,
 }
 
 const MIME_EXTENSIONS = {
@@ -123,6 +133,8 @@ const MIME_EXTENSIONS = {
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
   'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['.pptx'],
+  'message/rfc822': ['.eml'],
+  'application/vnd.ms-outlook': ['.msg'],
 }
 
 function responseFileInfo(headers, hint) {
