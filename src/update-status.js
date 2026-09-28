@@ -1,3 +1,5 @@
+const fs = require('fs')
+
 // Electron updater 6.8.3 starts installation inside quitAndInstall, before its
 // own app.quit. Call it only from will-quit, after every window accepted closing.
 function createUpdateStatus({ app, updater, onChange = () => {}, restoreWindow = () => {}, schedule = setImmediate }) {
@@ -46,7 +48,19 @@ function createUpdateStatus({ app, updater, onChange = () => {}, restoreWindow =
     event.preventDefault()
     restartPending = false
     installing = true
-    try { updater.quitAndInstall() } catch { fail() }
+    try {
+      // BaseUpdater (NSIS/Linux) exposes its downloaded installer. MacUpdater
+      // delegates to Squirrel and has no installerPath. Check at the last
+      // synchronous point: NSIS 6.8.3 can swallow openPath's resolved error after
+      // a missing-file spawn and still quit. Do not enter that fallback.
+      if ('installerPath' in updater) {
+        const descriptor = fs.openSync(updater.installerPath, 'r')
+        try {
+          if (!fs.fstatSync(descriptor).isFile()) throw new Error('Installer is not a regular file')
+        } finally { fs.closeSync(descriptor) }
+      }
+      updater.quitAndInstall()
+    } catch { fail() }
   }
 
   function cancelQuit() {

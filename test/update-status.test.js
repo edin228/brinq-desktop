@@ -160,3 +160,130 @@ test('an asynchronous installer error cancels the updater scheduled quit and all
   assert.equal(f.updater.quitAndInstallCalled, false)
   assert.equal(f.updater.autoInstallOnAppQuit, false)
 })
+
+
+test('installed updater contract: missing NSIS installer recovers before its silent openPath failure', async (t) => {
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const os = require('node:os')
+  const Module = require('node:module')
+  const { NsisUpdater } = require('electron-updater/out/NsisUpdater')
+  const { MacUpdater } = require('electron-updater/out/MacUpdater')
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'brinq-installer-contract-'))
+  const installer = path.join(directory, 'installer.exe')
+  const missing = path.join(directory, 'missing.exe')
+  fs.writeFileSync(installer, 'fixture; never executed')
+  let electron
+  const originalLoad = Module._load
+  Module._load = function(name, ...args) {
+    return name === 'electron' ? electron : originalLoad.call(this, name, ...args)
+  }
+  t.after(() => { Module._load = originalLoad; fs.rmSync(directory, { recursive: true, force: true }) })
+  const settle = async () => { for (let turn = 0; turn < 4; turn++) await new Promise(setImmediate) }
+
+  function installedFixture({ file = missing, dirty = false, mac = false, managed = true } = {}) {
+    const app = new EventEmitter()
+    app.isPackaged = true
+    const frame = new EventEmitter()
+    let windowsOpen = true
+    let exited = false
+    let restored = 0
+    let spawns = 0
+    let opens = 0
+    let installs = 0
+    let errors = 0
+    electron = {
+      autoUpdater: new EventEmitter(),
+      shell: { openPath: async () => { opens++; return 'The system cannot find the file specified.' } },
+    }
+    const event = () => ({ defaultPrevented: false, preventDefault() { this.defaultPrevented = true } })
+    app.quit = () => {
+      const before = event()
+      app.emit('before-quit', before)
+      if (before.defaultPrevented) return
+      app.isQuitting = true
+      if (windowsOpen && dirty) { frame.emit('will-prevent-unload'); return }
+      windowsOpen = false
+      const quitting = event()
+      app.emit('will-quit', quitting)
+      if (!quitting.defaultPrevented) exited = true
+    }
+    electron.autoUpdater.quitAndInstall = () => {
+      assert.equal(windowsOpen, false)
+      installs++
+      setImmediate(app.quit)
+    }
+    const updater = new (mac ? MacUpdater : NsisUpdater)(null, { version: '1.2.5', quit: app.quit })
+    updater.logger = null
+    updater.on('error', () => { errors++ })
+    if (mac) updater.squirrelDownloadedUpdate = true
+    else updater.downloadedUpdateHelper = { file, downloadedFileInfo: { isAdminRightsRequired: false } }
+    // Stub only OS execution. Installed BaseUpdater.quitAndInstall and
+    // NsisUpdater.doInstall, including the ENOENT fallback, remain real.
+    updater.spawnLog = async () => {
+      spawns++
+      if (file === missing) throw Object.assign(new Error('missing fixture'), { code: 'ENOENT' })
+      assert.equal(windowsOpen, false)
+      installs++
+      return true
+    }
+    const owner = managed ? createUpdateStatus({ app, updater, restoreWindow: () => { restored++; windowsOpen = true } }) : null
+    if (owner) {
+      app.emit('browser-window-created', {}, { webContents: frame })
+      updater.emit('update-downloaded', { version: '2.0.0' })
+    }
+    return { app, updater, owner, snapshot: () => ({ exited, restored, spawns, opens, installs, errors }) }
+  }
+
+  await t.test('reproduces the installed ENOENT/openPath contract without Brinq protection', async () => {
+    const f = installedFixture({ managed: false })
+    f.updater.quitAndInstall()
+    await settle()
+    assert.deepEqual(f.snapshot(), { exited: true, restored: 0, spawns: 1, opens: 1, installs: 0, errors: 0 })
+  })
+  for (const [label, file] of [['missing', missing], ['directory', directory], ['absent metadata', null]]) {
+    await t.test(`${label} installer recovers without invoking native execution`, async () => {
+      const f = installedFixture({ file })
+      f.owner.restart()
+      await settle()
+      assert.deepEqual(f.snapshot(), { exited: false, restored: 1, spawns: 0, opens: 0, installs: 0, errors: 0 })
+      assert.equal(f.owner.getState().status, 'error')
+      assert.equal(f.updater.autoInstallOnAppQuit, false)
+      assert.equal(f.app.isQuitting, false)
+    })
+  }
+  await t.test('checks again after restart is requested, immediately before installer invocation', async () => {
+    const removed = path.join(directory, 'removed.exe')
+    fs.writeFileSync(removed, 'fixture')
+    const f = installedFixture({ file: removed })
+    f.owner.restart()
+    fs.unlinkSync(removed)
+    await settle()
+    assert.equal(f.snapshot().restored, 1)
+    assert.equal(f.snapshot().spawns, 0)
+    assert.equal(f.snapshot().exited, false)
+  })
+  await t.test('a readable regular installer preserves the installed success path', async () => {
+    const f = installedFixture({ file: installer })
+    f.owner.restart()
+    await settle()
+    assert.deepEqual(f.snapshot(), { exited: true, restored: 0, spawns: 1, opens: 0, installs: 1, errors: 0 })
+  })
+  await t.test('dirty window still vetoes before any installed updater invocation', async () => {
+    const f = installedFixture({ file: installer, dirty: true })
+    f.owner.restart()
+    await settle()
+    assert.equal(f.snapshot().spawns, 0)
+    assert.equal(f.snapshot().exited, false)
+    assert.equal(f.owner.getState().status, 'ready')
+  })
+  await t.test('installed MacUpdater still delegates to native Squirrel without an installer path', async () => {
+    const f = installedFixture({ mac: true })
+    assert.equal('installerPath' in f.updater, false)
+    f.owner.restart()
+    await settle()
+    assert.equal(f.snapshot().installs, 1)
+    assert.equal(f.snapshot().exited, true)
+    assert.equal(f.snapshot().restored, 0)
+  })
+})
