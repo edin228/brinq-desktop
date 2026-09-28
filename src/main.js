@@ -8,12 +8,12 @@ const {
   shell,
   nativeImage,
   dialog,
+  screen,
 } = require('electron')
 const { randomUUID } = require('crypto')
-const { execFile } = require('child_process')
 const fs = require('fs')
 const path = require('path')
-const { promisify } = require('util')
+const { pathToFileURL } = require('url')
 const { autoUpdater } = require('electron-updater')
 const { simpleParser } = require('mailparser')
 const MsgReader = require('@kenjiuno/msgreader').default
@@ -21,16 +21,20 @@ const { decompressRTF } = require('@kenjiuno/decompressrtf')
 const { deEncapsulateSync } = require('rtf-stream-parser')
 const iconv = require('iconv-lite')
 const config = require('./config')
+const { isMode, modeUrl, visibleBounds, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue } = require('./window-state')
+const { createWindowSecurity } = require('./window-security')
 const {
-  buildSyncedAttachmentUrl,
-  filenameFromContentDisposition,
   isSafeOpenFilename,
-  readResponseWithLimit,
   sanitizeDownloadName,
   truncateFilenameBytes,
+  profileTempDir,
+  ensurePrivateDirectory,
+  cleanupProfileTemp,
+  markFileAsInternetOrigin,
+  requiresInternetOriginProtection,
 } = require('./attachment-files')
-
-const execFileAsync = promisify(execFile)
+const { createFileActions, CAPABILITIES } = require('./file-actions')
+const { createUpdateStatus } = require('./update-status')
 
 // Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
 if (process.platform === 'win32') {
@@ -46,11 +50,36 @@ app.commandLine.appendSwitch('enable-features', 'BackdropFilter')
 const PRELOAD_PATH = path.join(__dirname, 'preload.js')
 const BASE_URL = config.getBaseUrl()
 const BASE_ORIGIN = new URL(BASE_URL).origin
+const windowSecurity = createWindowSecurity({
+  baseUrl: BASE_URL,
+  preloadPath: PRELOAD_PATH,
+  openExternal: (url) => shell.openExternal(url),
+})
 
 let mainWindow = null
 let tray = null
-let pendingPayloads = []
-let rendererReady = false
+const navigationQueue = createNavigationQueue()
+let navigatingMain = false
+let recoveryWindow = null
+let intendedAppUrl = null
+let recoveryRetry = null
+const RECOVERY_URL = pathToFileURL(path.join(__dirname, 'offline.html')).href
+const updates = createUpdateStatus({
+  app, updater: autoUpdater,
+  onChange: (state) => {
+    if (tray) updateTrayMenu()
+    for (const window of BrowserWindow.getAllWindows()) {
+      const contents = window.webContents
+      if (validateSender({ sender: contents, senderFrame: contents.mainFrame })) {
+        contents.send('update-status', state)
+      }
+    }
+  },
+  restoreWindow: () => {
+    if (!mainWindow || mainWindow.isDestroyed()) createWindow({ initialUrl: intendedAppUrl })
+    showMainWindow()
+  },
+})
 
 // ---------------------------------------------------------------------------
 // EML File Viewer — in-memory store and parser
@@ -305,18 +334,7 @@ async function parseEmailFile(filePath) {
 // EML File Viewer — IPC validation and URL helpers
 // ---------------------------------------------------------------------------
 function validateFileViewerSender(event, viewerId) {
-  if (!validateSender(event)) return false
-  const stored = fileViewerStore.get(viewerId)
-  return !!stored && event.sender.id === stored.windowId
-}
-
-function isAllowedExternalUrl(url) {
-  try {
-    const parsed = new URL(url)
-    return ['http:', 'https:', 'mailto:', 'tel:'].includes(parsed.protocol)
-  } catch {
-    return false
-  }
+  return windowSecurity.validateViewerSender(event, fileViewerStore.get(viewerId))
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +352,7 @@ ipcMain.handle('get-file-email', (event, viewerId) => {
 ipcMain.handle(
   'save-file-attachment',
   async (event, viewerId, attachmentIndex) => {
+    const stillAuthorized = windowSecurity.captureSender(event, ['viewer'])
     if (
       typeof viewerId !== 'string' ||
       !validateFileViewerSender(event, viewerId)
@@ -371,6 +390,9 @@ ipcMain.handle(
     }
 
     try {
+      if (!stillAuthorized()) {
+        return { ok: false, canceled: true, error: 'Window navigated or closed.' }
+      }
       await fs.promises.writeFile(savePath, att.content)
       return { ok: true, canceled: false }
     } catch (err) {
@@ -383,70 +405,11 @@ ipcMain.handle(
   },
 )
 
-const BRINQ_TEMP_DIR = path.join(app.getPath('temp'), 'brinq-viewer')
+const BRINQ_TEMP_DIR = profileTempDir(app.getPath('temp'), app.getPath('userData'))
 const viewerTempFiles = new Map() // viewerId -> Set<tempPath>
 
-function cleanupTempDir() {
-  return fs.promises.rm(BRINQ_TEMP_DIR, { recursive: true, force: true })
-}
-
-async function ensurePrivateTempDir() {
-  await fs.promises.mkdir(BRINQ_TEMP_DIR, { recursive: true, mode: 0o700 })
-  const stats = await fs.promises.lstat(BRINQ_TEMP_DIR)
-  if (!stats.isDirectory() || stats.isSymbolicLink()) {
-    throw new Error('Attachment temp path is not a private directory.')
-  }
-  if (typeof process.getuid === 'function' && stats.uid !== process.getuid()) {
-    throw new Error('Attachment temp directory has an unexpected owner.')
-  }
-  if (process.platform !== 'win32') {
-    await fs.promises.chmod(BRINQ_TEMP_DIR, 0o700)
-  }
-}
-
-const INTERNET_PROTECTION_REQUIRED_EXTENSIONS = new Set([
-  '.csv',
-  '.docx',
-  '.xlsx',
-  '.pptx',
-])
-
-async function markFileAsInternetOrigin(filePath, sourceUrl) {
-  if (process.platform === 'win32') {
-    const zoneData = [
-      '[ZoneTransfer]',
-      'ZoneId=3',
-      `HostUrl=${sourceUrl}`,
-      '',
-    ].join('\r\n')
-    await fs.promises.writeFile(`${filePath}:Zone.Identifier`, zoneData, {
-      mode: 0o600,
-    })
-    return true
-  } else if (process.platform === 'darwin') {
-    const timestamp = Math.floor(Date.now() / 1000).toString(16)
-    const quarantine = `0083;${timestamp};Brinq;${randomUUID()}`
-    await execFileAsync('/usr/bin/xattr', [
-      '-w',
-      'com.apple.quarantine',
-      quarantine,
-      filePath,
-    ])
-    return true
-  }
-  return false
-}
-
-function requiresInternetOriginProtection(filename) {
-  // Linux has no interoperable Internet-zone/quarantine metadata that native
-  // viewers enforce. Its safety boundary remains the macro-free extension
-  // allowlist; Windows and macOS additionally require their OS provenance.
-  if (process.platform !== 'win32' && process.platform !== 'darwin') {
-    return false
-  }
-  return INTERNET_PROTECTION_REQUIRED_EXTENSIONS.has(
-    path.extname(filename).toLowerCase(),
-  )
+function ensurePrivateTempDir() {
+  return ensurePrivateDirectory(BRINQ_TEMP_DIR)
 }
 
 function retryUnlink(filePath, attemptsLeft) {
@@ -479,6 +442,7 @@ function scheduleSyncedAttachmentCleanup(tempPath) {
 ipcMain.handle(
   'open-file-attachment',
   async (event, viewerId, attachmentIndex) => {
+    const stillAuthorized = windowSecurity.captureSender(event, ['viewer'])
     if (
       typeof viewerId !== 'string' ||
       !validateFileViewerSender(event, viewerId)
@@ -511,16 +475,21 @@ ipcMain.handle(
       }
     }
 
+    let tempPath
+    let tempCreated = false
     try {
       await ensurePrivateTempDir()
-      const tempPath = path.join(
+      tempPath = path.join(
         BRINQ_TEMP_DIR,
         `${randomUUID()}-${truncateFilenameBytes(safeName, 180)}`,
       )
-      await fs.promises.writeFile(tempPath, att.content, {
-        flag: 'wx',
-        mode: 0o600,
-      })
+      const handle = await fs.promises.open(tempPath, 'wx', 0o600)
+      tempCreated = true
+      try {
+        await handle.writeFile(att.content)
+      } finally {
+        await handle.close()
+      }
 
       try {
         const protectedByOs = await markFileAsInternetOrigin(
@@ -550,12 +519,18 @@ ipcMain.handle(
       if (!viewerTempFiles.has(viewerId)) viewerTempFiles.set(viewerId, new Set())
       viewerTempFiles.get(viewerId).add(tempPath)
 
+      if (!stillAuthorized()) {
+        retryUnlink(tempPath, 1)
+        return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
+      }
       const errorMessage = await shell.openPath(tempPath)
       if (errorMessage) {
-        return { ok: false, error: errorMessage, unsafe: false }
+        retryUnlink(tempPath, 1)
+        return { ok: false, error: 'No application could open this file. Use Save As instead.', unsafe: false }
       }
       return { ok: true }
     } catch (err) {
+      if (tempCreated) retryUnlink(tempPath, 1)
       return {
         ok: false,
         unsafe: false,
@@ -565,194 +540,29 @@ ipcMain.handle(
   },
 )
 
-// ---------------------------------------------------------------------------
-// Synced inbox attachments — authenticated download, native open, and save
-// ---------------------------------------------------------------------------
-const MAX_SYNCED_ATTACHMENT_BYTES = 50 * 1024 * 1024
-
-async function cancelResponseBody(response) {
-  if (!response?.body) return
-  try {
-    await response.body.cancel()
-  } catch {
-    // The request may already have closed while handling the user action.
-  }
-}
-
-async function fetchSyncedAttachmentResponse(
-  event,
-  emailUid,
-  attachmentId,
-  fallbackFilename,
-) {
-  if (!validateSender(event)) {
-    return { ok: false, error: 'Unauthorized sender.' }
-  }
-
-  const url = buildSyncedAttachmentUrl(BASE_URL, emailUid, attachmentId)
-  if (!url) return { ok: false, error: 'Invalid attachment request.' }
-
-  try {
-    const response = await event.sender.session.fetch(url, {
-      credentials: 'include',
-    })
-    if (!response.ok) {
-      await cancelResponseBody(response)
-      return {
-        ok: false,
-        error:
-          response.status === 401 || response.status === 403
-            ? 'Your session expired. Sign in and try again.'
-            : 'Failed to download attachment.',
-      }
-    }
-
-    const declaredBytes = Number(response.headers.get('content-length') || 0)
-    if (declaredBytes > MAX_SYNCED_ATTACHMENT_BYTES) {
-      await cancelResponseBody(response)
-      return { ok: false, error: 'Attachment exceeds the 50MB limit.' }
-    }
-
-    return {
-      ok: true,
-      response,
-      filename: filenameFromContentDisposition(
-        response.headers.get('content-disposition'),
-        sanitizeDownloadName(fallbackFilename),
-      ),
-    }
-  } catch (err) {
-    return {
-      ok: false,
-      error: err?.message || 'Failed to download attachment.',
-    }
-  }
-}
-
-ipcMain.handle(
-  'open-email-attachment',
-  async (event, emailUid, attachmentId, fallbackFilename) => {
-    const result = await fetchSyncedAttachmentResponse(
-      event,
-      emailUid,
-      attachmentId,
-      fallbackFilename,
-    )
-    if (!result.ok) return { ...result, unsafe: false }
-
-    if (!isSafeOpenFilename(result.filename)) {
-      await cancelResponseBody(result.response)
-      return {
-        ok: false,
-        unsafe: true,
-        error: 'This file type must be saved before it can be opened.',
-      }
-    }
-
-    try {
-      const content = await readResponseWithLimit(
-        result.response,
-        MAX_SYNCED_ATTACHMENT_BYTES,
-      )
-      await ensurePrivateTempDir()
-      const tempPath = path.join(
-        BRINQ_TEMP_DIR,
-        `${randomUUID()}-${truncateFilenameBytes(result.filename, 180)}`,
-      )
-      await fs.promises.writeFile(tempPath, content, {
-        flag: 'wx',
-        mode: 0o600,
-      })
-      try {
-        const protectedByOs = await markFileAsInternetOrigin(
-          tempPath,
-          BASE_ORIGIN,
-        )
-        if (
-          !protectedByOs &&
-          requiresInternetOriginProtection(result.filename)
-        ) {
-          retryUnlink(tempPath, 1)
-          return {
-            ok: false,
-            unsafe: true,
-            error: 'This file type must be saved before it can be opened.',
-          }
-        }
-      } catch (err) {
-        if (requiresInternetOriginProtection(result.filename)) {
-          retryUnlink(tempPath, 1)
-          return {
-            ok: false,
-            unsafe: true,
-            error: 'Could not apply OS security protections. Use "Save As" instead.',
-          }
-        }
-        console.warn('Could not mark attachment as Internet-originated:', err)
-      }
-      scheduleSyncedAttachmentCleanup(tempPath)
-      const errorMessage = await shell.openPath(tempPath)
-      if (errorMessage) {
-        return { ok: false, unsafe: false, error: errorMessage }
-      }
-      return { ok: true, unsafe: false }
-    } catch (err) {
-      return {
-        ok: false,
-        unsafe: false,
-        error: err?.message || 'Failed to open attachment.',
-      }
-    }
+// Authenticated remote files share one cancellable streaming owner.
+const fileActions = createFileActions({
+  baseUrl: BASE_URL,
+  security: windowSecurity,
+  tempDir: BRINQ_TEMP_DIR,
+  showSaveDialog: (contents, options) => {
+    const owner = BrowserWindow.fromWebContents(contents)
+    if (!owner || owner.isDestroyed()) return { canceled: true }
+    return dialog.showSaveDialog(owner, options)
   },
-)
+  openPath: (file) => shell.openPath(file),
+  scheduleCleanup: scheduleSyncedAttachmentCleanup,
+})
+ipcMain.handle('open-file', (event, source, id) => fileActions.open(event, source, id))
+ipcMain.handle('save-file-as', (event, source, id) => fileActions.save(event, source, id))
+ipcMain.handle('cancel-file-operation', (event, id) => fileActions.cancel(event, id))
+ipcMain.handle('file-capabilities', (event) => validateSender(event) ? CAPABILITIES : null)
 
-ipcMain.handle(
-  'save-email-attachment',
-  async (event, emailUid, attachmentId, fallbackFilename) => {
-    const result = await fetchSyncedAttachmentResponse(
-      event,
-      emailUid,
-      attachmentId,
-      fallbackFilename,
-    )
-    if (!result.ok) return { ...result, canceled: false }
-
-    const owner = BrowserWindow.fromWebContents(event.sender)
-    if (!owner || owner.isDestroyed()) {
-      await cancelResponseBody(result.response)
-      return { ok: false, canceled: false, error: 'Email window closed.' }
-    }
-
-    const { canceled, filePath: savePath } = await dialog.showSaveDialog(
-      owner,
-      { defaultPath: result.filename },
-    )
-    if (canceled || !savePath) {
-      await cancelResponseBody(result.response)
-      return { ok: false, canceled: true }
-    }
-
-    try {
-      const content = await readResponseWithLimit(
-        result.response,
-        MAX_SYNCED_ATTACHMENT_BYTES,
-      )
-      await fs.promises.writeFile(savePath, content)
-      try {
-        await markFileAsInternetOrigin(savePath, BASE_ORIGIN)
-      } catch (err) {
-        console.warn('Could not mark saved attachment as Internet-originated:', err)
-      }
-      return { ok: true, canceled: false }
-    } catch (err) {
-      return {
-        ok: false,
-        canceled: false,
-        error: err?.message || 'Failed to save attachment.',
-      }
-    }
-  },
-)
+// Old frontend versions retain their result fields and fixed email methods.
+for (const [channel, action] of [['open-email-attachment', 'open'], ['save-email-attachment', 'save']]) {
+  ipcMain.handle(channel, (event, emailUid, attachmentId, filename) =>
+    fileActions[action](event, { kind: 'synced-email-attachment', emailUid, attachmentId, filename }, randomUUID()))
+}
 
 // ---------------------------------------------------------------------------
 // EML File Viewer — open file in popup window
@@ -791,6 +601,7 @@ async function openEmailFile(filePath) {
         preload: PRELOAD_PATH,
         contextIsolation: true,
         nodeIntegration: false,
+        sandbox: true,
       },
     })
 
@@ -821,20 +632,7 @@ async function openEmailFile(filePath) {
 
     const viewerUrl = `${BASE_URL}/email/file-viewer?viewerId=${viewerId}`
 
-    viewer.webContents.on('will-navigate', (event, url) => {
-      if (url === viewerUrl) return
-      event.preventDefault()
-      if (isAllowedExternalUrl(url)) {
-        shell.openExternal(url)
-      }
-    })
-
-    viewer.webContents.setWindowOpenHandler(({ url }) => {
-      if (isAllowedExternalUrl(url)) {
-        shell.openExternal(url)
-      }
-      return { action: 'deny' }
-    })
+    windowSecurity.register(viewer, 'viewer', viewerUrl)
 
     try {
       await viewer.loadURL(viewerUrl)
@@ -949,8 +747,7 @@ if (!gotLock) {
     if (protocolArg) handleProtocolUrl(protocolArg)
     if (mainWindow) {
       launchedForFileViewerOnly = false
-      mainWindow.show()
-      mainWindow.focus()
+      showMainWindow()
     }
   })
 }
@@ -958,34 +755,8 @@ if (!gotLock) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-function isSameOriginEmailPopout(url) {
-  try {
-    const parsed = new URL(url)
-    return (
-      parsed.origin === BASE_ORIGIN && parsed.pathname.startsWith('/email/')
-    )
-  } catch {
-    return false
-  }
-}
-
-function isOffOriginHttp(url) {
-  try {
-    const parsed = new URL(url)
-    return (
-      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-      parsed.origin !== BASE_ORIGIN
-    )
-  } catch {
-    return false
-  }
-}
-
 function getModeUrl() {
-  const mode = config.getMode()
-  return mode === 'email'
-    ? `${BASE_URL}/emails?standalone=email`
-    : `${BASE_URL}/dashboard?standalone=full`
+  return modeUrl(BASE_URL, config.getMode())
 }
 
 function isOnEmailsRoute() {
@@ -1009,59 +780,34 @@ function isOnLoginPage() {
 }
 
 function drainPendingPayloads() {
-  if (!rendererReady || pendingPayloads.length === 0) return
-  for (const payload of pendingPayloads) {
-    if (payload.type === 'mailto') {
-      mainWindow.webContents.send('mailto', payload.data)
-    } else if (payload.type === 'navigate-email') {
-      mainWindow.webContents.send('navigate-email', payload.uid)
-    }
-  }
-  pendingPayloads = []
+  if (!mainWindow || navigatingMain || !isOnEmailsRoute()) return
+  const contents = mainWindow.webContents
+  const frame = contents.mainFrame
+  if (!windowSecurity.validateSender({ sender: contents, senderFrame: frame }, ['main'])) return
+  navigationQueue.drain(frame, (channel, data) => contents.send(channel, data))
 }
 
-function queuePayload(payload) {
-  pendingPayloads.push(payload)
-  drainPendingPayloads()
+function routePendingPayloads() {
+  if (!mainWindow || navigatingMain || !navigationQueue.hasPending()) return
+  const target = incomingNavigationUrl(mainWindow.webContents.getURL(), BASE_URL, config.getMode())
+  if (target) mainWindow.loadURL(target).catch(() => {})
+  else drainPendingPayloads()
 }
 
-// ---------------------------------------------------------------------------
-// Protocol URL handling (mailto: and brinq://)
-// ---------------------------------------------------------------------------
-function parseMailtoUrl(url) {
-  const parsed = new URL(url)
-  const to = decodeURIComponent(parsed.pathname)
-    .split(/[;,]/)
-    .map((v) => v.trim())
-    .filter(Boolean)
-  const subject = parsed.searchParams.get('subject') || ''
-  const cc = (parsed.searchParams.get('cc') || '')
-    .split(/[;,]/)
-    .map((v) => v.trim())
-    .filter(Boolean)
-  const body = parsed.searchParams.get('body') || ''
-  return { to, subject, cc, body }
+function queuePayload(channel, data) {
+  navigationQueue.push(channel, data)
+  routePendingPayloads()
 }
 
+// Protocols activate Brinq or compose email; they never select an arbitrary URL.
 function handleProtocolUrl(url) {
-  if (url.startsWith('mailto:')) {
-    const data = parseMailtoUrl(url)
-    if (mainWindow) {
-      launchedForFileViewerOnly = false
-      mainWindow.show()
-      mainWindow.focus()
-    }
-    if (!isOnEmailsRoute() && mainWindow) {
-      mainWindow.loadURL(getModeUrl())
-    }
-    queuePayload({ type: 'mailto', data })
-  } else if (url.startsWith('brinq:')) {
-    if (mainWindow) {
-      launchedForFileViewerOnly = false
-      mainWindow.show()
-      mainWindow.focus()
-    }
+  const payload = parseProtocolUrl(url)
+  if (!payload) return
+  if (mainWindow) {
+    launchedForFileViewerOnly = false
+    showMainWindow()
   }
+  if (payload.type === 'mailto') queuePayload('mailto', payload.data)
 }
 
 // Register Brinq-owned deep links only. Do not register as the system
@@ -1077,8 +823,77 @@ app.on('open-url', (event, url) => {
 // ---------------------------------------------------------------------------
 // Window creation
 // ---------------------------------------------------------------------------
-function createWindow({ showOnReady = true } = {}) {
-  const bounds = config.getWindowBounds()
+// Recovery owns a local window and only retries the last approved app route.
+function approvedAppUrl(value) {
+  try {
+    const url = new URL(value)
+    return url.origin === BASE_ORIGIN && ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password
+  } catch { return false }
+}
+
+function showMainWindow() {
+  const window = recoveryWindow && !recoveryWindow.isDestroyed() ? recoveryWindow : mainWindow
+  if (!window || window.isDestroyed()) return
+  if (window.isMinimized()) window.restore()
+  window.show()
+  window.focus()
+}
+
+function showRecovery() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.hide()
+  if (recoveryWindow && !recoveryWindow.isDestroyed()) { showMainWindow(); return }
+  const window = new BrowserWindow({
+    width: 520, height: 340, show: false, autoHideMenuBar: true, title: 'Brinq',
+    webPreferences: {
+      preload: path.join(__dirname, 'recovery-preload.js'),
+      contextIsolation: true, nodeIntegration: false, sandbox: true,
+    },
+  })
+  recoveryWindow = window
+  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  window.webContents.on('will-navigate', (event) => event.preventDefault())
+  window.webContents.on('will-redirect', (event) => event.preventDefault())
+  window.once('ready-to-show', () => window.show())
+  window.on('close', (event) => {
+    if (!app.isQuitting) { event.preventDefault(); window.hide() }
+  })
+  window.once('closed', () => {
+    if (recoveryWindow === window) recoveryWindow = null
+  })
+  window.loadURL(RECOVERY_URL).catch(() => {})
+  if (tray) updateTrayMenu()
+}
+
+function validateRecoverySender(event) {
+  try {
+    const contents = recoveryWindow?.webContents
+    const frame = event.senderFrame
+    return !!contents && !recoveryWindow.isDestroyed() && !contents.isDestroyed() &&
+      event.sender === contents && frame === contents.mainFrame && !frame.detached &&
+      frame.parent === null && frame.url === RECOVERY_URL && contents.getURL() === RECOVERY_URL
+  } catch { return false }
+}
+
+function retryMainWindow() {
+  if (recoveryRetry) return recoveryRetry
+  if (!mainWindow || mainWindow.isDestroyed() || !approvedAppUrl(intendedAppUrl)) {
+    return Promise.resolve({ ok: false, error: 'Brinq could not reconnect. Reopen the app and try again.' })
+  }
+  recoveryRetry = mainWindow.loadURL(intendedAppUrl)
+    .then(() => ({ ok: true }))
+    .catch(() => ({ ok: false, error: 'Still unable to connect. Check your connection and try again.' }))
+    .finally(() => { recoveryRetry = null })
+  return recoveryRetry
+}
+
+ipcMain.handle('retry-app-load', (event) => {
+  if (!validateRecoverySender(event)) return { ok: false, error: 'Unauthorized sender.' }
+  return retryMainWindow()
+})
+
+function createWindow({ showOnReady = true, initialUrl = null } = {}) {
+  const bounds = visibleBounds(config.getWindowBounds(), screen.getAllDisplays().map((display) => display.workArea), screen.getPrimaryDisplay().workArea)
 
   mainWindow = new BrowserWindow({
     width: bounds.width,
@@ -1093,14 +908,39 @@ function createWindow({ showOnReady = true } = {}) {
       preload: PRELOAD_PATH,
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
     },
   })
 
   mainWindow.once('ready-to-show', () => {
-    if (showOnReady) mainWindow.show()
+    if (showOnReady && !recoveryWindow) mainWindow.show()
   })
 
-  mainWindow.loadURL(getModeUrl())
+  windowSecurity.register(mainWindow, 'main')
+  mainWindow.webContents.on('did-start-navigation', (_event, url, inPlace, isMainFrame) => {
+    if (isMainFrame && !inPlace) {
+      navigatingMain = true
+      if (approvedAppUrl(url)) intendedAppUrl = url
+      navigationQueue.reset()
+    }
+  })
+  mainWindow.webContents.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame) => {
+    if (isMainFrame) navigatingMain = false
+  })
+  mainWindow.webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+    if (isMainFrame) {
+      if (approvedAppUrl(url)) intendedAppUrl = url
+      routePendingPayloads()
+    }
+  })
+  mainWindow.webContents.on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
+    if (!isMainFrame || code === -3 || url !== intendedAppUrl || !approvedAppUrl(url)) return
+    navigatingMain = false
+    showRecovery()
+  })
+  const target = approvedAppUrl(initialUrl) ? initialUrl : navigationQueue.hasPending() ? modeUrl(BASE_URL, config.getMode(), true) : getModeUrl()
+  intendedAppUrl = target
+  mainWindow.loadURL(target).catch(() => {})
 
   // Save window bounds on move/resize
   const saveBounds = () => {
@@ -1119,53 +959,18 @@ function createWindow({ showOnReady = true } = {}) {
     }
   })
 
-  // Track when the renderer is on /emails and ready for IPC payloads
+  mainWindow.once('closed', () => { mainWindow = null })
   mainWindow.webContents.on('did-finish-load', () => {
-    if (isOnLoginPage()) {
-      clearBadge()
+    const contents = mainWindow.webContents
+    if (!validateSender({ sender: contents, senderFrame: contents.mainFrame })) return
+    if (recoveryWindow) {
+      recoveryWindow.destroy()
+      recoveryWindow = null
+      if (tray) updateTrayMenu()
+      showMainWindow()
     }
-    if (isOnEmailsRoute()) {
-      rendererReady = true
-      drainPendingPayloads()
-    }
-  })
-
-  // Same-origin navigation guard
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    try {
-      const parsed = new URL(url)
-      if (parsed.origin === BASE_ORIGIN) return
-      event.preventDefault()
-      shell.openExternal(url)
-    } catch {
-      event.preventDefault()
-    }
-  })
-
-  // Handle window.open() from the web app
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (isSameOriginEmailPopout(url)) {
-      return {
-        action: 'allow',
-        overrideBrowserWindowOptions: {
-          width: 1100,
-          height: 700,
-          autoHideMenuBar: true,
-          webPreferences: {
-            preload: PRELOAD_PATH,
-            contextIsolation: true,
-            nodeIntegration: false,
-          },
-        },
-      }
-    }
-    if (isOffOriginHttp(url)) {
-      shell.openExternal(url)
-    }
-    if (url && !isOffOriginHttp(url) && !isSameOriginEmailPopout(url)) {
-      return { action: 'allow' }
-    }
-    return { action: 'deny' }
+    if (isOnLoginPage()) clearBadge()
+    routePendingPayloads()
   })
 }
 
@@ -1190,13 +995,20 @@ function createTray() {
 
 function updateTrayMenu() {
   const currentMode = config.getMode()
+  const update = updates.getState()
+  const updateLabel = {
+    idle: 'Check for updates', checking: 'Checking for updates…',
+    'up-to-date': 'Brinq is up to date. Check again',
+    downloading: `Downloading update (${Math.round(update.percent || 0)}%)`,
+    ready: 'Update ready to install', error: 'Update failed. Check again',
+    unavailable: 'Updates require an installed app',
+  }[update.status]
   const menu = Menu.buildFromTemplate([
     {
       label: 'Open Brinq',
       click: () => {
         launchedForFileViewerOnly = false
-        mainWindow.show()
-        mainWindow.focus()
+        showMainWindow()
       },
     },
     { type: 'separator' },
@@ -1217,6 +1029,17 @@ function updateTrayMenu() {
       label: `Version ${app.getVersion()}`,
       enabled: false,
     },
+    ...(recoveryWindow ? [{ label: 'Retry connection', click: () => retryMainWindow() }] : []),
+    {
+      label: updateLabel,
+      enabled: ['idle', 'up-to-date', 'error'].includes(update.status),
+      click: () => updates.check(),
+    },
+    {
+      label: 'Restart to update (closes Brinq)',
+      enabled: update.status === 'ready',
+      click: () => updates.restart(),
+    },
     {
       label: 'Quit',
       click: () => {
@@ -1228,23 +1051,39 @@ function updateTrayMenu() {
   tray.setContextMenu(menu)
 }
 
-function switchMode(mode) {
-  config.setMode(mode)
-  rendererReady = false
-  mainWindow.loadURL(getModeUrl())
-  updateTrayMenu()
+function desktopState() {
+  return { mode: config.getMode(), version: app.getVersion() }
+}
+
+let modeChangeInProgress = false
+
+async function switchMode(mode) {
+  if (!isMode(mode)) return { ok: false, error: 'Choose Mail Mode or Full App Mode.' }
+  if (modeChangeInProgress) {
+    return { ok: false, state: desktopState(), error: 'A mode change is already in progress. Please try again after it finishes.' }
+  }
+  const previousMode = config.getMode()
+  modeChangeInProgress = true
+  try {
+    // The destination reads Desktop state while mounting, before loadURL resolves.
+    config.setMode(mode)
+    updateTrayMenu()
+    await mainWindow.loadURL(modeUrl(BASE_URL, mode))
+    return { ok: true, state: desktopState() }
+  } catch {
+    config.setMode(previousMode)
+    updateTrayMenu()
+    return { ok: false, state: desktopState(), error: 'Could not open the selected mode. Please try again.' }
+  } finally {
+    modeChangeInProgress = false
+  }
 }
 
 // ---------------------------------------------------------------------------
 // IPC handlers (with sender origin validation)
 // ---------------------------------------------------------------------------
 function validateSender(event) {
-  try {
-    const senderUrl = event.sender.getURL()
-    return new URL(senderUrl).origin === BASE_ORIGIN
-  } catch {
-    return false
-  }
+  return windowSecurity.validateSender(event)
 }
 
 ipcMain.on('notify', (event, title, body, data) => {
@@ -1258,25 +1097,32 @@ ipcMain.on('notify', (event, title, body, data) => {
   })
   notif.on('click', () => {
     launchedForFileViewerOnly = false
-    mainWindow.show()
-    mainWindow.focus()
+    showMainWindow()
     if (data?.uid && typeof data.uid === 'string') {
-      if (isOnEmailsRoute()) {
-        mainWindow.webContents.send('navigate-email', data.uid)
-      } else {
-        const mode = config.getMode()
-        mainWindow.loadURL(
-          `${BASE_URL}/emails?standalone=${mode}&open_email_uid=${encodeURIComponent(data.uid)}`,
-        )
-      }
+      queuePayload('navigate-email', data.uid)
     }
   })
   notif.show()
 })
 
+ipcMain.handle('update-status', (event) => validateSender(event) ? updates.getState() : null)
+ipcMain.handle('check-for-updates', (event) => validateSender(event) ? updates.check() : { ok: false, error: 'Unauthorized sender.' })
+ipcMain.handle('restart-to-update', (event) => validateSender(event) ? updates.restart() : { ok: false, error: 'Unauthorized sender.' })
+
+ipcMain.handle('desktop-state', (event) => validateSender(event) ? desktopState() : null)
+ipcMain.handle('change-mode', (event, mode) => {
+  if (!validateSender(event)) return { ok: false, error: 'Unauthorized sender.' }
+  return switchMode(mode)
+})
+ipcMain.on('email-listener-state', (event, channel, active) => {
+  if (!windowSecurity.validateSender(event, ['main']) || typeof active !== 'boolean') return
+  navigationQueue.subscribe(channel, event.senderFrame, active)
+  drainPendingPayloads()
+})
+
 ipcMain.on('set-mode', (event, mode) => {
   if (!validateSender(event)) return
-  if (mode === 'email' || mode === 'full') {
+  if (isMode(mode)) {
     config.setMode(mode)
     updateTrayMenu()
   }
@@ -1316,8 +1162,9 @@ function clearBadge() {
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.on('ready', async () => {
+  if (!gotLock) return
   try {
-    await cleanupTempDir()
+    await cleanupProfileTemp(BRINQ_TEMP_DIR, gotLock)
   } catch (err) {
     console.warn('Could not clean attachment temp directory:', err)
   }
@@ -1336,26 +1183,20 @@ app.on('ready', async () => {
   )
   if (protocolArg) handleProtocolUrl(protocolArg)
 
-  // Auto-update: check silently on launch, download in background
-  if (process.env.NODE_ENV !== 'development') {
-    autoUpdater.logger = require('electron-log')
-    autoUpdater.autoDownload = true
-    autoUpdater.autoInstallOnAppQuit = true
-    autoUpdater.checkForUpdatesAndNotify().catch(() => {})
-  }
+  autoUpdater.logger = require('electron-log')
+  updates.checkOnLaunch()
 })
 
 // macOS: re-show window when dock icon clicked
 app.on('activate', () => {
   if (mainWindow) {
     launchedForFileViewerOnly = false
-    mainWindow.show()
-    mainWindow.focus()
+    showMainWindow()
   }
 })
 
-app.on('before-quit', () => {
-  app.isQuitting = true
+app.on('before-quit', (event) => {
+  if (!event.defaultPrevented) app.isQuitting = true
 })
 
 app.on('window-all-closed', () => {

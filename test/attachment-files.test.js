@@ -90,3 +90,67 @@ test('aborts a streamed response as soon as it exceeds the byte limit', async ()
     /Attachment exceeds the 50MB limit/,
   )
 })
+
+const fs = require('node:fs/promises')
+const os = require('node:os')
+const path = require('node:path')
+const {
+  responseFileInfo, profileTempDir, cleanupProfileTemp, ensurePrivateDirectory,
+  markFileAsInternetOrigin, requiresInternetOriginProtection,
+} = require('../src/attachment-files')
+
+test('server names and compatible MIME govern opening, including extensionless AMS names', () => {
+  function info(mime, disposition, hint = 'hint.pdf') {
+    const headers = new Headers({ 'content-type': mime })
+    if (disposition) headers.set('content-disposition', disposition)
+    return responseFileInfo(headers, hint)
+  }
+  assert.equal(info('application/pdf', 'attachment; filename="AMS policy"').filename, 'AMS policy.pdf')
+  assert.equal(info('application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'attachment; filename="AMS policy"').filename, 'AMS policy.docx')
+  assert.equal(info('application/pdf', undefined).canOpen, true)
+  assert.equal(info('application/octet-stream', undefined).canOpen, false)
+  assert.equal(info('application/octet-stream', 'attachment; filename=""').canOpen, false)
+  assert.equal(info('application/octet-stream', 'attachment; filename="server.pdf"').canOpen, true)
+  assert.equal(info('application/pdf', 'attachment; filename="server.exe"').canOpen, false)
+  assert.equal(info('text/html', 'attachment; filename="server.pdf"').canOpen, false)
+  assert.equal(info('image/png', 'attachment; filename="server.pdf"').canOpen, false)
+  assert.equal(info('application/pdf', 'attachment; filename="server.pdf"', 'hint.exe').canOpen, true)
+})
+
+test('profile cleanup cannot affect another profile or run without the instance lock', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'brinq-profile-test-'))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  const first = profileTempDir(root, '/profiles/first')
+  const second = profileTempDir(root, '/profiles/second')
+  assert.notEqual(first, second)
+  for (const dir of [first, second]) { await ensurePrivateDirectory(dir); await fs.writeFile(path.join(dir, 'keep'), 'bytes') }
+  await cleanupProfileTemp(first, false)
+  assert.equal(await fs.readFile(path.join(first, 'keep'), 'utf8'), 'bytes')
+  await cleanupProfileTemp(first, true)
+  await assert.rejects(fs.stat(first), { code: 'ENOENT' })
+  assert.equal(await fs.readFile(path.join(second, 'keep'), 'utf8'), 'bytes')
+})
+
+test('private temporary directory rejects symlinks', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'brinq-dir-test-'))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  const link = path.join(root, 'link')
+  await fs.symlink(root, link)
+  await assert.rejects(ensurePrivateDirectory(link), /private directory/)
+})
+
+test('Windows zone and macOS quarantine adapters use fixed safe provenance', async () => {
+  const writes = [], commands = []
+  assert.equal(await markFileAsInternetOrigin('/tmp/document', 'https://brinq.io/file?secret=token', { platform: 'win32', writeFile: async (...args) => writes.push(args) }), true)
+  assert.equal(writes[0][0], '/tmp/document:Zone.Identifier')
+  assert.match(writes[0][1], /ZoneId=3/)
+  assert.match(writes[0][1], /HostUrl=https:\/\/brinq.io\r\n/)
+  assert.equal(writes[0][1].includes('secret'), false)
+  assert.equal(await markFileAsInternetOrigin('/tmp/document', 'https://brinq.io', { platform: 'darwin', execFile: async (...args) => commands.push(args) }), true)
+  assert.equal(commands[0][0], '/usr/bin/xattr')
+  assert.equal(commands[0][1][1], 'com.apple.quarantine')
+  assert.equal(commands[0][1][3], '/tmp/document')
+  assert.equal(await markFileAsInternetOrigin('/tmp/document', 'https://brinq.io', { platform: 'linux' }), false)
+  assert.equal(requiresInternetOriginProtection('policy.docx', 'win32'), true)
+  assert.equal(requiresInternetOriginProtection('policy.docx', 'linux'), false)
+})
