@@ -8,6 +8,7 @@ const {
   shell,
   nativeImage,
   dialog,
+  screen,
 } = require('electron')
 const { randomUUID } = require('crypto')
 const fs = require('fs')
@@ -19,6 +20,7 @@ const { decompressRTF } = require('@kenjiuno/decompressrtf')
 const { deEncapsulateSync } = require('rtf-stream-parser')
 const iconv = require('iconv-lite')
 const config = require('./config')
+const { isMode, modeUrl, visibleBounds, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue } = require('./window-state')
 const { createWindowSecurity } = require('./window-security')
 const {
   isSafeOpenFilename,
@@ -54,8 +56,8 @@ const windowSecurity = createWindowSecurity({
 
 let mainWindow = null
 let tray = null
-let pendingPayloads = []
-let rendererReady = false
+const navigationQueue = createNavigationQueue()
+let navigatingMain = false
 
 // ---------------------------------------------------------------------------
 // EML File Viewer — in-memory store and parser
@@ -733,10 +735,7 @@ if (!gotLock) {
 // Helpers
 // ---------------------------------------------------------------------------
 function getModeUrl() {
-  const mode = config.getMode()
-  return mode === 'email'
-    ? `${BASE_URL}/emails?standalone=email`
-    : `${BASE_URL}/dashboard?standalone=full`
+  return modeUrl(BASE_URL, config.getMode())
 }
 
 function isOnEmailsRoute() {
@@ -760,59 +759,36 @@ function isOnLoginPage() {
 }
 
 function drainPendingPayloads() {
-  if (!rendererReady || pendingPayloads.length === 0) return
-  for (const payload of pendingPayloads) {
-    if (payload.type === 'mailto') {
-      mainWindow.webContents.send('mailto', payload.data)
-    } else if (payload.type === 'navigate-email') {
-      mainWindow.webContents.send('navigate-email', payload.uid)
-    }
-  }
-  pendingPayloads = []
+  if (!mainWindow || navigatingMain || !isOnEmailsRoute()) return
+  const contents = mainWindow.webContents
+  const frame = contents.mainFrame
+  if (!windowSecurity.validateSender({ sender: contents, senderFrame: frame }, ['main'])) return
+  navigationQueue.drain(frame, (channel, data) => contents.send(channel, data))
 }
 
-function queuePayload(payload) {
-  pendingPayloads.push(payload)
-  drainPendingPayloads()
+function routePendingPayloads() {
+  if (!mainWindow || navigatingMain || !navigationQueue.hasPending()) return
+  const target = incomingNavigationUrl(mainWindow.webContents.getURL(), BASE_URL, config.getMode())
+  if (target) mainWindow.loadURL(target).catch(() => {})
+  else drainPendingPayloads()
 }
 
-// ---------------------------------------------------------------------------
-// Protocol URL handling (mailto: and brinq://)
-// ---------------------------------------------------------------------------
-function parseMailtoUrl(url) {
-  const parsed = new URL(url)
-  const to = decodeURIComponent(parsed.pathname)
-    .split(/[;,]/)
-    .map((v) => v.trim())
-    .filter(Boolean)
-  const subject = parsed.searchParams.get('subject') || ''
-  const cc = (parsed.searchParams.get('cc') || '')
-    .split(/[;,]/)
-    .map((v) => v.trim())
-    .filter(Boolean)
-  const body = parsed.searchParams.get('body') || ''
-  return { to, subject, cc, body }
+function queuePayload(channel, data) {
+  navigationQueue.push(channel, data)
+  routePendingPayloads()
 }
 
+// Protocols activate Brinq or compose email; they never select an arbitrary URL.
 function handleProtocolUrl(url) {
-  if (url.startsWith('mailto:')) {
-    const data = parseMailtoUrl(url)
-    if (mainWindow) {
-      launchedForFileViewerOnly = false
-      mainWindow.show()
-      mainWindow.focus()
-    }
-    if (!isOnEmailsRoute() && mainWindow) {
-      mainWindow.loadURL(getModeUrl())
-    }
-    queuePayload({ type: 'mailto', data })
-  } else if (url.startsWith('brinq:')) {
-    if (mainWindow) {
-      launchedForFileViewerOnly = false
-      mainWindow.show()
-      mainWindow.focus()
-    }
+  const payload = parseProtocolUrl(url)
+  if (!payload) return
+  if (mainWindow) {
+    launchedForFileViewerOnly = false
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.show()
+    mainWindow.focus()
   }
+  if (payload.type === 'mailto') queuePayload('mailto', payload.data)
 }
 
 // Register Brinq-owned deep links only. Do not register as the system
@@ -829,7 +805,7 @@ app.on('open-url', (event, url) => {
 // Window creation
 // ---------------------------------------------------------------------------
 function createWindow({ showOnReady = true } = {}) {
-  const bounds = config.getWindowBounds()
+  const bounds = visibleBounds(config.getWindowBounds(), screen.getAllDisplays().map((display) => display.workArea), screen.getPrimaryDisplay().workArea)
 
   mainWindow = new BrowserWindow({
     width: bounds.width,
@@ -853,7 +829,19 @@ function createWindow({ showOnReady = true } = {}) {
   })
 
   windowSecurity.register(mainWindow, 'main')
-  mainWindow.loadURL(getModeUrl())
+  mainWindow.webContents.on('did-start-navigation', (_event, _url, inPlace, isMainFrame) => {
+    if (isMainFrame && !inPlace) {
+      navigatingMain = true
+      navigationQueue.reset()
+    }
+  })
+  mainWindow.webContents.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame) => {
+    if (isMainFrame) navigatingMain = false
+  })
+  mainWindow.webContents.on('did-navigate-in-page', (_event, _url, isMainFrame) => {
+    if (isMainFrame) routePendingPayloads()
+  })
+  mainWindow.loadURL(navigationQueue.hasPending() ? modeUrl(BASE_URL, config.getMode(), true) : getModeUrl()).catch(() => {})
 
   // Save window bounds on move/resize
   const saveBounds = () => {
@@ -872,15 +860,9 @@ function createWindow({ showOnReady = true } = {}) {
     }
   })
 
-  // Track when the renderer is on /emails and ready for IPC payloads
   mainWindow.webContents.on('did-finish-load', () => {
-    if (isOnLoginPage()) {
-      clearBadge()
-    }
-    if (isOnEmailsRoute()) {
-      rendererReady = true
-      drainPendingPayloads()
-    }
+    if (isOnLoginPage()) clearBadge()
+    routePendingPayloads()
   })
 }
 
@@ -943,11 +925,20 @@ function updateTrayMenu() {
   tray.setContextMenu(menu)
 }
 
-function switchMode(mode) {
-  config.setMode(mode)
-  rendererReady = false
-  mainWindow.loadURL(getModeUrl())
-  updateTrayMenu()
+function desktopState() {
+  return { mode: config.getMode(), version: app.getVersion() }
+}
+
+async function switchMode(mode) {
+  if (!isMode(mode)) return { ok: false, error: 'Choose Mail Mode or Full App Mode.' }
+  try {
+    await mainWindow.loadURL(modeUrl(BASE_URL, mode))
+    config.setMode(mode)
+    updateTrayMenu()
+    return { ok: true, state: desktopState() }
+  } catch {
+    return { ok: false, state: desktopState(), error: 'Could not open the selected mode. Please try again.' }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -971,22 +962,26 @@ ipcMain.on('notify', (event, title, body, data) => {
     mainWindow.show()
     mainWindow.focus()
     if (data?.uid && typeof data.uid === 'string') {
-      if (isOnEmailsRoute()) {
-        mainWindow.webContents.send('navigate-email', data.uid)
-      } else {
-        const mode = config.getMode()
-        mainWindow.loadURL(
-          `${BASE_URL}/emails?standalone=${mode}&open_email_uid=${encodeURIComponent(data.uid)}`,
-        )
-      }
+      queuePayload('navigate-email', data.uid)
     }
   })
   notif.show()
 })
 
+ipcMain.handle('desktop-state', (event) => validateSender(event) ? desktopState() : null)
+ipcMain.handle('change-mode', (event, mode) => {
+  if (!validateSender(event)) return { ok: false, error: 'Unauthorized sender.' }
+  return switchMode(mode)
+})
+ipcMain.on('email-listener-state', (event, channel, active) => {
+  if (!windowSecurity.validateSender(event, ['main']) || typeof active !== 'boolean') return
+  navigationQueue.subscribe(channel, event.senderFrame, active)
+  drainPendingPayloads()
+})
+
 ipcMain.on('set-mode', (event, mode) => {
   if (!validateSender(event)) return
-  if (mode === 'email' || mode === 'full') {
+  if (isMode(mode)) {
     config.setMode(mode)
     updateTrayMenu()
   }

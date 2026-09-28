@@ -1,5 +1,18 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
+function subscribe(channel, callback) {
+  const handler = (_, data) => callback(data)
+  ipcRenderer.on(channel, handler)
+  if (ipcRenderer.listenerCount(channel) === 1) ipcRenderer.send('email-listener-state', channel, true)
+  let active = true
+  return () => {
+    if (!active) return
+    active = false
+    ipcRenderer.removeListener(channel, handler)
+    if (ipcRenderer.listenerCount(channel) === 0) ipcRenderer.send('email-listener-state', channel, false)
+  }
+}
+
 // about:blank inherits its parent's preload in Electron. Never expose a bridge
 // there, in blob previews, or in subframes, even when their origin is inherited.
 if (process.isMainFrame && ['http:', 'https:'].includes(location.protocol)) {
@@ -10,17 +23,13 @@ if (process.isMainFrame && ['http:', 'https:'].includes(location.protocol)) {
 
     setMode: (mode) => ipcRenderer.send('set-mode', mode),
 
-    onNavigateEmail: (callback) => {
-      const handler = (_, uid) => callback(uid)
-      ipcRenderer.on('navigate-email', handler)
-      return () => ipcRenderer.removeListener('navigate-email', handler)
-    },
+    getDesktopState: () => ipcRenderer.invoke('desktop-state'),
 
-    onMailto: (callback) => {
-      const handler = (_, data) => callback(data)
-      ipcRenderer.on('mailto', handler)
-      return () => ipcRenderer.removeListener('mailto', handler)
-    },
+    changeMode: (mode) => ipcRenderer.invoke('change-mode', mode),
+
+    onNavigateEmail: (callback) => subscribe('navigate-email', callback),
+
+    onMailto: (callback) => subscribe('mailto', callback),
 
     getFileCapabilities: () => ipcRenderer.invoke('file-capabilities'),
 

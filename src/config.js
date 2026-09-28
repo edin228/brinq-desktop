@@ -4,7 +4,7 @@ const { resolveBaseUrl } = require('./window-security')
 
 const store = new Store({
   defaults: {
-    mode: 'email',
+    mode: 'full',
     windowBounds: { width: 1200, height: 800 },
   },
 })

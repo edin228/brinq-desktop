@@ -19,7 +19,7 @@ function load(protocol = 'http:', isMainFrame = true) {
 
 test('preload exposes fixed file and legacy methods and strips IPC events', async () => {
   const { api, ipc, calls } = load()
-  assert.deepEqual(Object.keys(api).sort(), ['getFileCapabilities', 'openFile', 'saveFileAs', 'cancelFileOperation', 'notify', 'setBadgeCount', 'setMode', 'onNavigateEmail', 'onMailto', 'getFileEmail', 'saveFileAttachment', 'openFileAttachment', 'openEmailAttachment', 'saveEmailAttachment'].sort())
+  assert.deepEqual(Object.keys(api).sort(), ['getDesktopState', 'changeMode', 'getFileCapabilities', 'openFile', 'saveFileAs', 'cancelFileOperation', 'notify', 'setBadgeCount', 'setMode', 'onNavigateEmail', 'onMailto', 'getFileEmail', 'saveFileAttachment', 'openFileAttachment', 'openEmailAttachment', 'saveEmailAttachment'].sort())
   api.notify('Title', 'Body', { uid: 'one' }); api.setBadgeCount(2); api.setMode('email')
   await api.getFileEmail('viewer'); await api.saveFileAttachment('viewer', 1); await api.openFileAttachment('viewer', 2)
   await api.openEmailAttachment('email', 'attachment', 'test.pdf'); await api.saveEmailAttachment('email', 'attachment', 'test.pdf')
@@ -42,4 +42,19 @@ test('preload exposes fixed file and legacy methods and strips IPC events', asyn
 test('inherited print preload, opaque documents and subframes expose no bridge', () => {
   for (const protocol of ['about:', 'blob:', 'file:', 'data:']) assert.equal(load(protocol).api, undefined)
   assert.equal(load('https:', false).api, undefined)
+})
+
+ test('subscription signals follow listener attachment and final removal; state APIs acknowledge requests', async () => {
+  const { api, ipc, calls } = load()
+  ipc.send = (...args) => {
+    if (args[0] === 'email-listener-state') assert.equal(ipc.listenerCount(args[1]) > 0, args[2])
+    calls.push(args)
+  }
+  const offOne = api.onMailto(() => {})
+  const offTwo = api.onMailto(() => {})
+  offOne(); offOne(); offTwo()
+  assert.deepEqual(calls, [['email-listener-state', 'mailto', true], ['email-listener-state', 'mailto', false]])
+  await api.getDesktopState()
+  await api.changeMode('full')
+  assert.deepEqual(calls.slice(-2), [['desktop-state'], ['change-mode', 'full']])
 })
