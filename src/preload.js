@@ -27,6 +27,18 @@ if (process.isMainFrame && ['http:', 'https:'].includes(location.protocol)) {
 
     changeMode: (mode) => ipcRenderer.invoke('change-mode', mode),
 
+    getUpdateStatus: () => ipcRenderer.invoke('update-status'),
+
+    checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
+
+    restartToUpdate: () => ipcRenderer.invoke('restart-to-update'),
+
+    onUpdateStatus: (callback) => {
+      const handler = (_, state) => callback(state)
+      ipcRenderer.on('update-status', handler)
+      return () => ipcRenderer.removeListener('update-status', handler)
+    },
+
     onNavigateEmail: (callback) => subscribe('navigate-email', callback),
 
     onMailto: (callback) => subscribe('mailto', callback),

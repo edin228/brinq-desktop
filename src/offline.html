@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Reconnect to Brinq</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: light-dark(#fafafa, #171717); color: light-dark(#171717, #fafafa); }
+    main { padding: 32px; max-width: 440px; }
+    h1 { margin: 0 0 16px; font-size: 24px; line-height: 1.25; }
+    p { line-height: 1.5; }
+    button { font: inherit; font-weight: 600; padding: 10px 20px; border: 1px solid currentColor; border-radius: 8px; color: inherit; background: transparent; cursor: pointer; }
+    button:focus-visible { outline: 3px solid currentColor; outline-offset: 3px; }
+    button:disabled { opacity: .6; cursor: wait; }
+    #status { min-height: 24px; margin-bottom: 0; }
+  </style>
+  <script src="offline.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Can't connect to Brinq</h1>
+    <p>Brinq needs a connection to load your workspace. Check your connection, then try again.</p>
+    <button id="retry" type="button">Retry</button>
+    <p id="status" role="status" aria-live="polite"></p>
+  </main>
+</body>
+</html>

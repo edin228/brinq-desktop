@@ -13,6 +13,7 @@ const {
 const { randomUUID } = require('crypto')
 const fs = require('fs')
 const path = require('path')
+const { pathToFileURL } = require('url')
 const { autoUpdater } = require('electron-updater')
 const { simpleParser } = require('mailparser')
 const MsgReader = require('@kenjiuno/msgreader').default
@@ -33,6 +34,7 @@ const {
   requiresInternetOriginProtection,
 } = require('./attachment-files')
 const { createFileActions, CAPABILITIES } = require('./file-actions')
+const { createUpdateStatus } = require('./update-status')
 
 // Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
 if (process.platform === 'win32') {
@@ -58,6 +60,26 @@ let mainWindow = null
 let tray = null
 const navigationQueue = createNavigationQueue()
 let navigatingMain = false
+let recoveryWindow = null
+let intendedAppUrl = null
+let recoveryRetry = null
+const RECOVERY_URL = pathToFileURL(path.join(__dirname, 'offline.html')).href
+const updates = createUpdateStatus({
+  app, updater: autoUpdater,
+  onChange: (state) => {
+    if (tray) updateTrayMenu()
+    for (const window of BrowserWindow.getAllWindows()) {
+      const contents = window.webContents
+      if (validateSender({ sender: contents, senderFrame: contents.mainFrame })) {
+        contents.send('update-status', state)
+      }
+    }
+  },
+  restoreWindow: () => {
+    if (!mainWindow || mainWindow.isDestroyed()) createWindow({ initialUrl: intendedAppUrl })
+    showMainWindow()
+  },
+})
 
 // ---------------------------------------------------------------------------
 // EML File Viewer — in-memory store and parser
@@ -725,8 +747,7 @@ if (!gotLock) {
     if (protocolArg) handleProtocolUrl(protocolArg)
     if (mainWindow) {
       launchedForFileViewerOnly = false
-      mainWindow.show()
-      mainWindow.focus()
+      showMainWindow()
     }
   })
 }
@@ -784,9 +805,7 @@ function handleProtocolUrl(url) {
   if (!payload) return
   if (mainWindow) {
     launchedForFileViewerOnly = false
-    if (mainWindow.isMinimized()) mainWindow.restore()
-    mainWindow.show()
-    mainWindow.focus()
+    showMainWindow()
   }
   if (payload.type === 'mailto') queuePayload('mailto', payload.data)
 }
@@ -804,7 +823,76 @@ app.on('open-url', (event, url) => {
 // ---------------------------------------------------------------------------
 // Window creation
 // ---------------------------------------------------------------------------
-function createWindow({ showOnReady = true } = {}) {
+// Recovery owns a local window and only retries the last approved app route.
+function approvedAppUrl(value) {
+  try {
+    const url = new URL(value)
+    return url.origin === BASE_ORIGIN && ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password
+  } catch { return false }
+}
+
+function showMainWindow() {
+  const window = recoveryWindow && !recoveryWindow.isDestroyed() ? recoveryWindow : mainWindow
+  if (!window || window.isDestroyed()) return
+  if (window.isMinimized()) window.restore()
+  window.show()
+  window.focus()
+}
+
+function showRecovery() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.hide()
+  if (recoveryWindow && !recoveryWindow.isDestroyed()) { showMainWindow(); return }
+  const window = new BrowserWindow({
+    width: 520, height: 340, show: false, autoHideMenuBar: true, title: 'Brinq',
+    webPreferences: {
+      preload: path.join(__dirname, 'recovery-preload.js'),
+      contextIsolation: true, nodeIntegration: false, sandbox: true,
+    },
+  })
+  recoveryWindow = window
+  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  window.webContents.on('will-navigate', (event) => event.preventDefault())
+  window.webContents.on('will-redirect', (event) => event.preventDefault())
+  window.once('ready-to-show', () => window.show())
+  window.on('close', (event) => {
+    if (!app.isQuitting) { event.preventDefault(); window.hide() }
+  })
+  window.once('closed', () => {
+    if (recoveryWindow === window) recoveryWindow = null
+  })
+  window.loadURL(RECOVERY_URL).catch(() => {})
+  if (tray) updateTrayMenu()
+}
+
+function validateRecoverySender(event) {
+  try {
+    const contents = recoveryWindow?.webContents
+    const frame = event.senderFrame
+    return !!contents && !recoveryWindow.isDestroyed() && !contents.isDestroyed() &&
+      event.sender === contents && frame === contents.mainFrame && !frame.detached &&
+      frame.parent === null && frame.url === RECOVERY_URL && contents.getURL() === RECOVERY_URL
+  } catch { return false }
+}
+
+function retryMainWindow() {
+  if (recoveryRetry) return recoveryRetry
+  if (!mainWindow || mainWindow.isDestroyed() || !approvedAppUrl(intendedAppUrl)) {
+    return Promise.resolve({ ok: false, error: 'Brinq could not reconnect. Reopen the app and try again.' })
+  }
+  recoveryRetry = mainWindow.loadURL(intendedAppUrl)
+    .then(() => ({ ok: true }))
+    .catch(() => ({ ok: false, error: 'Still unable to connect. Check your connection and try again.' }))
+    .finally(() => { recoveryRetry = null })
+  return recoveryRetry
+}
+
+ipcMain.handle('retry-app-load', (event) => {
+  if (!validateRecoverySender(event)) return { ok: false, error: 'Unauthorized sender.' }
+  return retryMainWindow()
+})
+
+function createWindow({ showOnReady = true, initialUrl = null } = {}) {
   const bounds = visibleBounds(config.getWindowBounds(), screen.getAllDisplays().map((display) => display.workArea), screen.getPrimaryDisplay().workArea)
 
   mainWindow = new BrowserWindow({
@@ -825,23 +913,34 @@ function createWindow({ showOnReady = true } = {}) {
   })
 
   mainWindow.once('ready-to-show', () => {
-    if (showOnReady) mainWindow.show()
+    if (showOnReady && !recoveryWindow) mainWindow.show()
   })
 
   windowSecurity.register(mainWindow, 'main')
-  mainWindow.webContents.on('did-start-navigation', (_event, _url, inPlace, isMainFrame) => {
+  mainWindow.webContents.on('did-start-navigation', (_event, url, inPlace, isMainFrame) => {
     if (isMainFrame && !inPlace) {
       navigatingMain = true
+      if (approvedAppUrl(url)) intendedAppUrl = url
       navigationQueue.reset()
     }
   })
   mainWindow.webContents.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame) => {
     if (isMainFrame) navigatingMain = false
   })
-  mainWindow.webContents.on('did-navigate-in-page', (_event, _url, isMainFrame) => {
-    if (isMainFrame) routePendingPayloads()
+  mainWindow.webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+    if (isMainFrame) {
+      if (approvedAppUrl(url)) intendedAppUrl = url
+      routePendingPayloads()
+    }
   })
-  mainWindow.loadURL(navigationQueue.hasPending() ? modeUrl(BASE_URL, config.getMode(), true) : getModeUrl()).catch(() => {})
+  mainWindow.webContents.on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
+    if (!isMainFrame || code === -3 || url !== intendedAppUrl || !approvedAppUrl(url)) return
+    navigatingMain = false
+    showRecovery()
+  })
+  const target = approvedAppUrl(initialUrl) ? initialUrl : navigationQueue.hasPending() ? modeUrl(BASE_URL, config.getMode(), true) : getModeUrl()
+  intendedAppUrl = target
+  mainWindow.loadURL(target).catch(() => {})
 
   // Save window bounds on move/resize
   const saveBounds = () => {
@@ -860,7 +959,16 @@ function createWindow({ showOnReady = true } = {}) {
     }
   })
 
+  mainWindow.once('closed', () => { mainWindow = null })
   mainWindow.webContents.on('did-finish-load', () => {
+    const contents = mainWindow.webContents
+    if (!validateSender({ sender: contents, senderFrame: contents.mainFrame })) return
+    if (recoveryWindow) {
+      recoveryWindow.destroy()
+      recoveryWindow = null
+      if (tray) updateTrayMenu()
+      showMainWindow()
+    }
     if (isOnLoginPage()) clearBadge()
     routePendingPayloads()
   })
@@ -887,13 +995,20 @@ function createTray() {
 
 function updateTrayMenu() {
   const currentMode = config.getMode()
+  const update = updates.getState()
+  const updateLabel = {
+    idle: 'Check for updates', checking: 'Checking for updates…',
+    'up-to-date': 'Brinq is up to date. Check again',
+    downloading: `Downloading update (${Math.round(update.percent || 0)}%)`,
+    ready: 'Update ready to install', error: 'Update failed. Check again',
+    unavailable: 'Updates require an installed app',
+  }[update.status]
   const menu = Menu.buildFromTemplate([
     {
       label: 'Open Brinq',
       click: () => {
         launchedForFileViewerOnly = false
-        mainWindow.show()
-        mainWindow.focus()
+        showMainWindow()
       },
     },
     { type: 'separator' },
@@ -913,6 +1028,17 @@ function updateTrayMenu() {
     {
       label: `Version ${app.getVersion()}`,
       enabled: false,
+    },
+    ...(recoveryWindow ? [{ label: 'Retry connection', click: () => retryMainWindow() }] : []),
+    {
+      label: updateLabel,
+      enabled: ['idle', 'up-to-date', 'error'].includes(update.status),
+      click: () => updates.check(),
+    },
+    {
+      label: 'Restart to update (closes Brinq)',
+      enabled: update.status === 'ready',
+      click: () => updates.restart(),
     },
     {
       label: 'Quit',
@@ -959,14 +1085,17 @@ ipcMain.on('notify', (event, title, body, data) => {
   })
   notif.on('click', () => {
     launchedForFileViewerOnly = false
-    mainWindow.show()
-    mainWindow.focus()
+    showMainWindow()
     if (data?.uid && typeof data.uid === 'string') {
       queuePayload('navigate-email', data.uid)
     }
   })
   notif.show()
 })
+
+ipcMain.handle('update-status', (event) => validateSender(event) ? updates.getState() : null)
+ipcMain.handle('check-for-updates', (event) => validateSender(event) ? updates.check() : { ok: false, error: 'Unauthorized sender.' })
+ipcMain.handle('restart-to-update', (event) => validateSender(event) ? updates.restart() : { ok: false, error: 'Unauthorized sender.' })
 
 ipcMain.handle('desktop-state', (event) => validateSender(event) ? desktopState() : null)
 ipcMain.handle('change-mode', (event, mode) => {
@@ -1042,26 +1171,20 @@ app.on('ready', async () => {
   )
   if (protocolArg) handleProtocolUrl(protocolArg)
 
-  // Auto-update: check silently on launch, download in background
-  if (process.env.NODE_ENV !== 'development') {
-    autoUpdater.logger = require('electron-log')
-    autoUpdater.autoDownload = true
-    autoUpdater.autoInstallOnAppQuit = true
-    autoUpdater.checkForUpdatesAndNotify().catch(() => {})
-  }
+  autoUpdater.logger = require('electron-log')
+  updates.checkOnLaunch()
 })
 
 // macOS: re-show window when dock icon clicked
 app.on('activate', () => {
   if (mainWindow) {
     launchedForFileViewerOnly = false
-    mainWindow.show()
-    mainWindow.focus()
+    showMainWindow()
   }
 })
 
-app.on('before-quit', () => {
-  app.isQuitting = true
+app.on('before-quit', (event) => {
+  if (!event.defaultPrevented) app.isQuitting = true
 })
 
 app.on('window-all-closed', () => {
