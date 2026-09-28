@@ -20,6 +20,7 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npx electron-builder --win --publish never -c.extraMetadata.version=1.2.6-test.1
+        shell: bash
       - uses: actions/upload-artifact@v4
         with:
           name: brinq-desktop-test-installer-${{ github.sha }}
