@@ -71,6 +71,17 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
         if (value.status === 401) fail('session', 'Your session expired. Sign in and try again.')
         if (value.status === 403) fail('permission', 'You no longer have access to this file. Refresh the page or contact your administrator.')
         if (value.status === 404) fail('not-found', 'This file is no longer available. Refresh the page and try again.')
+        // The stored SMS owner enforces the existing 25 MiB upload/download cap.
+        if (source.kind === 'sms-attachment' && value.status === 413) fail('provider', 'SMS attachment exceeds the 25 MiB (26,214,400 byte) download limit. Ask the sender for a smaller file or download it in RingCentral.', { limitBytes: 25 * 1024 * 1024 })
+        if (source.kind === 'sms-attachment' && value.status === 503) fail('provider', 'The SMS attachment storage is unavailable. Try again later.')
+        if (['ams360-attachment', 'ams360-document', 'ams360-activity-attachment'].includes(source.kind)) {
+          const message = {
+            400: 'AMS360 is not configured for this file. Ask your agency administrator to check the EMS integration and AMS360 web login in Agency settings, then retry.',
+            409: 'AMS360 cannot provide this file yet. Ask your agency administrator to reconnect the AMS360 web login and check that this client is linked. Then retry; some attachments have no downloadable data.',
+            502: 'AMS360 could not provide the file. Try again. If this continues, ask your agency administrator to check the AMS360 connection.',
+          }[value.status]
+          if (message) fail('provider', message)
+        }
         fail('network', 'The file could not be downloaded. Try again.')
       }
       return value

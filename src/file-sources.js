@@ -4,6 +4,9 @@ const SOURCE_FIELDS = {
   'brinq-file': ['uid'],
   'ams360-attachment': ['clientId', 'uid'],
   'ams360-document': ['clientId', 'documentId'],
+  'ams360-activity-attachment': ['clientId', 'activityId', 'ref', 'refKind'],
+  'marketing-attachment': ['projectUid', 'uid'],
+  'sms-attachment': ['uid'],
   'synced-email-attachment': ['emailUid', 'attachmentId'],
 }
 const SOURCE_KINDS = Object.freeze(Object.keys(SOURCE_FIELDS))
@@ -29,15 +32,19 @@ function resolveSource(baseUrl, source) {
       Object.keys(source).some(key => !['kind', 'filename', ...fields].includes(key)) ||
       fields.some(key => !validIdentifier(source[key], key === 'attachmentId' ? 4096 : 512)) ||
       (source.filename !== undefined && typeof source.filename !== 'string')) return null
+  if (source.kind === 'ams360-activity-attachment' && !['attachment', 'data'].includes(source.refKind)) return null
   const ids = Object.fromEntries(fields.map(key => [key, encodeURIComponent(source[key])]))
   let route
   switch (source.kind) {
     case 'brinq-file': route = `/api/files/${ids.uid}`; break
     case 'ams360-attachment': route = `/api/clients/${ids.clientId}/ams360-attachments/${ids.uid}/data`; break
     case 'ams360-document': route = `/api/clients/${ids.clientId}/ams360-documents/${ids.documentId}/data`; break
+    case 'ams360-activity-attachment': route = `/api/clients/${ids.clientId}/ams360-activities/${ids.activityId}/attachments/${ids.ref}/data?kind=${ids.refKind}`; break
+    case 'marketing-attachment': route = `/api/marketing-projects/${ids.projectUid}/attachments/${ids.uid}/download`; break
+    case 'sms-attachment': route = `/api/messaging/sms/attachments/${ids.uid}/download`; break
     case 'synced-email-attachment': route = `/api/email-sync/synced-emails/${ids.emailUid}/attachments/${ids.attachmentId}/download`; break
   }
-  return { url: new URL(route, baseUrl).href, storageLink: source.kind === 'brinq-file', filename: source.filename }
+  return { url: new URL(route, baseUrl).href, storageLink: source.kind === 'brinq-file' || source.kind === 'marketing-attachment', filename: source.filename }
 }
 
 function storageProxyUrl(baseUrl, value) {

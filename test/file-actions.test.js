@@ -315,3 +315,103 @@ test('50 MiB Open boundary is streamed; larger Save As succeeds without bufferin
   assert.equal(f.opens.length, 1)
   t.diagnostic(`Generated 50 MiB Open / 51 MiB Save: peak RSS delta ${peakRss - before.rss} bytes; peak external-memory delta ${peakExternal - before.external} bytes. Streams used 64 KiB fixture chunks.`)
 })
+
+const ACTIVITY_SOURCE = { kind: 'ams360-activity-attachment', clientId: '42', activityId: 'transaction+id', ref: 'reference/id', refKind: 'attachment', filename: 'activity.pdf' }
+const MARKETING_SOURCE = { kind: 'marketing-attachment', projectUid: 'project-uid', uid: 'attachment-uid', filename: 'marketing.pdf' }
+const SMS_SOURCE = { kind: 'sms-attachment', uid: 'stored-sms-uid', filename: 'sms.pdf' }
+
+test('activity detail and stored SMS issue one authenticated byte request for each explicit action', async t => {
+  for (const source of [ACTIVITY_SOURCE, { ...ACTIVITY_SOURCE, refKind: 'data' }, SMS_SOURCE]) {
+    const f = await fixture(t)
+    assert.equal((await f.open(source)).ok, true)
+    assert.equal((await f.save(source)).ok, true)
+    assert.equal(f.requests.length, 2)
+    const expected = source.kind === 'sms-attachment'
+      ? `${BASE}/api/messaging/sms/attachments/stored-sms-uid/download`
+      : `${BASE}/api/clients/42/ams360-activities/transaction%2Bid/attachments/reference%2Fid/data?kind=${source.refKind}`
+    for (const [url, options] of f.requests) {
+      assert.equal(url, expected)
+      assert.equal(options.credentials, 'include')
+      assert.equal(options.redirect, 'error')
+    }
+    assert.deepEqual(await fs.readFile(f.target), PDF)
+  }
+})
+
+test('marketing reacquires a fresh project-scoped link after expiry and never uses the generic file owner', async t => {
+  const f = await fixture(t)
+  let links = 0
+  f.fetchWith(url => {
+    if (url === `${BASE}/api/marketing-projects/project-uid/attachments/attachment-uid/download`) return Response.json({ url: `https://cdn.brinq.io/file?signature=${++links}` })
+    return links === 1 ? new Response('expired signature', { status: 403 }) : pdf()
+  })
+  assert.equal((await f.open(MARKETING_SOURCE)).code, 'permission')
+  assert.equal((await f.open(MARKETING_SOURCE)).ok, true)
+  assert.equal((await f.save(MARKETING_SOURCE)).ok, true)
+  assert.equal(links, 3)
+  assert.equal(f.requests.length, 6)
+  for (const [url] of f.requests) {
+    assert.equal(new URL(url).origin, BASE)
+    assert.equal(url.includes('/api/files/'), false)
+  }
+  assert.notEqual(f.requests[1][0], f.requests[3][0])
+})
+
+test('revoked access, removed marketing participants, and absent SMS storage never open or save error bytes', async t => {
+  for (const source of [ACTIVITY_SOURCE, MARKETING_SOURCE, SMS_SOURCE]) {
+    for (const [status, code] of [[401, 'session'], [403, 'permission'], [404, 'not-found']]) {
+      const f = await fixture(t)
+      f.fetchWith(() => Response.json({ detail: 'private provider data' }, { status }))
+      for (const action of ['open', 'save']) {
+        const result = await f[action](source)
+        assert.equal(result.code, code)
+        assert.equal(result.error.includes('private provider'), false)
+      }
+      assert.equal(f.requests.length, 2)
+      assert.equal(f.opens.length, 0)
+      assert.deepEqual(await f.tempFiles(), [])
+      await assert.rejects(fs.stat(f.target), { code: 'ENOENT' })
+    }
+  }
+})
+
+test('legacy SMS URLs and cross-source descriptors are rejected before any request', async t => {
+  const f = await fixture(t)
+  for (const source of [
+    { ...SMS_SOURCE, download_url: 'https://provider.test/old-file' },
+    { ...SMS_SOURCE, uid: 'https://provider.test/old-file' },
+    { ...ACTIVITY_SOURCE, documentId: 'DocAId' },
+    { ...MARKETING_SOURCE, kind: 'brinq-file' },
+  ]) assert.equal((await f.open(source)).code, 'invalid')
+  assert.equal(f.requests.length, 0)
+  assert.equal(f.opens.length, 0)
+})
+
+test('AMS provider errors use actionable controlled messages without reading raw details', async t => {
+  for (const source of [SOURCE, { kind: 'ams360-attachment', clientId: '42', uid: 'stored' }, ACTIVITY_SOURCE]) {
+    for (const [status, message] of [[400, /not configured/], [409, /reconnect/], [502, /Try again/]]) {
+      const f = await fixture(t)
+      f.fetchWith(() => new Response('secret token and provider details', { status }))
+      const result = await f.open(source)
+      assert.equal(result.code, 'provider')
+      assert.match(result.error, message)
+      assert.equal(result.error.includes('secret'), false)
+      assert.equal(f.requests.length, 1)
+      assert.equal(f.opens.length, 0)
+    }
+  }
+})
+
+test('stored SMS limit and storage failures retain corrective action without provider details', async t => {
+  for (const status of [413, 503]) {
+    const f = await fixture(t)
+    f.fetchWith(() => new Response('private storage details', { status }))
+    const result = await f.save(SMS_SOURCE)
+    assert.equal(result.code, 'provider')
+    assert.match(result.error, status === 413 ? /25 MiB.*RingCentral/ : /Try again later/)
+    if (status === 413) assert.equal(result.limitBytes, 25 * 1024 * 1024)
+    assert.equal(result.error.includes('private'), false)
+    assert.equal(f.requests.length, 1)
+    await assert.rejects(fs.stat(f.target), { code: 'ENOENT' })
+  }
+})

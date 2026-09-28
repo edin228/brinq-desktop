@@ -8,6 +8,9 @@ test('source identities select existing canonical Next routes without slash redi
     [{ kind: 'brinq-file', uid: 'file-uid' }, '/api/files/file-uid', true],
     [{ kind: 'ams360-attachment', clientId: 'client', uid: 'stored-uid' }, '/api/clients/client/ams360-attachments/stored-uid/data', false],
     [{ kind: 'ams360-document', clientId: 'client', documentId: 'DocAId' }, '/api/clients/client/ams360-documents/DocAId/data', false],
+    [{ kind: 'ams360-activity-attachment', clientId: 'client', activityId: 'activity +', ref: 'ref/&', refKind: 'attachment' }, '/api/clients/client/ams360-activities/activity%20%2B/attachments/ref%2F%26/data?kind=attachment', false],
+    [{ kind: 'marketing-attachment', projectUid: 'project/&', uid: 'attachment +' }, '/api/marketing-projects/project%2F%26/attachments/attachment%20%2B/download', true],
+    [{ kind: 'sms-attachment', uid: 'stored-uid' }, '/api/messaging/sms/attachments/stored-uid/download', false],
     [{ kind: 'synced-email-attachment', emailUid: 'email', attachmentId: 'A/B?C#D' }, '/api/email-sync/synced-emails/email/attachments/A%2FB%3FC%23D/download', false],
   ]
   assert.equal(SOURCE_KINDS.length, cases.length)
@@ -38,4 +41,19 @@ test('only HTTPS storage links returned by source owners enter the same-origin p
   for (const url of ['http://cdn.brinq.io/file', 'https://cdn.brinq.io.evil.test/file', 'https://evil.test/file', 'https://user:password@cdn.brinq.io/file', 'https://cdn.brinq.io:8443/file', '//cdn.brinq.io/file', 'file:///tmp/x', null]) {
     assert.equal(storageProxyUrl(base, url), null)
   }
+})
+
+
+test('AMS detail reference kind is explicit and cannot be confused with stored or document sources', () => {
+  const source = { kind: 'ams360-activity-attachment', clientId: '1', activityId: 'transaction', ref: 'DataId', refKind: 'data' }
+  assert.equal(resolveSource(base, source).url, base + '/api/clients/1/ams360-activities/transaction/attachments/DataId/data?kind=data')
+  for (const refKind of [undefined, '', 'Data', 'document', 'attachment&kind=data']) assert.equal(resolveSource(base, { ...source, refKind }), null)
+  for (const invalid of [
+    { ...source, uid: 'stored' }, { ...source, kind: 'ams360-document' },
+    { kind: 'marketing-attachment', uid: 'file-uid' },
+    { kind: 'marketing-attachment', projectUid: 'project', attachmentId: 'attachment' },
+    { kind: 'sms-attachment', uid: 'stored', download_url: 'https://provider.test/file' },
+    { kind: 'sms-attachment', uid: 'https://provider.test/file' },
+    { kind: 'sms-attachment', url: '/api/messaging/sms/shared-files/capability' },
+  ]) assert.equal(resolveSource(base, invalid), null)
 })
