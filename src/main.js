@@ -21,6 +21,7 @@ const { decompressRTF } = require('@kenjiuno/decompressrtf')
 const { deEncapsulateSync } = require('rtf-stream-parser')
 const iconv = require('iconv-lite')
 const config = require('./config')
+const { createWindowSecurity } = require('./window-security')
 const {
   buildSyncedAttachmentUrl,
   filenameFromContentDisposition,
@@ -46,6 +47,11 @@ app.commandLine.appendSwitch('enable-features', 'BackdropFilter')
 const PRELOAD_PATH = path.join(__dirname, 'preload.js')
 const BASE_URL = config.getBaseUrl()
 const BASE_ORIGIN = new URL(BASE_URL).origin
+const windowSecurity = createWindowSecurity({
+  baseUrl: BASE_URL,
+  preloadPath: PRELOAD_PATH,
+  openExternal: (url) => shell.openExternal(url),
+})
 
 let mainWindow = null
 let tray = null
@@ -305,18 +311,7 @@ async function parseEmailFile(filePath) {
 // EML File Viewer — IPC validation and URL helpers
 // ---------------------------------------------------------------------------
 function validateFileViewerSender(event, viewerId) {
-  if (!validateSender(event)) return false
-  const stored = fileViewerStore.get(viewerId)
-  return !!stored && event.sender.id === stored.windowId
-}
-
-function isAllowedExternalUrl(url) {
-  try {
-    const parsed = new URL(url)
-    return ['http:', 'https:', 'mailto:', 'tel:'].includes(parsed.protocol)
-  } catch {
-    return false
-  }
+  return windowSecurity.validateViewerSender(event, fileViewerStore.get(viewerId))
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +329,7 @@ ipcMain.handle('get-file-email', (event, viewerId) => {
 ipcMain.handle(
   'save-file-attachment',
   async (event, viewerId, attachmentIndex) => {
+    const stillAuthorized = windowSecurity.captureSender(event, ['viewer'])
     if (
       typeof viewerId !== 'string' ||
       !validateFileViewerSender(event, viewerId)
@@ -371,6 +367,9 @@ ipcMain.handle(
     }
 
     try {
+      if (!stillAuthorized()) {
+        return { ok: false, canceled: true, error: 'Window navigated or closed.' }
+      }
       await fs.promises.writeFile(savePath, att.content)
       return { ok: true, canceled: false }
     } catch (err) {
@@ -479,6 +478,7 @@ function scheduleSyncedAttachmentCleanup(tempPath) {
 ipcMain.handle(
   'open-file-attachment',
   async (event, viewerId, attachmentIndex) => {
+    const stillAuthorized = windowSecurity.captureSender(event, ['viewer'])
     if (
       typeof viewerId !== 'string' ||
       !validateFileViewerSender(event, viewerId)
@@ -550,6 +550,10 @@ ipcMain.handle(
       if (!viewerTempFiles.has(viewerId)) viewerTempFiles.set(viewerId, new Set())
       viewerTempFiles.get(viewerId).add(tempPath)
 
+      if (!stillAuthorized()) {
+        retryUnlink(tempPath, 1)
+        return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
+      }
       const errorMessage = await shell.openPath(tempPath)
       if (errorMessage) {
         return { ok: false, error: errorMessage, unsafe: false }
@@ -595,6 +599,7 @@ async function fetchSyncedAttachmentResponse(
   try {
     const response = await event.sender.session.fetch(url, {
       credentials: 'include',
+      redirect: 'error',
     })
     if (!response.ok) {
       await cancelResponseBody(response)
@@ -632,6 +637,7 @@ async function fetchSyncedAttachmentResponse(
 ipcMain.handle(
   'open-email-attachment',
   async (event, emailUid, attachmentId, fallbackFilename) => {
+    const stillAuthorized = windowSecurity.captureSender(event)
     const result = await fetchSyncedAttachmentResponse(
       event,
       emailUid,
@@ -691,6 +697,10 @@ ipcMain.handle(
         console.warn('Could not mark attachment as Internet-originated:', err)
       }
       scheduleSyncedAttachmentCleanup(tempPath)
+      if (!stillAuthorized()) {
+        retryUnlink(tempPath, 1)
+        return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
+      }
       const errorMessage = await shell.openPath(tempPath)
       if (errorMessage) {
         return { ok: false, unsafe: false, error: errorMessage }
@@ -709,6 +719,7 @@ ipcMain.handle(
 ipcMain.handle(
   'save-email-attachment',
   async (event, emailUid, attachmentId, fallbackFilename) => {
+    const stillAuthorized = windowSecurity.captureSender(event)
     const result = await fetchSyncedAttachmentResponse(
       event,
       emailUid,
@@ -716,6 +727,10 @@ ipcMain.handle(
       fallbackFilename,
     )
     if (!result.ok) return { ...result, canceled: false }
+    if (!stillAuthorized()) {
+      await cancelResponseBody(result.response)
+      return { ok: false, canceled: true }
+    }
 
     const owner = BrowserWindow.fromWebContents(event.sender)
     if (!owner || owner.isDestroyed()) {
@@ -737,6 +752,9 @@ ipcMain.handle(
         result.response,
         MAX_SYNCED_ATTACHMENT_BYTES,
       )
+      if (!stillAuthorized()) {
+        return { ok: false, canceled: true, error: 'Window navigated or closed.' }
+      }
       await fs.promises.writeFile(savePath, content)
       try {
         await markFileAsInternetOrigin(savePath, BASE_ORIGIN)
@@ -791,6 +809,7 @@ async function openEmailFile(filePath) {
         preload: PRELOAD_PATH,
         contextIsolation: true,
         nodeIntegration: false,
+        sandbox: true,
       },
     })
 
@@ -821,20 +840,7 @@ async function openEmailFile(filePath) {
 
     const viewerUrl = `${BASE_URL}/email/file-viewer?viewerId=${viewerId}`
 
-    viewer.webContents.on('will-navigate', (event, url) => {
-      if (url === viewerUrl) return
-      event.preventDefault()
-      if (isAllowedExternalUrl(url)) {
-        shell.openExternal(url)
-      }
-    })
-
-    viewer.webContents.setWindowOpenHandler(({ url }) => {
-      if (isAllowedExternalUrl(url)) {
-        shell.openExternal(url)
-      }
-      return { action: 'deny' }
-    })
+    windowSecurity.register(viewer, 'viewer', viewerUrl)
 
     try {
       await viewer.loadURL(viewerUrl)
@@ -958,29 +964,6 @@ if (!gotLock) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-function isSameOriginEmailPopout(url) {
-  try {
-    const parsed = new URL(url)
-    return (
-      parsed.origin === BASE_ORIGIN && parsed.pathname.startsWith('/email/')
-    )
-  } catch {
-    return false
-  }
-}
-
-function isOffOriginHttp(url) {
-  try {
-    const parsed = new URL(url)
-    return (
-      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-      parsed.origin !== BASE_ORIGIN
-    )
-  } catch {
-    return false
-  }
-}
-
 function getModeUrl() {
   const mode = config.getMode()
   return mode === 'email'
@@ -1093,6 +1076,7 @@ function createWindow({ showOnReady = true } = {}) {
       preload: PRELOAD_PATH,
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
     },
   })
 
@@ -1100,6 +1084,7 @@ function createWindow({ showOnReady = true } = {}) {
     if (showOnReady) mainWindow.show()
   })
 
+  windowSecurity.register(mainWindow, 'main')
   mainWindow.loadURL(getModeUrl())
 
   // Save window bounds on move/resize
@@ -1128,44 +1113,6 @@ function createWindow({ showOnReady = true } = {}) {
       rendererReady = true
       drainPendingPayloads()
     }
-  })
-
-  // Same-origin navigation guard
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    try {
-      const parsed = new URL(url)
-      if (parsed.origin === BASE_ORIGIN) return
-      event.preventDefault()
-      shell.openExternal(url)
-    } catch {
-      event.preventDefault()
-    }
-  })
-
-  // Handle window.open() from the web app
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (isSameOriginEmailPopout(url)) {
-      return {
-        action: 'allow',
-        overrideBrowserWindowOptions: {
-          width: 1100,
-          height: 700,
-          autoHideMenuBar: true,
-          webPreferences: {
-            preload: PRELOAD_PATH,
-            contextIsolation: true,
-            nodeIntegration: false,
-          },
-        },
-      }
-    }
-    if (isOffOriginHttp(url)) {
-      shell.openExternal(url)
-    }
-    if (url && !isOffOriginHttp(url) && !isSameOriginEmailPopout(url)) {
-      return { action: 'allow' }
-    }
-    return { action: 'deny' }
   })
 }
 
@@ -1239,12 +1186,7 @@ function switchMode(mode) {
 // IPC handlers (with sender origin validation)
 // ---------------------------------------------------------------------------
 function validateSender(event) {
-  try {
-    const senderUrl = event.sender.getURL()
-    return new URL(senderUrl).origin === BASE_ORIGIN
-  } catch {
-    return false
-  }
+  return windowSecurity.validateSender(event)
 }
 
 ipcMain.on('notify', (event, title, body, data) => {
