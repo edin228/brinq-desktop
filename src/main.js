@@ -6,7 +6,6 @@ const {
   Notification,
   ipcMain,
   shell,
-  nativeImage,
   dialog,
   screen,
 } = require('electron')
@@ -50,6 +49,13 @@ app.commandLine.appendSwitch('enable-zero-copy')
 app.commandLine.appendSwitch('enable-features', 'BackdropFilter')
 
 const PRELOAD_PATH = path.join(__dirname, 'preload.js')
+// Windows loads the matching ICO frame for each title bar and taskbar size;
+// a PNG window icon would be downscaled from 1024 px by the OS instead.
+const WINDOW_ICON_PATH = path.join(
+  __dirname,
+  '../assets',
+  process.platform === 'win32' ? 'icon.ico' : 'icon.png',
+)
 const BASE_URL = config.getBaseUrl()
 const BASE_ORIGIN = new URL(BASE_URL).origin
 const windowSecurity = createWindowSecurity({
@@ -615,7 +621,7 @@ async function openEmailFile(filePath, { showError = true, stillAuthorized = () 
       height: 700,
       title: result.metadata.subject,
       autoHideMenuBar: true,
-      icon: path.join(__dirname, '../assets/icon.png'),
+      icon: WINDOW_ICON_PATH,
       backgroundColor: '#0a0a0f',
       show: false,
       webPreferences: {
@@ -935,7 +941,7 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
     x: bounds.x,
     y: bounds.y,
     autoHideMenuBar: true,
-    icon: path.join(__dirname, '../assets/icon.png'),
+    icon: WINDOW_ICON_PATH,
     backgroundColor: '#0a0a0f',
     show: false,
     webPreferences: {
@@ -1012,16 +1018,11 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
 // Tray
 // ---------------------------------------------------------------------------
 function createTray() {
+  // Pass the ICO path unresized so Windows picks the hand-tuned frame for
+  // the current tray size and DPI.
   const iconFile =
     process.platform === 'win32' ? 'icon.ico' : 'tray-icon.png'
-  const trayIcon = nativeImage.createFromPath(
-    path.join(__dirname, '../assets/', iconFile),
-  )
-  const resized =
-    process.platform === 'win32'
-      ? trayIcon.resize({ width: 16, height: 16 })
-      : trayIcon
-  tray = new Tray(resized)
+  tray = new Tray(path.join(__dirname, '../assets', iconFile))
   tray.setToolTip('Brinq Mail')
 
   updateTrayMenu()

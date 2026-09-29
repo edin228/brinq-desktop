@@ -31,7 +31,7 @@ nsis:
   perMachine: true
 
 mac:
-  icon: assets/icon.png
+  icon: assets/icon-mac.png
   target:
     - dmg
   artifactName: Brinq-${version}.${ext}
