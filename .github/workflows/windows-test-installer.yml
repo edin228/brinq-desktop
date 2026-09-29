@@ -34,3 +34,10 @@ jobs:
             dist/Brinq-Setup.exe.blockmap
             dist/latest.yml
           if-no-files-found: error
+      # Brinq must never own .msg/.eml or mailto:; Outlook and AMS360 rely on them.
+      - name: Check installer registry behavior
+        shell: pwsh
+        run: |
+          $previous = Join-Path $env:RUNNER_TEMP 'Brinq-Setup-1.2.8.exe'
+          curl.exe -fsSL -o $previous https://github.com/edin228/brinq-desktop/releases/download/v1.2.8/Brinq-Setup.exe
+          ./test/windows-installer-registry.ps1 -Installer dist/Brinq-Setup.exe -PreviousInstaller $previous

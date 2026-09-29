@@ -15,17 +15,11 @@ win:
   target:
     - nsis
   artifactName: Brinq-Setup.${ext}
-  fileAssociations:
-    - ext: eml
-      name: "Email Message"
-      description: "Email Message File"
-      role: Viewer
-    - ext: msg
-      name: "Outlook Message"
-      description: "Outlook Message File"
-      role: Viewer
+  # No fileAssociations on Windows: they make Brinq the machine-wide default
+  # for .msg/.eml. build/installer.nsh registers an "Open with" choice instead.
 
 nsis:
+  include: build/installer.nsh
   oneClick: false
   allowToChangeInstallationDirectory: true
   perMachine: true
