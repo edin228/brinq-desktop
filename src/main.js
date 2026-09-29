@@ -854,6 +854,11 @@ function handleProtocolUrl(url) {
 // mailto: handler; Outlook and AMS360 depend on that association.
 app.setAsDefaultProtocolClient('brinq')
 
+// Versions before 1.2.4 claimed mailto: and uninstalling never removed it.
+// Electron only deletes the per-user key while it still points at this exe,
+// so a user's own choice or a vendor repair to Outlook is left alone.
+if (process.platform === 'win32') app.removeAsDefaultProtocolClient('mailto')
+
 // macOS: protocol URLs arrive via open-url event
 app.on('open-url', (event, url) => {
   event.preventDefault()
