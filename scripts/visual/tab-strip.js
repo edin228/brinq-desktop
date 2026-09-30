@@ -36,7 +36,8 @@ document.documentElement.style.setProperty('--controls-right', '138px')
 const calls = []
 window.__calls = calls
 window.brinqTabs = {
-  onState(callback) { callback(state); return () => {} },
+  // Tests push later states through window.__push.
+  onState(callback) { window.__push = callback; callback(state); return () => {} },
   select: (id, focus) => calls.push(['select', id, focus]),
   close: (id) => calls.push(['close', id]),
   move: (id, position) => calls.push(['move', id, position]),

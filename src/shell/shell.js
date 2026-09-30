@@ -106,6 +106,9 @@ function updateRovingFocus() {
 function render(next) {
   const previousSelected = state.selectedId
   state = next
+  // Moving a node blurs it; put keyboard focus back after reordering.
+  const focused = document.activeElement
+  if (drag && !next.tabs.some((tab) => tab.id === drag.id)) clearDrag()
   root.dataset.theme = next.theme === 'light' ? 'light' : 'dark'
   root.dataset.platform = next.platform || ''
   const home = next.tabs.find((tab) => tab.home)
@@ -135,6 +138,7 @@ function render(next) {
     }
   }
   updateRovingFocus()
+  if (focused && focused !== document.activeElement && focused.isConnected) focused.focus()
 
   const selected = next.tabs.find((tab) => tab.id === next.selectedId)
   refreshButton.dataset.loading = String(!!selected?.loading)
@@ -195,28 +199,35 @@ function moveDrag(event) {
   })
 }
 
+function clearDrag() {
+  const current = drag
+  drag = null
+  for (const wrapper of current.order) wrapper.style.transform = ''
+  tabsElement.classList.remove('reordering')
+  current.element.wrapper.classList.remove('dragging')
+  return current
+}
+
 function endDrag(event, cancelled = false) {
   if (!drag || event.pointerId !== drag.pointerId) return
-  const { element, order, from, to, moved, id } = drag
-  drag = null
-  for (const wrapper of order) wrapper.style.transform = ''
-  tabsElement.classList.remove('reordering')
-  element.wrapper.classList.remove('dragging')
+  const { element, from, to, moved, id } = clearDrag()
   if (!moved) return
   element.justDragged = true
   // A pointer that never produces a click must not swallow the next one.
   setTimeout(() => { element.justDragged = false })
-  if (cancelled || from === to) return
+  // The tab may have closed during the drag; never put back a stale copy.
+  if (cancelled || from === to || tabElements.get(id) !== element || element.wrapper.parentNode !== tabsElement) return
   // Show the new order at once; main confirms it with the next state.
-  const reference = to > from ? order[to].nextSibling : order[to]
-  tabsElement.insertBefore(element.wrapper, reference)
+  const others = [...tabsElement.children].filter((wrapper) => wrapper !== element.wrapper)
+  tabsElement.insertBefore(element.wrapper, others[to] || null)
   // Positions count Home as 0.
   bridge.move(id, to + 1)
 }
 
-tabsElement.addEventListener('pointermove', moveDrag)
-tabsElement.addEventListener('pointerup', (event) => endDrag(event))
-tabsElement.addEventListener('pointercancel', (event) => endDrag(event, true))
+// Listen on the document so a release outside the tray still ends the drag.
+document.addEventListener('pointermove', moveDrag)
+document.addEventListener('pointerup', (event) => endDrag(event))
+document.addEventListener('pointercancel', (event) => endDrag(event, true))
 
 homeButton.addEventListener('click', () => bridge.home(true))
 refreshButton.addEventListener('click', () => bridge.reload())
