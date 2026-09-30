@@ -77,4 +77,30 @@ if (process.isMainFrame && ['http:', 'https:'].includes(location.protocol)) {
         filename,
       ),
   })
+
+  // Report Brinq's light/dark theme so the desktop header can match it.
+  // next-themes marks the root element with a `light` or `dark` class.
+  let reported = null
+  const reportTheme = (force = false) => {
+    const classes = document.documentElement?.classList
+    if (!classes) return
+    const dark = classes.contains('dark')
+    const light = classes.contains('light')
+    if (dark === light) return
+    const theme = dark ? 'dark' : 'light'
+    if (!force && theme === reported) return
+    reported = theme
+    ipcRenderer.send('theme-changed', theme)
+  }
+  const observeTheme = () => {
+    const observer = new MutationObserver(() => reportTheme())
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
+    window.addEventListener('pagehide', () => observer.disconnect(), { once: true })
+    reportTheme()
+  }
+  // Main asks again after each load and tab switch, since a report sent
+  // while the page was still navigating is not accepted.
+  ipcRenderer.on('theme-request', () => reportTheme(true))
+  if (document.documentElement) observeTheme()
+  else document.addEventListener('DOMContentLoaded', observeTheme, { once: true })
 }
