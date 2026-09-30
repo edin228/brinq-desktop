@@ -210,9 +210,11 @@ function createTabWindow({
     entries.set(entry.id, entry)
     byContents.set(contents, entry)
     view.setBackgroundColor(THEME_COLORS[theme].color)
-    view.setVisible(false)
+    // Size before hiding: a view hidden before its first bounds renders its
+    // page at 0x0, so background tabs would never lay out.
     host.contentView.addChildView(view)
     layout()
+    view.setVisible(false)
     contents.on('before-input-event', onInput)
     contents.on('page-title-updated', (_event, title) => { entry.title = title; push() })
     const committed = (url) => {
