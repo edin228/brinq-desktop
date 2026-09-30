@@ -31,7 +31,8 @@ function recoveryFixture() {
   const context = {
     URL, Promise, BASE_ORIGIN: 'https://brinq.io', RECOVERY_URL: frame.url,
     recoveryWindow: { webContents: contents, isDestroyed: () => false }, recoveryRetry: null,
-    mainWindow: { isDestroyed: () => false, loadURL: (url) => { urls.push(url); return new Promise((done) => { resolve = done }) } },
+    // Recovery retries Home, the main window's permanent base tab.
+    homeContents: () => ({ loadURL: (url) => { urls.push(url); return new Promise((done) => { resolve = done }) } }),
     intendedAppUrl: 'https://brinq.io/clients/123?standalone=full',
     ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
   }

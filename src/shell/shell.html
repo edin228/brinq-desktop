@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Brinq</title>
+  <link rel="stylesheet" href="shell.css">
+  <script src="shell.js" defer></script>
+</head>
+<body>
+  <header class="bar">
+    <!-- Home and the tabs form one tab list; CSS places Refresh between them. -->
+    <div class="tablist" role="tablist" aria-label="Tabs">
+      <button class="home" type="button" role="tab" id="tab-1" aria-label="Home" aria-selected="false" tabindex="-1"></button>
+      <div class="tabs"></div>
+    </div>
+    <button class="icon-button refresh" type="button" aria-label="Refresh this tab" title="Refresh"></button>
+    <span class="divider" aria-hidden="true"></span>
+    <button class="icon-button new-tab" type="button" aria-label="New tab" title="New tab"></button>
+    <div class="drag" aria-hidden="true"></div>
+  </header>
+  <main class="panel" hidden>
+    <div class="panel-body" role="alert">
+      <h1 class="panel-title"></h1>
+      <p class="panel-text"></p>
+      <button class="retry" type="button">Try again</button>
+    </div>
+  </main>
+</body>
+</html>

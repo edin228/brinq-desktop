@@ -119,6 +119,8 @@ function createUpdateStatus({ app, updater, onChange = () => {}, restoreWindow =
 
   return {
     getState, check, restart,
+    // Tab pages are not windows, so the main window reports their veto here.
+    cancelQuit,
     checkOnLaunch() {
       if (startupChecked) return
       startupChecked = true
