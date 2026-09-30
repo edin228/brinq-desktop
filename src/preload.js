@@ -98,6 +98,36 @@ if (process.isMainFrame && ['http:', 'https:'].includes(location.protocol)) {
     window.addEventListener('pagehide', () => observer.disconnect(), { once: true })
     reportTheme()
   }
+  // Name the tab a link opens before its page loads: send the link's label
+  // synchronously, so the main process has it before the open request that
+  // the same gesture produces. Client links carry data-tab-label; other
+  // links fall back to their visible text.
+  const MAX_LINK_LABEL = 120
+  const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim()
+  const captureLink = (event) => {
+    if (!event.isTrusted || event.defaultPrevented) return
+    const target = event.target
+    if (!(target instanceof Element)) return
+    const anchor = target.closest('a[href]')
+    if (!(anchor instanceof HTMLAnchorElement) || anchor.hasAttribute('download')) return
+    if (anchor.origin !== location.origin) return
+    const text = clean(anchor.getAttribute('data-tab-label')) || clean(anchor.innerText)
+    const label = Array.from(text).slice(0, MAX_LINK_LABEL).join('')
+    if (!label) return
+    try { ipcRenderer.sendSync('link-label', { href: anchor.href, label }) } catch {}
+  }
+  const plain = (event) => !event.altKey && !event.shiftKey
+  // Keyboard-generated clicks (detail 0) are left to the keydown capture.
+  document.addEventListener('click', (event) => {
+    if (event.button === 0 && event.detail !== 0 && (event.ctrlKey || event.metaKey) && plain(event)) captureLink(event)
+  }, true)
+  document.addEventListener('auxclick', (event) => {
+    if (event.button === 1 && plain(event)) captureLink(event)
+  }, true)
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && plain(event) && !event.repeat && !event.isComposing) captureLink(event)
+  }, true)
+
   // Main asks again after each load and tab switch, since a report sent
   // while the page was still navigating is not accepted.
   ipcRenderer.on('theme-request', () => reportTheme(true))

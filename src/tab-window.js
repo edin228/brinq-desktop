@@ -1,4 +1,4 @@
-const { HOME_ID, createTabList, tabKind, tabLabel, shortcutAction } = require('./tabs')
+const { HOME_ID, createTabList, tabKind, pageTitle, tabLabel, linkLabelText, shortcutAction } = require('./tabs')
 
 // Owns the main window: a local tab strip in the window's own page and one
 // WebContentsView per Brinq tab below it. Home is the permanent base tab.
@@ -14,6 +14,11 @@ const isTheme = (value) => value === 'dark' || value === 'light'
 // immediate retry was dropped, one 100 ms later succeeded. Later requests
 // wait out this margin instead of being lost.
 const UNLOAD_SETTLE_MS = 250
+// A link label names the tab its gesture opens. The label arrives by
+// synchronous IPC before the open request (measured gap: about 1 ms in
+// Electron 44); 2 s is a generous, reversible margin before it goes stale.
+const LINK_LABEL_MS = 2000
+const canonicalUrl = (value) => { try { return new URL(value).href } catch { return null } }
 
 function createTabWindow({
   electron: { BrowserWindow, WebContentsView, dialog },
@@ -52,6 +57,9 @@ function createTabWindow({
   let pushScheduled = false
   let disposed = false
   let quitting = null
+  // One pending link label per opener page: its latest gesture.
+  const linkLabels = new Map()
+  const watchedOpeners = new WeakSet()
 
   const alive = () => !disposed && !host.isDestroyed()
   const entryFor = (contents) => byContents.get(contents)
@@ -65,7 +73,7 @@ function createTabWindow({
       tabs: list.ids().filter((id) => entries.has(id)).map((id) => {
         const entry = entries.get(id)
         return {
-          id, home: id === HOME_ID, label: tabLabel(entry.title, entry.url),
+          id, home: id === HOME_ID, label: tabLabel(entry.title, entry.url, entry.provisional),
           kind: tabKind(entry.url), loading: entry.loading, failed: entry.failed,
         }
       }),
@@ -81,7 +89,7 @@ function createTabWindow({
       if (!alive() || strip.isDestroyed()) return
       strip.send('tabs:state', snapshot())
       const selected = selectedEntry()
-      host.setTitle(selected ? tabLabel(selected.title, selected.url) : 'Brinq')
+      host.setTitle(selected ? tabLabel(selected.title, selected.url, selected.provisional) : 'Brinq')
     })
   }
 
@@ -223,8 +231,15 @@ function createTabWindow({
     layout()
     view.setVisible(false)
     contents.on('before-input-event', onInput)
-    contents.on('page-title-updated', (_event, title) => { entry.title = title; push() })
+    contents.on('page-title-updated', (_event, title) => {
+      entry.title = title
+      // The page named itself; the link's name is no longer needed.
+      if (pageTitle(title)) entry.provisional = null
+      push()
+    })
     const committed = (url) => {
+      // A different page than the link named: drop the link's name.
+      if (entry.provisional && canonicalUrl(url) !== entry.provisionalUrl) entry.provisional = null
       if (security.isAppUrl(url)) entry.url = url
       push()
     }
@@ -263,7 +278,7 @@ function createTabWindow({
     security.register(contents, entry.id === HOME_ID ? 'main' : 'app', undefined, host)
   }
 
-  function addTab({ contents: guest = null, webPreferences, url, afterId, background, id: fixedId }) {
+  function addTab({ contents: guest = null, webPreferences, url, afterId, background, id: fixedId, provisional = null }) {
     const view = guest
       ? new WebContentsView({ webContents: guest })
       // Keep inherited sandbox flags, but never loosen the app preferences.
@@ -272,6 +287,8 @@ function createTabWindow({
     const entry = {
       id, view, contents: view.webContents, url, title: '', loading: !guest, failed: null,
       theme: null, closing: false, retrying: false, stayedAt: 0,
+      // The opening link's name, shown until the page has its own title.
+      provisional: provisional?.label ?? null, provisionalUrl: provisional?.url ?? null,
     }
     attach(entry)
     if (!background) select(id)
@@ -290,16 +307,57 @@ function createTabWindow({
       return window.webContents
     }
     const openerEntry = entryFor(opener)
+    const provisional = takeLinkLabel(opener, url)
     const entry = addTab({
       contents: options.webContents || null,
       webPreferences: options.webPreferences,
       url,
       afterId: openerEntry ? openerEntry.id : null,
       background,
+      provisional,
     })
     if (!options.webContents) entry.contents.loadURL(url, { httpReferrer: referrer }).catch(() => {})
     if (!background && !openerEntry) { host.show(); host.focus() }
     return entry.contents
+  }
+
+  // Stores the name of the link a page is opening in a new tab. Called
+  // synchronously by the page, so it must only validate and store.
+  function linkLabel(event, payload) {
+    if (!alive() || !security.validateSender(event)) return false
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false
+    const { href, label } = payload
+    if (typeof href !== 'string' || !security.isAppUrl(href)) return false
+    const text = linkLabelText(label)
+    if (!text) return false
+    const opener = event.sender
+    watchOpener(opener)
+    const slot = {
+      href: canonicalUrl(href), label: text, at: now(),
+      stillAuthorized: security.captureSender(event),
+    }
+    linkLabels.set(opener, slot)
+    // A gesture that opened nothing leaves no label behind.
+    setTimer(() => { if (linkLabels.get(opener) === slot) linkLabels.delete(opener) }, LINK_LABEL_MS)
+    return true
+  }
+
+  function watchOpener(opener) {
+    if (watchedOpeners.has(opener)) return
+    watchedOpeners.add(opener)
+    const forget = () => linkLabels.delete(opener)
+    opener.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (isMainFrame) forget() })
+    opener.on('did-navigate-in-page', (_event, _url, isMainFrame) => { if (isMainFrame) forget() })
+    opener.once('destroyed', forget)
+  }
+
+  // The next tab this opener opens takes its pending label, once, and only
+  // for the exact URL the label named while the page is unchanged.
+  function takeLinkLabel(opener, url) {
+    const slot = linkLabels.get(opener)
+    linkLabels.delete(opener)
+    if (!slot || now() - slot.at >= LINK_LABEL_MS || !slot.stillAuthorized()) return null
+    return slot.href === canonicalUrl(url) ? { label: slot.label, url: slot.href } : null
   }
 
   function newTab() {
@@ -441,6 +499,7 @@ function createTabWindow({
 
   function dispose() {
     if (disposed) return
+    linkLabels.clear()
     for (const entry of entries.values()) {
       if (!entry.contents.isDestroyed()) entry.contents.close()
     }
@@ -461,6 +520,7 @@ function createTabWindow({
     dispatch,
     closeTab,
     closeAllForQuit,
+    linkLabel,
     reportTheme,
     stripCommand,
     stripState,

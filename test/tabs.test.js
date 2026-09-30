@@ -161,3 +161,23 @@ test('a moved tab leaves its opener run, so new tabs from that page follow the r
   const third = tabs.add({ afterId: HOME_ID })
   assert.deepEqual(tabs.ids(), [HOME_ID, second, third, other, first])
 })
+
+test('a page title wins over the link name, which wins over the route fallback', () => {
+  const { pageTitle, linkLabelText } = require('../src/tabs')
+  const client = 'http://localhost:3004/clients/42'
+  assert.equal(tabLabel('brinq', client, 'Acme Holdings'), 'Acme Holdings')
+  assert.equal(tabLabel('', client, 'Acme Holdings'), 'Acme Holdings')
+  assert.equal(tabLabel('brinq | Acme Holdings, LLC', client, 'Acme Holdings'), 'Acme Holdings, LLC')
+  assert.equal(tabLabel('brinq | Client', client, 'Acme Holdings'), 'Client', 'a real title "Client" is still a title')
+  assert.equal(tabLabel('brinq', client, null), 'Client')
+  assert.equal(pageTitle('Bots · Brinq'), 'Bots')
+  assert.equal(pageTitle('  brinq  '), '')
+  assert.equal(linkLabelText('  Acme\n  Holdings  '), 'Acme Holdings')
+  assert.equal(linkLabelText('   '), null)
+  assert.equal(linkLabelText(42), null)
+  assert.equal(linkLabelText(['Acme']), null)
+  assert.equal(linkLabelText('a'.repeat(120)), 'a'.repeat(120))
+  assert.equal(linkLabelText('a'.repeat(121)), null)
+  assert.equal(linkLabelText('😀'.repeat(120)), '😀'.repeat(120), 'the cap counts characters, not UTF-16 units')
+  assert.equal(linkLabelText('<img src=x>'), '<img src=x>')
+})
