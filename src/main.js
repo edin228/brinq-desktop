@@ -1243,6 +1243,18 @@ ipcMain.on('theme-changed', (event, theme) => {
   if (!validateSender(event)) return
   tabWindow?.reportTheme(event.sender, theme)
 })
+// A page names the tab its Ctrl/middle-click or Ctrl+Enter is about to open.
+// The page waits for this reply, so always answer, even on errors.
+ipcMain.on('link-label', (event, payload) => {
+  let stored = false
+  try {
+    stored = !!tabWindow?.linkLabel(event, payload)
+  } catch {
+    stored = false
+  } finally {
+    event.returnValue = stored
+  }
+})
 ipcMain.on('tabs:command', (event, command, id, options) => {
   tabWindow?.stripCommand(event, command, id, options)
 })

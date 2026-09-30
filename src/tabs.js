@@ -91,15 +91,30 @@ const FALLBACK = { client: 'Client', email: 'Email', page: 'Brinq' }
 
 // Page titles use "brinq | X", "X | brinq" and "X · Brinq". Remove only a
 // boundary brand segment so names such as "A | B Holdings" stay intact.
-function tabLabel(title, url) {
+// Returns '' when the title names nothing beyond the brand.
+function pageTitle(title) {
   let label = typeof title === 'string' ? title.replace(/\s+/g, ' ').trim() : ''
   const lower = () => label.toLowerCase()
   for (const separator of [' | ', ' · ']) {
     if (lower().startsWith(`${BRAND}${separator}`)) label = label.slice(BRAND.length + separator.length).trim()
     if (lower().endsWith(`${separator}${BRAND}`)) label = label.slice(0, -(BRAND.length + separator.length)).trim()
   }
-  if (!label || lower() === BRAND) return FALLBACK[tabKind(url)]
-  return label
+  return lower() === BRAND ? '' : label
+}
+
+// The page's own title wins; before it has one, the name of the link that
+// opened the tab; otherwise a name for the route.
+function tabLabel(title, url, provisional = null) {
+  return pageTitle(title) || provisional || FALLBACK[tabKind(url)]
+}
+
+const MAX_LINK_LABEL = 120
+
+// Normalizes a link label sent by a page. Returns null when it is not a
+// non-empty string of at most MAX_LINK_LABEL characters.
+function linkLabelText(value) {
+  if (typeof value !== 'string' || [...value].length > MAX_LINK_LABEL) return null
+  return value.replace(/\s+/g, ' ').trim() || null
 }
 
 const FEATURE_TOKENS = new Set(['noopener', 'noreferrer'])
@@ -147,4 +162,4 @@ function shortcutAction(input, platform = process.platform) {
   return null
 }
 
-module.exports = { HOME_ID, createTabList, tabKind, tabLabel, openAsTab, shortcutAction }
+module.exports = { HOME_ID, createTabList, tabKind, pageTitle, tabLabel, linkLabelText, MAX_LINK_LABEL, openAsTab, shortcutAction }

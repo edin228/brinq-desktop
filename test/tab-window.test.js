@@ -583,3 +583,114 @@ test('tabs move by drag command or Ctrl+Shift+PageUp/PageDown; Home never moves'
   f.flush()
   assert.equal(f.state().tabs[0].home, true, 'Home does not move')
 })
+
+test('a link label names the next tab its page opens for that exact URL, once', () => {
+  const f = fixture()
+  f.tabs.home.mainFrame.url = `${BASE}/renewals`
+  const event = { sender: f.tabs.home, senderFrame: f.tabs.home.mainFrame }
+  const labelOf = (contents) => f.state().tabs.find((tab) => f.viewOf(contents) && tab.id === tabIds(f)[f.host.children.indexOf(f.viewOf(contents))])?.label
+  const url = `${BASE}/clients/42?view=policies`
+  assert.equal(f.tabs.linkLabel(event, { href: url, label: '  Acme\n Holdings ' }), true)
+  const tab = f.open(url)
+  assert.equal(labelOf(tab), 'Acme Holdings')
+  tab.emit('did-navigate', {}, url)
+  tab.emit('page-title-updated', {}, 'brinq')
+  f.flush()
+  assert.equal(labelOf(tab), 'Acme Holdings', 'a brand-only title keeps the link name')
+  tab.emit('page-title-updated', {}, 'brinq | Acme Holdings, LLC')
+  f.flush()
+  assert.equal(labelOf(tab), 'Acme Holdings, LLC')
+  tab.emit('page-title-updated', {}, 'brinq')
+  f.flush()
+  assert.equal(labelOf(tab), 'Client', 'once the page named itself, the link name is gone')
+  assert.equal(f.host.titles.includes('Acme Holdings'), false, 'a background tab does not retitle the window')
+  const second = f.open(url)
+  assert.equal(labelOf(second), 'Client', 'the label was used once')
+})
+
+test('link labels expire, are replaced, stay with their page and need the exact URL', () => {
+  const f = fixture()
+  f.tabs.home.mainFrame.url = `${BASE}/renewals`
+  const home = { sender: f.tabs.home, senderFrame: f.tabs.home.mainFrame }
+  const labels = () => f.state().tabs.slice(1).map((tab) => tab.label)
+  const url = `${BASE}/clients/42?view=policies`
+  f.tabs.linkLabel(home, { href: url, label: 'Old' })
+  f.clock.advance(2000)
+  f.open(url)
+  f.tabs.linkLabel(home, { href: url, label: 'First' })
+  f.tabs.linkLabel(home, { href: url, label: 'Second' })
+  f.open(url)
+  f.tabs.linkLabel(home, { href: url, label: 'Mismatch' })
+  f.open(`${BASE}/clients/43?view=policies`)
+  f.open(url)
+  assert.deepEqual(labels(), ['Client', 'Second', 'Client', 'Client'])
+  const other = f.open(`${BASE}/renewals`)
+  const fromTab = { sender: other, senderFrame: other.mainFrame }
+  f.tabs.linkLabel(fromTab, { href: url, label: 'From tab' })
+  f.open(url)
+  assert.equal(labels().includes('From tab'), false, 'another page cannot use it')
+  f.open(url, { opener: other })
+  // A tab opened from another tab sits right after it.
+  assert.equal(labels().filter((label) => label === 'From tab').length, 1)
+  f.tabs.linkLabel(home, { href: url, label: 'Before navigation' })
+  f.tabs.home.emit('did-start-navigation', {}, `${BASE}/emails`, false, true)
+  f.tabs.home.emit('did-frame-navigate', {}, `${BASE}/emails`, 200, 'OK', true)
+  f.open(url)
+  assert.equal(labels().includes('Before navigation'), false, 'navigating the opener drops its label')
+})
+
+test('link labels are dropped when the tab goes to a different page', () => {
+  const f = fixture()
+  const home = { sender: f.tabs.home, senderFrame: f.tabs.home.mainFrame }
+  const url = `${BASE}/clients/42?view=policies`
+  f.tabs.linkLabel(home, { href: url, label: 'Acme Holdings' })
+  const tab = f.open(url)
+  const label = () => f.state().tabs.at(-1).label
+  tab.emit('did-navigate', {}, url)
+  f.flush()
+  assert.equal(label(), 'Acme Holdings', 'the first load of the same URL keeps it')
+  tab.emit('did-navigate-in-page', {}, `${BASE}/clients/42?view=files`, true)
+  f.flush()
+  assert.equal(label(), 'Client')
+})
+
+test('link labels come only from validated app pages with app URLs and text', () => {
+  const f = fixture()
+  const home = { sender: f.tabs.home, senderFrame: f.tabs.home.mainFrame }
+  const url = `${BASE}/clients/42`
+  for (const [event, payload] of [
+    [{ sender: f.strip, senderFrame: f.strip.mainFrame }, { href: url, label: 'Acme' }],
+    [{ ...home, senderFrame: { ...f.tabs.home.mainFrame } }, { href: url, label: 'Acme' }],
+    [home, null], [home, [url, 'Acme']], [home, 'Acme'],
+    [home, { href: 'https://evil.test/clients/42', label: 'Acme' }],
+    [home, { href: 'http://user@localhost:3004/clients/42', label: 'Acme' }],
+    [home, { href: 42, label: 'Acme' }],
+    [home, { href: url, label: '   ' }], [home, { href: url, label: 7 }],
+    [home, { href: url, label: 'a'.repeat(121) }],
+  ]) assert.equal(f.tabs.linkLabel(event, payload), false, JSON.stringify(payload))
+  f.open(url)
+  assert.equal(f.state().tabs.at(-1).label, 'Client')
+  f.host.close()
+  assert.equal(f.tabs.linkLabel(home, { href: url, label: 'Acme' }), false)
+})
+
+test('the synchronous link-label reply is always sent: true only when stored', () => {
+  const vm = require('node:vm')
+  const fs = require('node:fs')
+  const source = fs.readFileSync(require.resolve('../src/main'), 'utf8')
+  const handler = source.slice(source.indexOf("ipcMain.on('link-label'"), source.indexOf("ipcMain.on('tabs:command'"))
+  const handlers = new Map()
+  const context = { ipcMain: { on: (channel, fn) => handlers.set(channel, fn) }, tabWindow: null }
+  vm.createContext(context)
+  vm.runInContext(handler, context)
+  const reply = (tabWindow) => {
+    context.tabWindow = tabWindow
+    const event = {}
+    handlers.get('link-label')(event, { href: 'x', label: 'y' })
+    return event.returnValue
+  }
+  assert.equal(reply(null), false)
+  assert.equal(reply({ linkLabel: () => true }), true)
+  assert.equal(reply({ linkLabel: () => false }), false)
+  assert.equal(reply({ linkLabel: () => { throw new Error('boom') } }), false)
+})

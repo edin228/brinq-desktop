@@ -70,6 +70,21 @@ const ROUTES = {
     <iframe id="frame" sandbox="allow-popups" src="/framed" style="width:300px;height:80px"></iframe>`),
   // The frame runs no scripts, so its link fills the frame to be clickable.
   '/framed': page('frame', '<a id="framed-link" href="/clients/3" style="position:fixed;inset:0;margin:0">Framed link</a>'),
+  // Link labels: the target pages start with a brand-only title and name
+  // themselves later, like a client page loading its data.
+  '/labels': page('brinq | Labels', `
+    <a id="labeled" data-tab-label="Acme Holdings" href="/slow-client">Acme <span>SERVICE_CENTER</span></a>
+    <a id="plain" href="/slow-other">Blue Ridge   Bakery</a>
+    <a id="search" data-tab-label="Northwind Dental" href="/slow-search">Northwind search row</a>`, `
+    document.getElementById('search').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && event.ctrlKey) {
+        event.preventDefault()
+        window.open('/slow-search', '_blank', 'noopener,noreferrer')
+      }
+    })`),
+  '/slow-client': page('brinq', '<p>Loading client</p>', `setTimeout(() => { document.title = 'brinq | Acme Holdings, LLC' }, 1500)`),
+  '/slow-other': page('brinq', '<p>Loading</p>'),
+  '/slow-search': page('brinq', '<p>Loading</p>'),
   '/dirty': page('brinq | Draft', '<input id="draft" value="">', `
     document.getElementById('draft').addEventListener('input', () => {
       window.onbeforeunload = (event) => { event.preventDefault(); event.returnValue = '' }
@@ -111,7 +126,18 @@ async function main() {
   })
   app.on('before-quit', () => { app.isQuitting = true })
   app.on('window-all-closed', () => {})
-  security.setTabHost(tabs)
+  // Same forwarding as main.js, with timings for the label-to-open gap.
+  const labelTimes = []
+  const openTimes = []
+  ipcMain.on('link-label', (event, payload) => {
+    let stored = false
+    try { stored = !!tabs.linkLabel(event, payload) } catch { stored = false } finally { event.returnValue = stored }
+    if (stored) labelTimes.push(performance.now())
+  })
+  security.setTabHost({
+    available: tabs.available,
+    openTab: (args) => { openTimes.push(performance.now()); return tabs.openTab(args) },
+  })
   ipcMain.on('tabs:command', (event, command, id, options) => tabs.stripCommand(event, command, id, options))
   ipcMain.handle('tabs:state', (event) => tabs.stripState(event))
   ipcMain.on('theme-changed', (event, theme) => {
@@ -273,6 +299,43 @@ async function main() {
     await clientTab.executeJavaScript(`document.documentElement.classList.replace('light', 'dark'); document.documentElement.classList.replace('dark', 'light')`)
     await wait(300)
     check('a background tab does not repaint the header', (await stripState()).theme === 'dark')
+
+    // Link labels name background tabs before their pages do.
+    await tabs.home.loadURL(`${base}/labels`)
+    const labelsBefore = labelTimes.length
+    const opensBefore = openTimes.length
+    await click(tabs.home, '#labeled', ['control'])
+    check('a labeled client link names its background tab at once',
+      await until(async () => (await stripState()).labels.includes('Acme Holdings'), 1000),
+      JSON.stringify((await stripState()).labels))
+    check('the page title replaces the link name when it arrives',
+      await until(async () => (await stripState()).labels.includes('Acme Holdings, LLC'), 5000) &&
+      !(await stripState()).labels.includes('Acme Holdings'))
+    await click(tabs.home, '#plain', [], 'middle')
+    check('a link without a label falls back to its text',
+      await until(async () => (await stripState()).labels.includes('Blue Ridge Bakery'), 1000))
+    await tabs.home.executeJavaScript(`document.getElementById('search').focus()`)
+    tabs.home.sendInputEvent({ type: 'rawKeyDown', keyCode: 'Enter', modifiers: ['control'] })
+    tabs.home.sendInputEvent({ type: 'keyUp', keyCode: 'Enter', modifiers: ['control'] })
+    check('a Ctrl+Enter script open gets its link name',
+      await until(async () => (await stripState()).labels.includes('Northwind Dental'), 1000))
+    // A plain anchor's Ctrl+Enter also produces a keyboard click; only the
+    // keydown may send the label.
+    const beforeKeyboard = labelTimes.length
+    const openedBefore = openTimes.length
+    await tabs.home.executeJavaScript(`document.getElementById('plain').focus()`)
+    tabs.home.sendInputEvent({ type: 'rawKeyDown', keyCode: 'Enter', modifiers: ['control'] })
+    tabs.home.sendInputEvent({ type: 'keyUp', keyCode: 'Enter', modifiers: ['control'] })
+    await until(() => openTimes.length === openedBefore + 1, 2000)
+    await wait(200)
+    check('keyboard activation of a plain link sends one label', labelTimes.length === beforeKeyboard + 1 && openTimes.length === openedBefore + 1,
+      `labels ${labelTimes.length - beforeKeyboard}, opens ${openTimes.length - openedBefore}`)
+    const labels = labelTimes.slice(labelsBefore, labelsBefore + 3)
+    const opens = openTimes.slice(opensBefore, opensBefore + 3)
+    const gaps = opens.map((openAt, index) => openAt - labels[index])
+    check('each gesture sends one label before its open', labels.length === 3 && opens.length === 3 && gaps.every((gap) => gap >= 0),
+      `labels ${labels.length}, opens ${opens.length}, label-to-open ms ${gaps.map((gap) => gap.toFixed(1)).join(', ')}`)
+    await tabs.home.loadURL(`${base}/home`)
 
     // Failure panel and retry.
     const broken = tabs.openTab({ opener: tabs.home, url: `${base}/broken`, options: { webPreferences: {} }, referrer: { url: '', policy: 'default' }, background: false })
