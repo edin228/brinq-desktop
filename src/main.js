@@ -77,6 +77,8 @@ let navigatingMain = false
 let recoveryWindow = null
 let intendedAppUrl = null
 let recoveryRetry = null
+// Home could not load; the recovery window explains it until a load succeeds.
+let homeUnavailable = false
 const RECOVERY_URL = pathToFileURL(path.join(__dirname, 'offline.html')).href
 const updates = createUpdateStatus({
   app, updater: autoUpdater,
@@ -905,6 +907,7 @@ function showMainWindow() {
 
 function showRecovery() {
   if (!mainWindow || mainWindow.isDestroyed()) return
+  homeUnavailable = true
   mainWindow.hide()
   if (recoveryWindow && !recoveryWindow.isDestroyed()) { showMainWindow(); return }
   const window = new BrowserWindow({
@@ -986,6 +989,7 @@ function attachHome(contents, target) {
   })
   contents.on('did-finish-load', () => {
     if (!validateSender({ sender: contents, senderFrame: contents.mainFrame })) return
+    homeUnavailable = false
     if (recoveryWindow) {
       recoveryWindow.destroy()
       recoveryWindow = null
@@ -1027,7 +1031,10 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
     requestQuit: () => app.quit(),
     onQuitStopped: () => {
       updates.cancelQuit()
-      showMainWindow()
+      // Quitting closed the recovery window; bring it back if Home still
+      // cannot load, rather than showing Home's error page.
+      if (homeUnavailable) showRecovery()
+      else showMainWindow()
     },
   })
   const window = tabWindow.window
