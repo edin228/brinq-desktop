@@ -59,11 +59,8 @@ function createTabList() {
     },
     next: () => step(1),
     previous: () => step(-1),
-    // Ctrl+1..8 select by position; Ctrl+9 always selects the last tab.
-    selectPosition(position) {
-      const id = position === 9 ? ids[ids.length - 1] : ids[position - 1]
-      return id === undefined ? false : select(id)
-    },
+    // Ctrl+1..8 pick by position; Ctrl+9 always picks the last tab.
+    idAtPosition: (position) => (position === 9 ? ids[ids.length - 1] : ids[position - 1]),
   }
 }
 

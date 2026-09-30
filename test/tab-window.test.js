@@ -55,6 +55,7 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1 } = {}) {
   const security = createWindowSecurity({ baseUrl: BASE, preloadPath: '/preload.js', openExternal() {} })
   const queue = []
   const flush = () => { while (queue.length) queue.shift()() }
+  const app = { quitting: false, quitRequests: 0, stopped: 0 }
   const clock = {
     now: 1000,
     timers: [],
@@ -88,6 +89,7 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1 } = {}) {
     isDestroyed() { return this.destroyed }
     isVisible() { return this.visible }
     show() { this.visible = true }
+    hide() { this.visible = false }
     focus() { this.focusedCount = (this.focusedCount || 0) + 1 }
     getContentSize() { return [1200, 800] }
     setTitle(title) { this.titles.push(title) }
@@ -121,6 +123,9 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1 } = {}) {
     schedule: (fn) => queue.push(fn),
     now: () => clock.now,
     setTimer: (fn, ms) => clock.timers.push([clock.now + ms, fn]),
+    isQuitting: () => app.quitting,
+    requestQuit: () => { app.quitRequests++ },
+    onQuitStopped: () => { app.stopped++; app.quitting = false },
   })
   const host = windows[0]
   const strip = host.webContents
@@ -138,7 +143,7 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1 } = {}) {
     flush()
     return contents
   }
-  return { tabs, host, strip, security, session, windows, dialogs, homes, themes, flush, state, stripEvent, viewOf, open, fakeContents, queue, clock }
+  return { tabs, host, strip, security, session, windows, dialogs, homes, themes, flush, state, stripEvent, viewOf, open, fakeContents, queue, clock, app }
 }
 
 function tabIds(f) { return f.state().tabs.map((tab) => tab.id) }
@@ -298,6 +303,7 @@ test('quit closes tabs one at a time with Home last and stops at Stay', async ()
   for (const [name, contents] of [['home', f.tabs.home], ['a', a], ['b', b]]) contents.on('destroyed', () => order.push(name))
   b.veto = true
   f.host.visible = false
+  f.app.quitting = true
   const first = f.tabs.closeAllForQuit()
   assert.equal(f.tabs.closeAllForQuit(), first, 'a second quit joins the first')
   assert.equal(await first, false)
@@ -478,4 +484,69 @@ test('title, loading and route changes coalesce into one strip update', () => {
   let prevented = false
   f.strip.emit('page-title-updated', { preventDefault() { prevented = true } }, 'Brinq')
   assert.equal(prevented, true)
+})
+
+test('closing the window hides it; quitting closes every tab, then quits again', async () => {
+  const f = fixture({ choice: 1 })
+  const tab = f.open(`${BASE}/clients/1`)
+  f.host.visible = true
+  let prevented = false
+  f.host.emit('close', { preventDefault() { prevented = true } })
+  assert.equal(prevented, true)
+  assert.equal(f.host.visible, false, 'close hides to the tray')
+  assert.equal(tab.isDestroyed(), false, 'hiding keeps every tab')
+  f.app.quitting = true
+  prevented = false
+  f.host.emit('close', { preventDefault() { prevented = true } })
+  assert.equal(prevented, true, 'the window waits for its tabs')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(tab.isDestroyed(), true)
+  assert.equal(f.tabs.home.isDestroyed(), true)
+  assert.equal(f.app.quitRequests, 1)
+  prevented = false
+  f.host.emit('close', { preventDefault() { prevented = true } })
+  assert.equal(prevented, false, 'with no tabs left the window closes')
+})
+
+test('Stay during quit, or a quit stopped by another window, keeps the tabs', async () => {
+  const f = fixture({ choice: 1 })
+  const dirty = f.open(`${BASE}/clients/1`)
+  dirty.veto = true
+  f.app.quitting = true
+  f.host.emit('close', { preventDefault() {} })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(f.app.stopped, 1)
+  assert.equal(f.app.quitRequests, 0)
+  assert.equal(dirty.isDestroyed(), false)
+
+  const g = fixture()
+  const first = g.open(`${BASE}/clients/1`)
+  const second = g.open(`${BASE}/clients/2`)
+  // An email pop-out vetoes the same quit while the first tab closes.
+  first.on('destroyed', () => { g.app.quitting = false })
+  g.app.quitting = true
+  g.host.emit('close', { preventDefault() {} })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(first.isDestroyed(), true)
+  assert.equal(second.isDestroyed(), false, 'remaining tabs are kept')
+  assert.equal(g.tabs.home.isDestroyed(), false)
+  assert.equal(g.app.stopped, 1)
+  assert.equal(g.app.quitRequests, 0)
+})
+
+test('closing from the strip keeps keyboard focus in the strip', () => {
+  const f = fixture()
+  const a = f.open(`${BASE}/clients/1`)
+  const b = f.open(`${BASE}/clients/2`)
+  const [, idA] = tabIds(f)
+  f.tabs.select(idA)
+  const before = b.focused
+  f.tabs.stripCommand(f.stripEvent(), 'close', idA)
+  f.flush()
+  assert.equal(a.isDestroyed(), true)
+  assert.equal(f.state().selectedId, tabIds(f)[1])
+  assert.equal(b.focused, before, 'the next tab is selected without taking focus')
+  f.tabs.closeTab(tabIds(f)[1])
+  f.flush()
+  assert.equal(f.tabs.home.focused > 0, true, 'a shortcut close focuses the next page')
 })

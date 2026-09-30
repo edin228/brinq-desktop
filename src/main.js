@@ -1023,6 +1023,12 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
       firstHomeUrl = null
       attachHome(contents, target)
     },
+    isQuitting: () => !!app.isQuitting,
+    requestQuit: () => app.quit(),
+    onQuitStopped: () => {
+      updates.cancelQuit()
+      showMainWindow()
+    },
   })
   const window = tabWindow.window
   mainWindow = window
@@ -1040,25 +1046,6 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
   }
   window.on('resize', saveBounds)
   window.on('move', saveBounds)
-
-  // Closing hides to the tray and keeps every tab. Quitting closes the tabs
-  // first, Home last, so each unsaved-work prompt can stop the quit.
-  window.on('close', (event) => {
-    if (!app.isQuitting) {
-      event.preventDefault()
-      window.hide()
-      return
-    }
-    if (!tabWindow || !tabWindow.hasOpenTabs()) return
-    event.preventDefault()
-    tabWindow.closeAllForQuit().then((closed) => {
-      if (closed) app.quit()
-      else {
-        updates.cancelQuit()
-        showMainWindow()
-      }
-    })
-  })
 
   window.once('closed', () => {
     if (mainWindow === window) {

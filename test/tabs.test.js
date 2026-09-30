@@ -43,7 +43,7 @@ test('tabs opened from one page stay next to it in click order', () => {
   assert.equal(tabs.ids().at(-1), standalone)
 })
 
-test('next/previous wrap and positions select 1..8 with 9 as last', () => {
+test('next/previous wrap and positions pick 1..8 with 9 as last', () => {
   const tabs = createTabList()
   const a = tabs.add()
   const b = tabs.add()
@@ -51,12 +51,10 @@ test('next/previous wrap and positions select 1..8 with 9 as last', () => {
   assert.equal(tabs.next(), b)
   assert.equal(tabs.next(), HOME_ID)
   assert.equal(tabs.previous(), b)
-  assert.equal(tabs.selectPosition(2), true)
-  assert.equal(tabs.selected(), a)
-  assert.equal(tabs.selectPosition(5), false)
-  assert.equal(tabs.selected(), a)
-  assert.equal(tabs.selectPosition(9), true)
-  assert.equal(tabs.selected(), b)
+  assert.equal(tabs.idAtPosition(1), HOME_ID)
+  assert.equal(tabs.idAtPosition(2), a)
+  assert.equal(tabs.idAtPosition(5), undefined)
+  assert.equal(tabs.idAtPosition(9), b)
 })
 
 test('labels strip only a boundary brand and fall back by route', () => {

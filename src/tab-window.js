@@ -21,6 +21,9 @@ function createTabWindow({
   theme: savedTheme = 'light', platform = process.platform,
   newTabUrl, onTheme = () => {}, onHome = () => {}, schedule = setImmediate,
   now = Date.now, setTimer = setTimeout,
+  // Quit wiring: whether the app is quitting, how to quit again once every
+  // tab closed, and what to do when an unsaved-work prompt stops the quit.
+  isQuitting = () => false, requestQuit = () => {}, onQuitStopped = () => {},
 }) {
   const appPreferences = () => ({
     preload: preloadPath, contextIsolation: true, nodeIntegration: false,
@@ -33,6 +36,7 @@ function createTabWindow({
     icon,
     show: false,
     title: 'Brinq',
+    autoHideMenuBar: true,
     backgroundColor: THEME_COLORS[theme].color,
     titleBarStyle: 'hidden',
     ...(platform === 'darwin' ? {} : { titleBarOverlay: overlay() }),
@@ -146,9 +150,7 @@ function createTabWindow({
     if (action === 'next') return select(list.next())
     if (action === 'previous') return select(list.previous())
     if (action.startsWith('select-')) {
-      const ids = list.ids()
-      const position = Number(action.slice(7))
-      const id = position === 9 ? ids[ids.length - 1] : ids[position - 1]
+      const id = list.idAtPosition(Number(action.slice(7)))
       return id !== undefined && select(id)
     }
     const target = selectedEntry()
@@ -199,7 +201,7 @@ function createTabWindow({
       // Home is permanent: if its page goes away outside quit, rebuild it.
       if (entry.id === HOME_ID) lastHomeUrl = entry.url
       if (entry.id === HOME_ID && !quitting) createHome(entry.url)
-      else if (wasSelected && entries.has(list.selected())) select(list.selected())
+      else if (wasSelected && entries.has(list.selected())) select(list.selected(), { focus: entry.focusAfterClose !== false })
       else push()
     }
     entry.settle?.(true)
@@ -315,9 +317,11 @@ function createTabWindow({
     else close()
   }
 
-  function closeTab(id) {
+  // A close from the strip keeps keyboard focus in the strip.
+  function closeTab(id, { focus = true } = {}) {
     const entry = entries.get(id)
     if (!entry || id === HOME_ID) return false
+    entry.focusAfterClose = focus
     requestClose(entry)
     return true
   }
@@ -337,6 +341,9 @@ function createTabWindow({
     quitting = (async () => {
       const order = [...list.ids().filter((id) => id !== HOME_ID), HOME_ID]
       for (const id of order) {
+        // Another window (an email pop-out) may have stopped the quit; keep
+        // the remaining tabs rather than closing them for nothing.
+        if (!isQuitting()) return false
         const entry = entries.get(id)
         if (entry && !(await closeAndWait(entry))) return false
       }
@@ -368,7 +375,7 @@ function createTabWindow({
     if (command === 'reload') return dispatch('reload'), true
     if (!Number.isSafeInteger(id) || !entries.has(id)) return false
     if (command === 'select') return select(id, { focus: options?.focus === true })
-    if (command === 'close') return closeTab(id)
+    if (command === 'close') return closeTab(id, { focus: false })
     if (command === 'retry') return retry(id), true
     return false
   }
@@ -389,6 +396,22 @@ function createTabWindow({
   strip.on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
     if (isMainFrame && code !== -3 && url === shellUrl) schedule(reloadStrip)
   })
+  // Closing the window hides it to the tray and keeps every tab. Quitting
+  // closes the tabs first, Home last, then quits again with no tabs left.
+  host.on('close', (event) => {
+    if (!isQuitting()) {
+      event.preventDefault()
+      host.hide()
+      return
+    }
+    if (entries.size === 0) return
+    event.preventDefault()
+    closeAllForQuit().then((closed) => {
+      if (closed) requestQuit()
+      else onQuitStopped()
+    })
+  })
+
   for (const name of ['resize', 'maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen', 'restore']) {
     host.on(name, layout)
   }

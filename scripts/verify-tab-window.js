@@ -92,6 +92,7 @@ async function main() {
   const prompts = []
   const dialog = { showMessageBoxSync: (_owner, options) => { prompts.push(options.message); return answers.shift() ?? 1 } }
   const themes = []
+  let quitStops = 0
   const tabs = createTabWindow({
     electron: { BrowserWindow, WebContentsView, dialog },
     security,
@@ -103,7 +104,13 @@ async function main() {
     newTabUrl: (home) => home.getURL(),
     onTheme: (theme) => themes.push(theme),
     onHome: (contents) => contents.loadURL(`${base}/home`),
+    // The same quit wiring main.js uses, with the real app.quit().
+    isQuitting: () => !!app.isQuitting,
+    requestQuit: () => app.quit(),
+    onQuitStopped: () => { quitStops++; app.isQuitting = false; tabs.window.show() },
   })
+  app.on('before-quit', () => { app.isQuitting = true })
+  app.on('window-all-closed', () => {})
   security.setTabHost(tabs)
   ipcMain.on('tabs:command', (event, command, id, options) => tabs.stripCommand(event, command, id, options))
   ipcMain.handle('tabs:state', (event) => tabs.stripState(event))
@@ -253,7 +260,21 @@ async function main() {
     await wait(300)
     check('open/close cycles leave no pages behind', allContents.getAllWebContents().length <= baseline, `${allContents.getAllWebContents().length} vs ${baseline}`)
 
-    // Quit: a hidden dirty tab can stop it.
+    // Home navigating away from unsaved work (as a mode switch does).
+    await tabs.home.loadURL(`${base}/dirty`)
+    await click(tabs.home, '#draft')
+    tabs.home.sendInputEvent({ type: 'char', keyCode: 'h' })
+    await until(() => tabs.home.executeJavaScript('document.getElementById("draft").value === "h"'))
+    answers.push(1)
+    const stayed = await tabs.home.loadURL(`${base}/home`).then(() => 'loaded', () => 'rejected')
+    check('Stay keeps Home on its page and rejects the navigation', stayed === 'rejected' && tabs.home.getURL().endsWith('/dirty'))
+    // A person takes longer than Chromium's canceled-unload acknowledgement.
+    await wait(300)
+    answers.push(0)
+    const left = await tabs.home.loadURL(`${base}/home`).then(() => 'loaded', (error) => `rejected: ${error.message}`)
+    check('Leave lets Home navigate', left === 'loaded' && tabs.home.getURL().endsWith('/home'), `${left} at ${tabs.home.getURL()}`)
+
+    // A real app.quit() with a hidden tab holding unsaved work.
     const quitTab = tabs.openTab({ opener: tabs.home, url: `${base}/dirty`, options: { webPreferences: {} }, referrer: { url: '', policy: 'default' }, background: false })
     await until(() => !quitTab.isLoading())
     await click(quitTab, '#draft')
@@ -262,14 +283,22 @@ async function main() {
     tabs.selectHome()
     host.hide()
     answers.push(1)
-    const stopped = await tabs.closeAllForQuit()
-    check('quit with unsaved work stops at Stay', stopped === false && !quitTab.isDestroyed())
-    check('quit shows the window and the tab with unsaved work', host.isVisible() && tabs.isTab(quitTab))
+    app.quit()
+    const quitStopped = await until(() => quitStops === 1)
+    check('Stay stops a real quit', quitStopped && !quitTab.isDestroyed() && !app.isQuitting,
+      JSON.stringify({ quitStops, destroyed: quitTab.isDestroyed(), quitting: app.isQuitting, prompts: prompts.length, answers }))
+    check('the stopped quit shows the window and the tab with unsaved work', host.isVisible() && tabs.isTab(quitTab))
+    let quitState = null
+    app.once('will-quit', (event) => {
+      // Keep the harness alive to report; record what quitting left behind.
+      event.preventDefault()
+      quitState = { host: host.isDestroyed(), tabs: tabPages().length, home: tabs.home.isDestroyed() }
+    })
     answers.push(0)
-    // Retry at once: the request must wait for Chromium, not be dropped.
-    const second = tabs.closeAllForQuit()
-    check('quit completes after Leave', await second)
-    check('quit closed every tab, Home last', !tabs.hasOpenTabs())
+    app.quit()
+    check('Leave completes the quit after every tab and Home closed', await until(() => quitState !== null),
+      JSON.stringify(quitState))
+    check('quit left no pages and closed the window', quitState?.host === true && quitState?.tabs === 0 && quitState?.home === true)
   } catch (error) {
     check('harness completed', false, error?.stack || String(error))
   }
@@ -277,7 +306,7 @@ async function main() {
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   server.close()
-  host.destroy()
+  if (!host.isDestroyed()) host.destroy()
   app.exit(failed.length ? 1 : 0)
 }
 
