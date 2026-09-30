@@ -18,8 +18,8 @@ const argv = process.argv.slice(2)
 // --- Visual harness server -------------------------------------------------
 // Serves only the strip harness, the strip's CSS/JS and the bundled font.
 const VISUAL_FILES = {
-  '/test/visual/tab-strip.html': ['test/visual/tab-strip.html', 'text/html; charset=utf-8'],
-  '/test/visual/tab-strip.js': ['test/visual/tab-strip.js', 'text/javascript; charset=utf-8'],
+  '/scripts/visual/tab-strip.html': ['scripts/visual/tab-strip.html', 'text/html; charset=utf-8'],
+  '/scripts/visual/tab-strip.js': ['scripts/visual/tab-strip.js', 'text/javascript; charset=utf-8'],
   '/src/shell/shell.html': ['src/shell/shell.html', 'text/html; charset=utf-8'],
   '/src/shell/shell.css': ['src/shell/shell.css', 'text/css; charset=utf-8'],
   '/src/shell/shell.js': ['src/shell/shell.js', 'text/javascript; charset=utf-8'],
@@ -38,7 +38,7 @@ function serveVisual(port) {
     fs.createReadStream(path.join(ROOT, entry[0])).pipe(response)
   })
   server.listen(port, '0.0.0.0', () => {
-    console.log(`Strip harness: http://localhost:${port}/test/visual/tab-strip.html?state=home-hover&theme=dark`)
+    console.log(`Strip harness: http://localhost:${port}/scripts/visual/tab-strip.html?state=home-hover&theme=dark`)
   })
   const stop = () => server.close(() => process.exit(0))
   process.on('SIGINT', stop)
