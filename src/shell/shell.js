@@ -89,8 +89,9 @@ function updateTab(element, tab, selected) {
   element.wrapper.classList.toggle('selected', selected)
 }
 
+// Keyboard order follows the tabs as displayed, including reorders.
 function focusable() {
-  return [homeButton, ...[...tabElements.values()].map((element) => element.select)]
+  return [homeButton, ...tabsElement.querySelectorAll('.tab-select')]
 }
 
 function idOf(button) {
@@ -171,9 +172,6 @@ function startDrag(event, id) {
     from: order.indexOf(element.wrapper), to: order.indexOf(element.wrapper),
     step: element.wrapper.getBoundingClientRect().width + TAB_GAP,
   }
-  // Capture keeps the drag when the pointer leaves the tab; a pointer the
-  // browser does not track (synthetic input) simply goes without it.
-  try { element.wrapper.setPointerCapture(event.pointerId) } catch {}
 }
 
 function moveDrag(event) {
@@ -184,6 +182,10 @@ function moveDrag(event) {
     drag.moved = true
     tabsElement.classList.add('reordering')
     drag.element.wrapper.classList.add('dragging')
+    // Capture only once this is a drag: capturing on press would retarget the
+    // click to the wrapper and a plain click would no longer select the tab.
+    // A pointer the browser does not track (synthetic input) goes without it.
+    try { drag.element.wrapper.setPointerCapture(event.pointerId) } catch {}
   }
   // Keep the tab inside the tray.
   const minDx = -drag.from * drag.step

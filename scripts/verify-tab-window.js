@@ -209,6 +209,20 @@ async function main() {
       check('dragging a tab reorders it', await until(async () => JSON.stringify(await stripOrder()) === JSON.stringify(expected)),
         JSON.stringify(await stripOrder()))
       check('dropping a dragged tab does not select it', (await stripState()).selected === 'home')
+
+      // Plain real clicks select, including a press that wobbles under the
+      // drag threshold.
+      const selectedId = () => host.webContents.executeJavaScript(`document.querySelector('.tab.selected .tab-select')?.id ?? 'home'`)
+      const after = await stripOrder()
+      const centers = await host.webContents.executeJavaScript(`[...document.querySelectorAll('.tab')].map((node) => { const box = node.getBoundingClientRect(); return [Math.round(box.x + 60), Math.round(box.y + box.height / 2)] })`)
+      xdo('mousemove', content.x + centers[0][0], content.y + centers[0][1], 'click', '1')
+      check('a plain click selects a tab', await until(async () => (await selectedId()) === after[0]))
+      xdo('mousemove', content.x + centers[1][0], content.y + centers[1][1], 'mousedown', '1')
+      xdo('mousemove', content.x + centers[1][0] + 3, content.y + centers[1][1])
+      xdo('mouseup', '1')
+      check('a press that moves under the drag threshold still selects', await until(async () => (await selectedId()) === after[1]))
+      check('clicks do not reorder', JSON.stringify(await stripOrder()) === JSON.stringify(after))
+      tabs.selectHome()
     } else console.log('SKIP tab drag: set XDOTOOL to a real input tool')
 
     const windowsBefore = BrowserWindow.getAllWindows().length
