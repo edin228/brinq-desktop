@@ -1,6 +1,7 @@
 const {
   app,
   BrowserWindow,
+  WebContentsView,
   Tray,
   Menu,
   Notification,
@@ -36,6 +37,7 @@ const {
 } = require('./attachment-files')
 const { createFileActions, CAPABILITIES } = require('./file-actions')
 const { createUpdateStatus } = require('./update-status')
+const { createTabWindow } = require('./tab-window')
 
 // Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
 if (process.platform === 'win32') {
@@ -49,6 +51,8 @@ app.commandLine.appendSwitch('enable-zero-copy')
 app.commandLine.appendSwitch('enable-features', 'BackdropFilter')
 
 const PRELOAD_PATH = path.join(__dirname, 'preload.js')
+const SHELL_PRELOAD_PATH = path.join(__dirname, 'shell-preload.js')
+const SHELL_URL = pathToFileURL(path.join(__dirname, 'shell', 'shell.html')).href
 // Windows loads the matching ICO frame for each title bar and taskbar size;
 // a PNG window icon would be downscaled from 1024 px by the OS instead.
 const WINDOW_ICON_PATH = path.join(
@@ -64,7 +68,9 @@ const windowSecurity = createWindowSecurity({
   openExternal: (url) => shell.openExternal(url),
 })
 
+// The main window hosts the tab strip; Home is its permanent base tab.
 let mainWindow = null
+let tabWindow = null
 let tray = null
 const navigationQueue = createNavigationQueue()
 let navigatingMain = false
@@ -76,12 +82,8 @@ const updates = createUpdateStatus({
   app, updater: autoUpdater,
   onChange: (state) => {
     if (tray) updateTrayMenu()
-    for (const window of BrowserWindow.getAllWindows()) {
-      const contents = window.webContents
-      if (validateSender({ sender: contents, senderFrame: contents.mainFrame })) {
-        contents.send('update-status', state)
-      }
-    }
+    // Every validated app page, whether a tab or a pop-out window.
+    for (const contents of windowSecurity.appContents()) contents.send('update-status', state)
   },
   restoreWindow: () => {
     if (!mainWindow || mainWindow.isDestroyed()) createWindow({ initialUrl: intendedAppUrl })
@@ -572,7 +574,8 @@ const fileActions = createFileActions({
   security: windowSecurity,
   tempDir: BRINQ_TEMP_DIR,
   showSaveDialog: (contents, options) => {
-    const owner = BrowserWindow.fromWebContents(contents)
+    // Tab pages belong to the main window, which fromWebContents cannot see.
+    const owner = tabWindow?.windowFor(contents) || BrowserWindow.fromWebContents(contents)
     if (!owner || owner.isDestroyed()) return { canceled: true }
     return dialog.showSaveDialog(owner, options)
   },
@@ -799,10 +802,17 @@ function getModeUrl() {
   return modeUrl(BASE_URL, config.getMode())
 }
 
+// Home owns every single-page duty: mail links, notifications, mode, recovery.
+function homeContents() {
+  const contents = tabWindow?.available() ? tabWindow.home : null
+  return contents && !contents.isDestroyed() ? contents : null
+}
+
 function isOnEmailsRoute() {
-  if (!mainWindow) return false
+  const home = homeContents()
+  if (!home) return false
   try {
-    const current = new URL(mainWindow.webContents.getURL())
+    const current = new URL(home.getURL())
     return current.pathname === '/emails'
   } catch {
     return false
@@ -810,9 +820,10 @@ function isOnEmailsRoute() {
 }
 
 function isOnLoginPage() {
-  if (!mainWindow) return false
+  const home = homeContents()
+  if (!home) return false
   try {
-    const current = new URL(mainWindow.webContents.getURL())
+    const current = new URL(home.getURL())
     return current.pathname === '/login'
   } catch {
     return false
@@ -820,22 +831,25 @@ function isOnLoginPage() {
 }
 
 function drainPendingPayloads() {
-  if (!mainWindow || navigatingMain || !isOnEmailsRoute()) return
-  const contents = mainWindow.webContents
+  const contents = homeContents()
+  if (!contents || navigatingMain || !isOnEmailsRoute()) return
   const frame = contents.mainFrame
   if (!windowSecurity.validateSender({ sender: contents, senderFrame: frame }, ['main'])) return
   navigationQueue.drain(frame, (channel, data) => contents.send(channel, data))
 }
 
 function routePendingPayloads() {
-  if (!mainWindow || navigatingMain || !navigationQueue.hasPending()) return
-  const target = incomingNavigationUrl(mainWindow.webContents.getURL(), BASE_URL, config.getMode())
-  if (target) mainWindow.loadURL(target).catch(() => {})
+  const home = homeContents()
+  if (!home || navigatingMain || !navigationQueue.hasPending()) return
+  const target = incomingNavigationUrl(home.getURL(), BASE_URL, config.getMode())
+  if (target) home.loadURL(target).catch(() => {})
   else drainPendingPayloads()
 }
 
+// Mail links and notification clicks land on Home, so show it.
 function queuePayload(channel, data) {
   navigationQueue.push(channel, data)
+  tabWindow?.selectHome()
   routePendingPayloads()
 }
 
@@ -877,6 +891,11 @@ function approvedAppUrl(value) {
 }
 
 function showMainWindow() {
+  // A quit stopped by another window can leave no main window; rebuild it.
+  if (!recoveryWindow && (!mainWindow || mainWindow.isDestroyed()) && app.isReady()) {
+    createWindow({ initialUrl: intendedAppUrl })
+  }
+  tabWindow?.ensureHome()
   const window = recoveryWindow && !recoveryWindow.isDestroyed() ? recoveryWindow : mainWindow
   if (!window || window.isDestroyed()) return
   if (window.isMinimized()) window.restore()
@@ -922,10 +941,11 @@ function validateRecoverySender(event) {
 
 function retryMainWindow() {
   if (recoveryRetry) return recoveryRetry
-  if (!mainWindow || mainWindow.isDestroyed() || !approvedAppUrl(intendedAppUrl)) {
+  const home = homeContents()
+  if (!home || !approvedAppUrl(intendedAppUrl)) {
     return Promise.resolve({ ok: false, error: 'Brinq could not reconnect. Reopen the app and try again.' })
   }
-  recoveryRetry = mainWindow.loadURL(intendedAppUrl)
+  recoveryRetry = home.loadURL(intendedAppUrl)
     .then(() => ({ ok: true }))
     .catch(() => ({ ok: false, error: 'Still unable to connect. Check your connection and try again.' }))
     .finally(() => { recoveryRetry = null })
@@ -937,76 +957,34 @@ ipcMain.handle('retry-app-load', (event) => {
   return retryMainWindow()
 })
 
-function createWindow({ showOnReady = true, initialUrl = null } = {}) {
-  const bounds = visibleBounds(config.getWindowBounds(), screen.getAllDisplays().map((display) => display.workArea), screen.getPrimaryDisplay().workArea)
-
-  mainWindow = new BrowserWindow({
-    width: bounds.width,
-    height: bounds.height,
-    x: bounds.x,
-    y: bounds.y,
-    autoHideMenuBar: true,
-    icon: WINDOW_ICON_PATH,
-    backgroundColor: '#0a0a0f',
-    show: false,
-    webPreferences: {
-      preload: PRELOAD_PATH,
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-    },
-  })
-
-  mainWindow.once('ready-to-show', () => {
-    if (showOnReady && !recoveryWindow) mainWindow.show()
-  })
-
-  windowSecurity.register(mainWindow.webContents, 'main', undefined, mainWindow)
-  mainWindow.webContents.on('did-start-navigation', (_event, url, inPlace, isMainFrame) => {
+// Home's page keeps the single-window duties it had before tabs existed.
+function attachHome(contents, target) {
+  contents.on('did-start-navigation', (_event, url, inPlace, isMainFrame) => {
     if (isMainFrame && !inPlace) {
       navigatingMain = true
       if (approvedAppUrl(url)) intendedAppUrl = url
       navigationQueue.reset()
     }
   })
-  mainWindow.webContents.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame) => {
+  contents.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame) => {
     if (isMainFrame) navigatingMain = false
   })
-  mainWindow.webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+  contents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
     if (isMainFrame) {
       if (approvedAppUrl(url)) intendedAppUrl = url
       routePendingPayloads()
     }
   })
-  mainWindow.webContents.on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
+  contents.on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
     if (!isMainFrame || code === -3 || url !== intendedAppUrl || !approvedAppUrl(url)) return
     navigatingMain = false
     showRecovery()
   })
-  const target = approvedAppUrl(initialUrl) ? initialUrl : navigationQueue.hasPending() ? modeUrl(BASE_URL, config.getMode(), true) : getModeUrl()
-  intendedAppUrl = target
-  mainWindow.loadURL(target).catch(() => {})
-
-  // Save window bounds on move/resize
-  const saveBounds = () => {
-    if (!mainWindow.isMinimized() && !mainWindow.isMaximized()) {
-      config.setWindowBounds(mainWindow.getBounds())
-    }
-  }
-  mainWindow.on('resize', saveBounds)
-  mainWindow.on('move', saveBounds)
-
-  // Hide to tray on close — keep background notifications alive
-  mainWindow.on('close', (event) => {
-    if (!app.isQuitting) {
-      event.preventDefault()
-      mainWindow.hide()
-    }
+  contents.on('render-process-gone', () => {
+    navigatingMain = false
+    showRecovery()
   })
-
-  mainWindow.once('closed', () => { mainWindow = null })
-  mainWindow.webContents.on('did-finish-load', () => {
-    const contents = mainWindow.webContents
+  contents.on('did-finish-load', () => {
     if (!validateSender({ sender: contents, senderFrame: contents.mainFrame })) return
     if (recoveryWindow) {
       recoveryWindow.destroy()
@@ -1017,6 +995,108 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
     if (isOnLoginPage()) clearBadge()
     routePendingPayloads()
   })
+  intendedAppUrl = target
+  contents.loadURL(target).catch(() => {})
+}
+
+function createWindow({ showOnReady = true, initialUrl = null } = {}) {
+  const bounds = visibleBounds(config.getWindowBounds(), screen.getAllDisplays().map((display) => display.workArea), screen.getPrimaryDisplay().workArea)
+  let firstHomeUrl = approvedAppUrl(initialUrl) ? initialUrl : navigationQueue.hasPending() ? modeUrl(BASE_URL, config.getMode(), true) : getModeUrl()
+
+  tabWindow = createTabWindow({
+    electron: { BrowserWindow, WebContentsView, dialog },
+    security: windowSecurity,
+    bounds,
+    icon: WINDOW_ICON_PATH,
+    preloadPath: PRELOAD_PATH,
+    shellPreloadPath: SHELL_PRELOAD_PATH,
+    shellUrl: SHELL_URL,
+    theme: config.getTheme(),
+    // + and Ctrl+T open the page Home is showing.
+    newTabUrl: (home) => {
+      const url = home && !home.isDestroyed() ? home.getURL() : ''
+      return approvedAppUrl(url) ? url : getModeUrl()
+    },
+    onTheme: (theme) => config.setTheme(theme),
+    onHome: (contents, lastUrl) => {
+      const target = approvedAppUrl(lastUrl) ? lastUrl : firstHomeUrl || getModeUrl()
+      firstHomeUrl = null
+      attachHome(contents, target)
+    },
+  })
+  const window = tabWindow.window
+  mainWindow = window
+  windowSecurity.setTabHost(tabWindow)
+
+  window.once('ready-to-show', () => {
+    if (showOnReady && !recoveryWindow) window.show()
+  })
+
+  // Save window bounds on move/resize
+  const saveBounds = () => {
+    if (!window.isMinimized() && !window.isMaximized()) {
+      config.setWindowBounds(window.getBounds())
+    }
+  }
+  window.on('resize', saveBounds)
+  window.on('move', saveBounds)
+
+  // Closing hides to the tray and keeps every tab. Quitting closes the tabs
+  // first, Home last, so each unsaved-work prompt can stop the quit.
+  window.on('close', (event) => {
+    if (!app.isQuitting) {
+      event.preventDefault()
+      window.hide()
+      return
+    }
+    if (!tabWindow || !tabWindow.hasOpenTabs()) return
+    event.preventDefault()
+    tabWindow.closeAllForQuit().then((closed) => {
+      if (closed) app.quit()
+      else {
+        updates.cancelQuit()
+        showMainWindow()
+      }
+    })
+  })
+
+  window.once('closed', () => {
+    if (mainWindow === window) {
+      mainWindow = null
+      tabWindow = null
+      windowSecurity.setTabHost(null)
+    }
+  })
+}
+
+// View menu actions act on the selected tab in the main window and on the
+// focused window anywhere else (email pop-outs, viewers).
+function buildAppMenu() {
+  const run = (action, apply) => (_item, window) => {
+    if (window && window === mainWindow && tabWindow) return tabWindow.dispatch(action)
+    const contents = window?.webContents
+    if (contents && !contents.isDestroyed()) apply(contents)
+  }
+  const zoom = (delta) => (contents) => contents.setZoomLevel(delta === 0 ? 0 : contents.getZoomLevel() + delta)
+  return Menu.buildFromTemplate([
+    ...(process.platform === 'darwin' ? [{ role: 'appMenu' }] : []),
+    { role: 'editMenu' },
+    {
+      label: 'View',
+      submenu: [
+        { label: 'Reload', accelerator: 'CmdOrCtrl+R', click: run('reload', (c) => c.reload()) },
+        { label: 'Force Reload', accelerator: 'CmdOrCtrl+Shift+R', click: run('reload-hard', (c) => c.reloadIgnoringCache()) },
+        { label: 'Toggle Developer Tools', accelerator: process.platform === 'darwin' ? 'Alt+Cmd+I' : 'Ctrl+Shift+I', click: run('devtools', (c) => c.toggleDevTools()) },
+        { type: 'separator' },
+        { label: 'Actual Size', accelerator: 'CmdOrCtrl+0', click: run('zoom-reset', zoom(0)) },
+        { label: 'Zoom In', accelerator: 'CmdOrCtrl+=', click: run('zoom-in', zoom(0.5)) },
+        { label: 'Zoom Out', accelerator: 'CmdOrCtrl+-', click: run('zoom-out', zoom(-0.5)) },
+        { type: 'separator' },
+        { role: 'togglefullscreen' },
+      ],
+    },
+    { role: 'windowMenu' },
+  ])
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,7 +1188,10 @@ async function switchMode(mode) {
     // The destination reads Desktop state while mounting, before loadURL resolves.
     config.setMode(mode)
     updateTrayMenu()
-    await mainWindow.loadURL(modeUrl(BASE_URL, mode))
+    const home = homeContents()
+    if (!home) throw new Error('Brinq is not open.')
+    tabWindow.selectHome()
+    await home.loadURL(modeUrl(BASE_URL, mode))
     return { ok: true, state: desktopState() }
   } catch {
     config.setMode(previousMode)
@@ -1160,6 +1243,17 @@ ipcMain.on('email-listener-state', (event, channel, active) => {
   drainPendingPayloads()
 })
 
+// The app preload reports Brinq's theme; only the selected tab's report
+// repaints the header. The strip's own commands are checked in tab-window.
+ipcMain.on('theme-changed', (event, theme) => {
+  if (!validateSender(event)) return
+  tabWindow?.reportTheme(event.sender, theme)
+})
+ipcMain.on('tabs:command', (event, command, id, options) => {
+  tabWindow?.stripCommand(event, command, id, options)
+})
+ipcMain.handle('tabs:state', (event) => tabWindow?.stripState(event) ?? null)
+
 ipcMain.on('set-mode', (event, mode) => {
   if (!validateSender(event)) return
   if (isMode(mode)) {
@@ -1208,6 +1302,7 @@ app.on('ready', async () => {
   } catch (err) {
     console.warn('Could not clean attachment temp directory:', err)
   }
+  Menu.setApplicationMenu(buildAppMenu())
   createWindow({ showOnReady: !launchedForFileViewerOnly })
   createTray()
 

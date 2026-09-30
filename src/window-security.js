@@ -168,7 +168,7 @@ function createWindowSecurity({ baseUrl, preloadPath, openExternal }) {
   }
 
   return {
-    register, validateSender, validateViewerSender, captureSender, appContents,
+    register, validateSender, validateViewerSender, captureSender, appContents, isAppUrl,
     setTabHost(host) { tabHost = host },
   }
 }

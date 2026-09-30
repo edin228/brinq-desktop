@@ -33,8 +33,15 @@ function createTabList() {
       const opener = ids.indexOf(afterId)
       if (opener === -1) ids.push(id)
       else {
+        // Skip past earlier tabs opened from the same page and their children.
+        const descends = (tab) => {
+          for (let parent = openedFrom.get(tab); parent !== undefined; parent = openedFrom.get(parent)) {
+            if (parent === afterId) return true
+          }
+          return false
+        }
         let index = opener + 1
-        while (index < ids.length && openedFrom.get(ids[index]) === afterId) index++
+        while (index < ids.length && descends(ids[index])) index++
         ids.splice(index, 0, id)
       }
       if (afterId !== null) openedFrom.set(id, afterId)

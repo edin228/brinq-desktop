@@ -74,6 +74,7 @@ test('destination sees selected Desktop mode during load, with rollback on failu
   const trayModes = []
   const destinationModes = []
   const targets = []
+  let homeSelections = 0
   const context = {
     isMode: require('../src/window-state').isMode,
     modeUrl,
@@ -81,11 +82,13 @@ test('destination sees selected Desktop mode during load, with rollback on failu
     config: { getMode: () => mode, setMode: (value) => { mode = value } },
     app: { getVersion: () => '1.2.5' },
     updateTrayMenu: () => { trayModes.push(mode) },
-    mainWindow: { loadURL: (url) => {
+    // Mode changes load Home, the main window's permanent base tab, and show it.
+    tabWindow: { selectHome: () => { homeSelections++ } },
+    homeContents: () => ({ loadURL: (url) => {
       targets.push(url)
       destinationModes.push(context.desktopState().mode)
       return new Promise((resolve, reject) => { resolveNavigation = resolve; rejectNavigation = reject })
-    } },
+    } }),
   }
   vm.createContext(context)
   vm.runInContext(transition, context)
@@ -114,4 +117,5 @@ test('destination sees selected Desktop mode during load, with rollback on failu
   assert.deepEqual(destinationModes, ['full', 'full', 'email'])
   resolveNavigation()
   assert.equal((await mailMode).state.mode, 'email')
+  assert.equal(homeSelections, 3)
 })

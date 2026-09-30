@@ -1,0 +1,276 @@
+@font-face {
+  font-family: 'Inter';
+  src: url('../../assets/fonts/inter-latin-wght-normal.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+}
+
+/* Colors follow the approved Paper header (Brinq file, "Desktop · Tab header
+   bar"), which uses the web app's layer, content, edge and brand roles. */
+:root {
+  --layer-0: oklch(21.8% 0 0);
+  --layer-1: oklch(24.4% 0 0);
+  --layer-3: oklch(29.3% 0 0);
+  --selected: var(--layer-3);
+  --hover: var(--layer-1);
+  --content: oklch(94% 0 0);
+  --content-muted: oklch(69% 0 0);
+  --edge-subtle: oklch(100% 0 0 / 6%);
+  --edge-strong: oklch(100% 0 0 / 16%);
+  --brand: oklch(72% 0.17 275);
+  /* Space kept free for the native window buttons. Tests may override it. */
+  --controls-left: env(titlebar-area-x, 0px);
+  --controls-right: calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw));
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  --layer-0: #eeeef2;
+  --layer-1: #f8f8fa;
+  --layer-3: #f1f1f3;
+  --selected: #ffffff;
+  --hover: rgb(13 13 13 / 6%);
+  --content: #0d0d0d;
+  --content-muted: #6b6b6d;
+  --edge-subtle: rgb(0 0 0 / 6%);
+  --edge-strong: rgb(0 0 0 / 16%);
+  --brand: #5d69e1;
+  color-scheme: light;
+}
+
+:root[data-platform='darwin'] {
+  /* macOS draws its window buttons on the left. */
+  --controls-left: 78px;
+  --controls-right: 0px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--layer-0);
+  color: var(--content);
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 12px;
+  line-height: 16px;
+  user-select: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  cursor: default;
+  -webkit-app-region: no-drag;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: -2px;
+}
+
+svg {
+  display: block;
+  flex-shrink: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 40px;
+  padding-left: calc(var(--controls-left) + 12px);
+  padding-right: var(--controls-right);
+  border-bottom: 1px solid var(--edge-subtle);
+  background: var(--layer-0);
+  -webkit-app-region: drag;
+}
+
+/* Keeps Home in the tab list while Refresh sits visually between them. */
+.tablist { display: contents; }
+.home { order: 1; }
+.refresh { order: 2; }
+.divider { order: 3; }
+.tabs { order: 4; }
+.new-tab { order: 5; }
+.drag { order: 6; }
+
+.home, .icon-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  height: 30px;
+  border-radius: 8px;
+  color: var(--content-muted);
+}
+
+/* Home and Refresh sit 2px apart, tighter than the bar's 4px rhythm. */
+.home { width: 36px; margin-right: -2px; }
+.icon-button { width: 30px; }
+.new-tab { width: 28px; height: 28px; }
+
+.home:hover, .icon-button:hover { background: var(--hover); color: var(--content); }
+
+.home[aria-selected='true'] {
+  background: var(--selected);
+  box-shadow: inset 0 0 0 1px var(--edge-strong);
+  color: var(--content);
+}
+
+.refresh[data-loading='true'] { background: var(--hover); color: var(--brand); }
+
+.divider {
+  width: 1px;
+  height: 18px;
+  flex-shrink: 0;
+  background: var(--edge-strong);
+}
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-left: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.tabs::-webkit-scrollbar { display: none; }
+
+/* A browser-width drag area always stays next to the window buttons. */
+.drag {
+  flex: 1 0 48px;
+  align-self: stretch;
+}
+
+.tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  /* A width, not a flex basis, so the tray's own width counts full tabs. */
+  width: 232px;
+  flex: 0 1 auto;
+  /* Below this the icon and close button would collide; the tab tray scrolls. */
+  min-width: 72px;
+  height: 30px;
+  border-radius: 8px;
+  color: var(--content-muted);
+}
+
+.tab:hover { background: var(--hover); color: var(--content); }
+
+.tab.selected {
+  background: var(--selected);
+  box-shadow: inset 0 0 0 1px var(--edge-strong);
+  color: var(--content);
+}
+
+.tab-select {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding-left: 10px;
+  padding-right: 30px;
+  border-radius: 8px;
+  font-weight: 500;
+  text-align: left;
+}
+
+.tab-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab-close {
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  color: var(--content-muted);
+  visibility: hidden;
+}
+
+.tab:hover .tab-close,
+.tab:focus-within .tab-close,
+.tab.selected .tab-close { visibility: visible; }
+
+.tab-close svg { stroke-width: 2.25; }
+
+.tab-close:hover { background: var(--hover); color: var(--content); }
+
+.spinner { animation: spin 0.9s linear infinite; }
+.spinner .track { stroke: var(--edge-strong); stroke-width: 1.75; }
+.spinner .arc { stroke: var(--brand); stroke-width: 1.75; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; }
+}
+
+.panel {
+  position: absolute;
+  inset: 40px 0 0 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--layer-0);
+}
+
+.panel[hidden] { display: none; }
+
+.panel-body { max-width: 420px; padding: 32px; user-select: text; }
+
+.panel-title {
+  margin: 0 0 8px;
+  font-size: 20px;
+  line-height: 28px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.panel-text {
+  margin: 0 0 20px;
+  font-size: 14px;
+  line-height: 20px;
+  color: var(--content-muted);
+}
+
+.retry {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  background: var(--selected);
+  box-shadow: inset 0 0 0 1px var(--edge-strong);
+  color: var(--content);
+}
+
+.retry:hover { background: var(--hover); }
+.retry:disabled { opacity: 0.6; }
