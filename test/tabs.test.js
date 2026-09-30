@@ -1,0 +1,136 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const { HOME_ID, createTabList, tabKind, tabLabel, openAsTab, shortcutAction } = require('../src/tabs')
+
+test('Home is permanent and closing picks the right neighbor, else the left', () => {
+  const tabs = createTabList()
+  assert.equal(tabs.remove(HOME_ID), false)
+  const a = tabs.add()
+  const b = tabs.add()
+  const c = tabs.add()
+  assert.deepEqual(tabs.ids(), [HOME_ID, a, b, c])
+  assert.equal(tabs.selected(), HOME_ID)
+  tabs.select(b)
+  assert.equal(tabs.remove(b), true)
+  assert.equal(tabs.selected(), c)
+  assert.equal(tabs.remove(c), true)
+  assert.equal(tabs.selected(), a)
+  assert.equal(tabs.remove(a), true)
+  assert.equal(tabs.selected(), HOME_ID)
+  assert.equal(tabs.remove(a), false)
+  assert.deepEqual(tabs.ids(), [HOME_ID])
+})
+
+test('closing a background tab keeps the selection and ids are never reused', () => {
+  const tabs = createTabList()
+  const a = tabs.add({ select: true })
+  const b = tabs.add()
+  tabs.remove(b)
+  assert.equal(tabs.selected(), a)
+  assert.equal(tabs.add() > b, true)
+  assert.equal(tabs.select(999), false)
+  assert.equal(tabs.selected(), a)
+})
+
+test('tabs opened from one page stay next to it in click order', () => {
+  const tabs = createTabList()
+  const other = tabs.add()
+  const first = tabs.add({ afterId: HOME_ID })
+  const second = tabs.add({ afterId: HOME_ID })
+  const child = tabs.add({ afterId: first })
+  assert.deepEqual(tabs.ids(), [HOME_ID, first, child, second, other])
+  const standalone = tabs.add({ afterId: null })
+  assert.equal(tabs.ids().at(-1), standalone)
+})
+
+test('next/previous wrap and positions select 1..8 with 9 as last', () => {
+  const tabs = createTabList()
+  const a = tabs.add()
+  const b = tabs.add()
+  assert.equal(tabs.next(), a)
+  assert.equal(tabs.next(), b)
+  assert.equal(tabs.next(), HOME_ID)
+  assert.equal(tabs.previous(), b)
+  assert.equal(tabs.selectPosition(2), true)
+  assert.equal(tabs.selected(), a)
+  assert.equal(tabs.selectPosition(5), false)
+  assert.equal(tabs.selected(), a)
+  assert.equal(tabs.selectPosition(9), true)
+  assert.equal(tabs.selected(), b)
+})
+
+test('labels strip only a boundary brand and fall back by route', () => {
+  const client = 'http://localhost:3004/clients/42'
+  assert.equal(tabLabel('brinq | Law Office of Torres & Brenner', client), 'Law Office of Torres & Brenner')
+  assert.equal(tabLabel('Re: BOP remarket | brinq', 'http://localhost:3004/email/1'), 'Re: BOP remarket')
+  assert.equal(tabLabel('Bots · Brinq', 'http://localhost:3004/bots'), 'Bots')
+  assert.equal(tabLabel('brinq | A | B Holdings', client), 'A | B Holdings')
+  assert.equal(tabLabel('  brinq  |   Spaced   Name ', client), 'Spaced Name')
+  assert.equal(tabLabel('brinq', client), 'Client')
+  assert.equal(tabLabel('', 'http://localhost:3004/emails'), 'Email')
+  assert.equal(tabLabel(undefined, 'http://localhost:3004/dashboard'), 'Brinq')
+  assert.equal(tabLabel('<img src=x onerror=alert(1)>', client), '<img src=x onerror=alert(1)>')
+  assert.equal(tabLabel('Brinqster Holdings', client), 'Brinqster Holdings')
+})
+
+test('route kinds choose the tab icon', () => {
+  assert.equal(tabKind('http://localhost:3004/clients/42?view=policies'), 'client')
+  assert.equal(tabKind('http://localhost:3004/clients'), 'client')
+  assert.equal(tabKind('http://localhost:3004/clientsx'), 'page')
+  assert.equal(tabKind('http://localhost:3004/email/1'), 'email')
+  assert.equal(tabKind('http://localhost:3004/emails?standalone=email'), 'email')
+  assert.equal(tabKind('not a url'), 'page')
+})
+
+test('only plain tab dispositions become tabs', () => {
+  assert.equal(openAsTab({ disposition: 'background-tab' }), true)
+  assert.equal(openAsTab({ disposition: 'foreground-tab', frameName: '_blank', features: 'noopener,noreferrer' }), true)
+  assert.equal(openAsTab({ disposition: 'foreground-tab', features: 'noopener=1' }), true)
+  for (const details of [
+    { disposition: 'new-window' }, { disposition: 'default' }, { disposition: 'other' },
+    { disposition: 'foreground-tab', frameName: 'email-1' },
+    { disposition: 'foreground-tab', features: 'width=1100,height=700' },
+    { disposition: 'background-tab', features: 'popup' },
+    { disposition: 'background-tab', postBody: { data: [] } },
+  ]) assert.equal(openAsTab(details), false, JSON.stringify(details))
+})
+
+const key = (key, extra = {}) => ({ type: 'keyDown', key, code: '', ...extra })
+
+test('shortcuts use Ctrl on Windows and Linux, Cmd on macOS', () => {
+  const ctrl = (value, extra) => shortcutAction(key(value, { control: true, ...extra }), 'win32')
+  assert.equal(ctrl('t'), 'new')
+  assert.equal(ctrl('T'), 'new')
+  assert.equal(ctrl('w'), 'close')
+  assert.equal(ctrl('Tab', { code: 'Tab' }), 'next')
+  assert.equal(ctrl('Tab', { code: 'Tab', shift: true }), 'previous')
+  assert.equal(ctrl('PageDown'), 'next')
+  assert.equal(ctrl('PageUp'), 'previous')
+  assert.equal(ctrl('1', { code: 'Digit1' }), 'select-1')
+  assert.equal(ctrl('9', { code: 'Digit9' }), 'select-9')
+  assert.equal(ctrl('r'), 'reload')
+  assert.equal(ctrl('R', { shift: true }), 'reload-hard')
+  assert.equal(ctrl('I', { shift: true }), 'devtools')
+  assert.equal(ctrl('='), 'zoom-in')
+  assert.equal(ctrl('+', { shift: true }), 'zoom-in')
+  assert.equal(ctrl('-'), 'zoom-out')
+  assert.equal(ctrl('0'), 'zoom-reset')
+  assert.equal(shortcutAction(key('F5'), 'win32'), 'reload')
+  assert.equal(shortcutAction(key('F5', { shift: true }), 'win32'), 'reload-hard')
+  assert.equal(shortcutAction(key('F12'), 'win32'), 'devtools')
+  assert.equal(shortcutAction(key('t', { meta: true }), 'darwin'), 'new')
+  assert.equal(shortcutAction(key('t', { control: true }), 'darwin'), null)
+  assert.equal(shortcutAction(key('t', { meta: true }), 'win32'), null)
+})
+
+test('shortcuts ignore key up, composition, AltGr, plain keys and new/close repeats', () => {
+  assert.equal(shortcutAction({ ...key('t', { control: true }), type: 'keyUp' }, 'win32'), null)
+  assert.equal(shortcutAction(key('t', { control: true, isComposing: true }), 'win32'), null)
+  assert.equal(shortcutAction(key('t', { control: true, alt: true }), 'win32'), null)
+  assert.equal(shortcutAction(key('t'), 'win32'), null)
+  assert.equal(shortcutAction(key('c', { control: true }), 'win32'), null)
+  assert.equal(shortcutAction(key('t', { control: true, isAutoRepeat: true }), 'win32'), null)
+  assert.equal(shortcutAction(key('w', { control: true, isAutoRepeat: true }), 'win32'), null)
+  assert.equal(shortcutAction(key('Tab', { control: true, code: 'Tab', isAutoRepeat: true }), 'win32'), 'next')
+  assert.equal(shortcutAction(null, 'win32'), null)
+})

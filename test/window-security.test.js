@@ -18,11 +18,11 @@ function fixture(role = 'main', url = 'http://localhost:3004/emails') {
       setWindowOpenHandler(fn) { this.popup = fn },
     })
     const window = new EventEmitter()
-    Object.assign(window, { webContents: wc, isDestroyed: () => false })
+    Object.assign(window, { webContents: wc, destroyed: false, isDestroyed() { return this.destroyed } })
     return window
   }
   const window = windowAt()
-  policy.register(window, role, url)
+  policy.register(window.webContents, role, url, window)
   const wc = window.webContents
   return { policy, window, wc, event: { sender: wc, senderFrame: wc.mainFrame }, external, session, windowAt }
 }
@@ -139,4 +139,106 @@ test('only unpackaged development accepts a loopback origin override', () => {
   }
   assert.equal(resolveBaseUrl({ isPackaged: true, env: { NODE_ENV: 'development', BRINQ_DEV_URL: 'http://localhost:3004' } }), 'https://brinq.io')
   assert.equal(resolveBaseUrl({ isPackaged: false, env: {} }), 'https://brinq.io')
+})
+
+function tabHost(available = true) {
+  const calls = []
+  const contents = { id: 'tab' }
+  return { calls, contents, available: () => available, openTab(args) { calls.push(args); return contents } }
+}
+
+test('ordinary app link and _blank opens become tabs through the tab host', () => {
+  for (const role of ['main', 'app']) {
+    const f = fixture(role)
+    const host = tabHost()
+    f.policy.setTabHost(host)
+    const url = 'http://localhost:3004/clients/42?view=policies'
+    for (const [disposition, background, extra] of [
+      ['background-tab', true, {}],
+      ['foreground-tab', false, {}],
+      ['foreground-tab', false, { frameName: '_blank', features: 'noopener,noreferrer' }],
+    ]) {
+      const referrer = { url: f.wc.getURL(), policy: 'default' }
+      const result = f.wc.popup({ url, disposition, referrer, frameName: '', features: '', ...extra })
+      assert.equal(result.action, 'allow')
+      assert.equal(result.outlivesOpener, true)
+      assert.equal(result.overrideBrowserWindowOptions.webPreferences.sandbox, true)
+      assert.equal(result.overrideBrowserWindowOptions.webPreferences.preload, '/preload.js')
+      const options = { webPreferences: { openerSandboxFlags: 8 } }
+      assert.equal(result.createWindow(options), host.contents)
+      const call = host.calls.at(-1)
+      assert.equal(call.opener, f.wc)
+      assert.equal(call.url, url)
+      assert.equal(call.background, background)
+      assert.equal(call.options, options)
+      assert.equal(call.referrer, referrer)
+    }
+  }
+})
+
+test('pop-outs, posts, other dispositions and non-app openers keep windows', () => {
+  const url = 'http://localhost:3004/email/1'
+  const windowCases = [
+    { disposition: 'new-window' }, { disposition: 'default' }, { disposition: 'other' },
+    { disposition: 'foreground-tab', frameName: 'email-1' },
+    { disposition: 'foreground-tab', features: 'width=1100,height=700' },
+    { disposition: 'foreground-tab', features: 'popup' },
+    { disposition: 'background-tab', postBody: { data: [] } },
+  ]
+  const f = fixture()
+  const host = tabHost()
+  f.policy.setTabHost(host)
+  for (const details of windowCases) {
+    const result = f.wc.popup({ url, frameName: '', features: '', ...details })
+    assert.equal(result.action, 'allow', JSON.stringify(details))
+    assert.equal(result.createWindow, undefined, JSON.stringify(details))
+    assert.equal(result.overrideBrowserWindowOptions.width, 1100)
+  }
+  const unavailable = fixture()
+  unavailable.policy.setTabHost(tabHost(false))
+  assert.equal(unavailable.wc.popup({ url, disposition: 'background-tab' }).createWindow, undefined)
+  assert.equal(fixture().wc.popup({ url, disposition: 'background-tab' }).createWindow, undefined)
+  const viewer = fixture('viewer', 'http://localhost:3004/email/file-viewer?viewerId=one')
+  viewer.policy.setTabHost(host)
+  assert.equal(viewer.wc.popup({ url, disposition: 'background-tab' }).createWindow, undefined)
+  for (const target of ['about:blank', 'blob:http://localhost:3004/id', 'https://example.com']) {
+    assert.equal(f.wc.popup({ url: target, disposition: 'background-tab' }).createWindow, undefined)
+  }
+  assert.deepEqual(f.external, ['https://example.com'])
+  assert.equal(host.calls.length, 0)
+})
+
+test('pages sharing one owner lose authority with it and add one close listener', () => {
+  const f = fixture()
+  const pages = Array.from({ length: 15 }, (_, index) => {
+    const page = f.windowAt(`http://localhost:3004/clients/${index}`).webContents
+    f.policy.register(page, 'app', undefined, f.window)
+    return page
+  })
+  assert.equal(f.window.listenerCount('closed'), 1)
+  const valid = (wc) => f.policy.validateSender({ sender: wc, senderFrame: wc.mainFrame })
+  assert.equal(pages.every(valid), true)
+  f.window.destroyed = true
+  assert.equal(pages.some(valid), false)
+  f.window.destroyed = false
+  f.window.emit('closed')
+  assert.equal(pages.some(valid), false)
+  assert.deepEqual(f.policy.appContents(), [])
+})
+
+test('app page enumeration covers tabs and app windows, never viewers or presentations', () => {
+  const f = fixture()
+  const tab = f.windowAt('http://localhost:3004/clients/1').webContents
+  f.policy.register(tab, 'app', undefined, f.window)
+  const popout = f.windowAt('http://localhost:3004/email/1')
+  f.policy.register(popout.webContents, 'app', undefined, popout)
+  const viewer = f.windowAt('http://localhost:3004/email/file-viewer?viewerId=one')
+  f.policy.register(viewer.webContents, 'viewer', viewer.webContents.getURL(), viewer)
+  const print = f.windowAt('about:blank')
+  f.policy.register(print.webContents, 'presentation', undefined, print)
+  assert.deepEqual(f.policy.appContents(), [f.wc, tab, popout.webContents])
+  tab.emit('did-start-navigation', {}, tab.getURL(), false, true)
+  assert.deepEqual(f.policy.appContents(), [f.wc, popout.webContents])
+  popout.webContents.emit('destroyed')
+  assert.deepEqual(f.policy.appContents(), [f.wc])
 })

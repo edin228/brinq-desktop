@@ -34,7 +34,7 @@ async function fixture(t, overrides = {}) {
     })
     const window = new EventEmitter()
     Object.assign(window, { webContents: sender, isDestroyed: () => false })
-    security.register(window, 'main')
+    security.register(sender, 'main', undefined, window)
     return { sender, senderFrame: frame }
   }
   const event = addWindow()

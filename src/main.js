@@ -664,7 +664,7 @@ async function openEmailFile(filePath, { showError = true, stillAuthorized = () 
 
     const viewerUrl = `${BASE_URL}/email/file-viewer?viewerId=${viewerId}`
 
-    windowSecurity.register(viewer, 'viewer', viewerUrl)
+    windowSecurity.register(viewer.webContents, 'viewer', viewerUrl, viewer)
 
     try {
       await viewer.loadURL(viewerUrl)
@@ -961,7 +961,7 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
     if (showOnReady && !recoveryWindow) mainWindow.show()
   })
 
-  windowSecurity.register(mainWindow, 'main')
+  windowSecurity.register(mainWindow.webContents, 'main', undefined, mainWindow)
   mainWindow.webContents.on('did-start-navigation', (_event, url, inPlace, isMainFrame) => {
     if (isMainFrame && !inPlace) {
       navigatingMain = true
