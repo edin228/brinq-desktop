@@ -72,10 +72,16 @@ const ROUTES = {
   '/framed': page('frame', '<a id="framed-link" href="/clients/3" style="position:fixed;inset:0;margin:0">Framed link</a>'),
   // Link labels: the target pages start with a brand-only title and name
   // themselves later, like a client page loading its data.
+  // The page times how long each Ctrl+click is held up: its window capture
+  // listener runs before the preload's document capture listener (which waits
+  // for the synchronous reply), its bubble listener after.
   '/labels': page('brinq | Labels', `
     <a id="labeled" data-tab-label="Acme Holdings" href="/slow-client">Acme <span>SERVICE_CENTER</span></a>
     <a id="plain" href="/slow-other">Blue Ridge   Bakery</a>
     <a id="search" data-tab-label="Northwind Dental" href="/slow-search">Northwind search row</a>`, `
+    window.blocked = []
+    window.addEventListener('click', (event) => { if (event.ctrlKey) window.clickStart = performance.now() }, true)
+    document.addEventListener('click', (event) => { if (event.ctrlKey) window.blocked.push(performance.now() - window.clickStart) })
     document.getElementById('search').addEventListener('keydown', (event) => {
       if (event.key === 'Enter' && event.ctrlKey) {
         event.preventDefault()
@@ -311,6 +317,9 @@ async function main() {
     check('the page title replaces the link name when it arrives',
       await until(async () => (await stripState()).labels.includes('Acme Holdings, LLC'), 5000) &&
       !(await stripState()).labels.includes('Acme Holdings'))
+    const blocked = await tabs.home.executeJavaScript('window.blocked')
+    check('the synchronous label holds a click up only briefly', blocked.length === 1 && blocked[0] < 50,
+      `click held for ${blocked.map((ms) => ms.toFixed(1)).join(', ')} ms (sendSync round trip plus listeners)`)
     await click(tabs.home, '#plain', [], 'middle')
     check('a link without a label falls back to its text',
       await until(async () => (await stripState()).labels.includes('Blue Ridge Bakery'), 1000))

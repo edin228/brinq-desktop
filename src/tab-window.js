@@ -332,10 +332,13 @@ function createTabWindow({
     if (!text) return false
     const opener = event.sender
     watchOpener(opener)
-    linkLabels.set(opener, {
+    const slot = {
       href: canonicalUrl(href), label: text, at: now(),
       stillAuthorized: security.captureSender(event),
-    })
+    }
+    linkLabels.set(opener, slot)
+    // A gesture that opened nothing leaves no label behind.
+    setTimer(() => { if (linkLabels.get(opener) === slot) linkLabels.delete(opener) }, LINK_LABEL_MS)
     return true
   }
 
