@@ -39,6 +39,7 @@ window.brinqTabs = {
   onState(callback) { callback(state); return () => {} },
   select: (id, focus) => calls.push(['select', id, focus]),
   close: (id) => calls.push(['close', id]),
+  move: (id, position) => calls.push(['move', id, position]),
   retry: (id) => calls.push(['retry', id]),
   newTab: () => calls.push(['new']),
   home: (focus) => calls.push(['home', focus]),

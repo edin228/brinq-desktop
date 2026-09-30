@@ -64,8 +64,13 @@ function createTab(tab) {
   wrapper.addEventListener('auxclick', (event) => {
     if (event.button === 1) { event.preventDefault(); bridge.close(tab.id) }
   })
-  select.addEventListener('click', () => bridge.select(tab.id, true))
-  const element = { wrapper, select, icon, label, close, iconKey: null }
+  select.addEventListener('click', () => {
+    // The click that ends a drag only drops the tab.
+    if (element.justDragged) { element.justDragged = false; return }
+    bridge.select(tab.id, true)
+  })
+  wrapper.addEventListener('pointerdown', (event) => startDrag(event, tab.id))
+  const element = { wrapper, select, icon, label, close, iconKey: null, justDragged: false }
   tabElements.set(tab.id, element)
   return element
 }
@@ -146,6 +151,72 @@ function render(next) {
     retryButton.dataset.id = String(selected.id)
   }
 }
+
+// Dragging a tab reorders it: the others slide aside and the tab drops into
+// the gap. A press that barely moves stays an ordinary click.
+const DRAG_THRESHOLD = 5
+const TAB_GAP = 2
+let drag = null
+
+function startDrag(event, id) {
+  if (event.button !== 0 || event.target.closest('.tab-close') || drag) return
+  const element = tabElements.get(id)
+  const order = [...tabsElement.children]
+  drag = {
+    id, element, order, pointerId: event.pointerId, startX: event.clientX, moved: false,
+    from: order.indexOf(element.wrapper), to: order.indexOf(element.wrapper),
+    step: element.wrapper.getBoundingClientRect().width + TAB_GAP,
+  }
+  // Capture keeps the drag when the pointer leaves the tab; a pointer the
+  // browser does not track (synthetic input) simply goes without it.
+  try { element.wrapper.setPointerCapture(event.pointerId) } catch {}
+}
+
+function moveDrag(event) {
+  if (!drag || event.pointerId !== drag.pointerId) return
+  const dx = event.clientX - drag.startX
+  if (!drag.moved && Math.abs(dx) < DRAG_THRESHOLD) return
+  if (!drag.moved) {
+    drag.moved = true
+    tabsElement.classList.add('reordering')
+    drag.element.wrapper.classList.add('dragging')
+  }
+  // Keep the tab inside the tray.
+  const minDx = -drag.from * drag.step
+  const maxDx = (drag.order.length - 1 - drag.from) * drag.step
+  const offset = Math.min(Math.max(dx, minDx), maxDx)
+  drag.element.wrapper.style.transform = `translateX(${offset}px)`
+  drag.to = Math.min(Math.max(Math.round(drag.from + offset / drag.step), 0), drag.order.length - 1)
+  drag.order.forEach((wrapper, index) => {
+    if (wrapper === drag.element.wrapper) return
+    const shift = drag.from < index && index <= drag.to ? -drag.step
+      : drag.to <= index && index < drag.from ? drag.step : 0
+    wrapper.style.transform = shift ? `translateX(${shift}px)` : ''
+  })
+}
+
+function endDrag(event, cancelled = false) {
+  if (!drag || event.pointerId !== drag.pointerId) return
+  const { element, order, from, to, moved, id } = drag
+  drag = null
+  for (const wrapper of order) wrapper.style.transform = ''
+  tabsElement.classList.remove('reordering')
+  element.wrapper.classList.remove('dragging')
+  if (!moved) return
+  element.justDragged = true
+  // A pointer that never produces a click must not swallow the next one.
+  setTimeout(() => { element.justDragged = false })
+  if (cancelled || from === to) return
+  // Show the new order at once; main confirms it with the next state.
+  const reference = to > from ? order[to].nextSibling : order[to]
+  tabsElement.insertBefore(element.wrapper, reference)
+  // Positions count Home as 0.
+  bridge.move(id, to + 1)
+}
+
+tabsElement.addEventListener('pointermove', moveDrag)
+tabsElement.addEventListener('pointerup', (event) => endDrag(event))
+tabsElement.addEventListener('pointercancel', (event) => endDrag(event, true))
 
 homeButton.addEventListener('click', () => bridge.home(true))
 refreshButton.addEventListener('click', () => bridge.reload())

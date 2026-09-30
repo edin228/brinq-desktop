@@ -14,6 +14,7 @@ if (process.isMainFrame && location.protocol === 'file:') {
     },
     select: (id, focus) => command('select', id, { focus: focus === true }),
     close: (id) => command('close', id),
+    move: (id, position) => command('move', id, { position }),
     retry: (id) => command('retry', id),
     newTab: () => command('new'),
     home: (focus) => command('home', undefined, { focus: focus === true }),

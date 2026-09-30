@@ -57,6 +57,17 @@ function createTabList() {
       if (selected === id) selected = ids[Math.min(index, ids.length - 1)]
       return true
     },
+    // Places a tab at a list position (Home stays first). A moved tab no
+    // longer belongs to its opener's run of tabs.
+    move(id, position) {
+      if (id === HOME_ID || !has(id) || !Number.isSafeInteger(position)) return false
+      const without = ids.filter((value) => value !== id)
+      const index = Math.min(Math.max(position, 1), without.length)
+      if (ids.indexOf(id) === index) return false
+      ids = [...without.slice(0, index), id, ...without.slice(index)]
+      openedFrom.delete(id)
+      return true
+    },
     next: () => step(1),
     previous: () => step(-1),
     // Ctrl+1..8 pick by position; Ctrl+9 always picks the last tab.
@@ -123,8 +134,8 @@ function shortcutAction(input, platform = process.platform) {
   }
   const lower = key.toLowerCase()
   if (code === 'Tab' || key === 'Tab') return shift ? 'previous' : 'next'
-  if (key === 'PageDown' && !shift) return 'next'
-  if (key === 'PageUp' && !shift) return 'previous'
+  if (key === 'PageDown') return shift ? 'move-right' : 'next'
+  if (key === 'PageUp') return shift ? 'move-left' : 'previous'
   if (lower === 't' && !shift) return once('new')
   if (lower === 'w' && !shift) return once('close')
   if (lower === 'r') return shift ? 'reload-hard' : 'reload'

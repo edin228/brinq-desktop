@@ -147,6 +147,11 @@ function createTabWindow({
     const entry = entryFor(contents) || selectedEntry()
     if (action === 'new') return newTab()
     if (action === 'close') return entry && closeTab(entry.id)
+    if (action === 'move-left' || action === 'move-right') {
+      const id = list.selected()
+      const position = list.ids().indexOf(id) + (action === 'move-left' ? -1 : 1)
+      return moveTab(id, position)
+    }
     if (action === 'next') return select(list.next())
     if (action === 'previous') return select(list.previous())
     if (action.startsWith('select-')) {
@@ -326,6 +331,13 @@ function createTabWindow({
     return true
   }
 
+  // Reorders a tab; Home keeps the first position.
+  function moveTab(id, position) {
+    if (!list.move(id, position)) return false
+    push()
+    return true
+  }
+
   function closeAndWait(entry) {
     return new Promise((resolve) => {
       entry.settle = (closed) => { entry.settle = null; resolve(closed) }
@@ -377,6 +389,7 @@ function createTabWindow({
     if (command === 'select') return select(id, { focus: options?.focus === true })
     if (command === 'close') return closeTab(id, { focus: false })
     if (command === 'retry') return retry(id), true
+    if (command === 'move') return Number.isSafeInteger(options?.position) && moveTab(id, options.position)
     return false
   }
 

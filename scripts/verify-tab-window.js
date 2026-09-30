@@ -193,6 +193,24 @@ async function main() {
     check('window.open _blank opens a selected tab', await until(async () => (await stripState()).selected === '/clients/2'))
     tabs.selectHome()
 
+    if (process.env.XDOTOOL) {
+      // Real pointer drag in the strip: first tab to the end.
+      const stripOrder = () => host.webContents.executeJavaScript(`[...document.querySelectorAll('.tab-select')].map((node) => node.id)`)
+      const before = await stripOrder()
+      const boxes = await host.webContents.executeJavaScript(`[...document.querySelectorAll('.tab')].map((node) => { const box = node.getBoundingClientRect(); return [Math.round(box.x + 40), Math.round(box.y + box.height / 2)] })`)
+      const content = host.getContentBounds()
+      const [fromX, y] = boxes[0]
+      const toX = boxes[boxes.length - 1][0] + 60
+      const xdo = (...args) => require('child_process').execFileSync(process.env.XDOTOOL, args.map(String))
+      xdo('mousemove', content.x + fromX, content.y + y, 'mousedown', '1')
+      for (let x = fromX; x <= toX; x += 20) { xdo('mousemove', content.x + x, content.y + y); await wait(15) }
+      xdo('mouseup', '1')
+      const expected = [...before.slice(1), before[0]]
+      check('dragging a tab reorders it', await until(async () => JSON.stringify(await stripOrder()) === JSON.stringify(expected)),
+        JSON.stringify(await stripOrder()))
+      check('dropping a dragged tab does not select it', (await stripState()).selected === 'home')
+    } else console.log('SKIP tab drag: set XDOTOOL to a real input tool')
+
     const windowsBefore = BrowserWindow.getAllWindows().length
     await click(tabs.home, '#popout')
     check('named, sized email pop-out stays a window', await until(() => BrowserWindow.getAllWindows().length === windowsBefore + 1))

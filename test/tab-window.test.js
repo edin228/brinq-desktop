@@ -550,3 +550,36 @@ test('closing from the strip keeps keyboard focus in the strip', () => {
   f.flush()
   assert.equal(f.tabs.home.focused > 0, true, 'a shortcut close focuses the next page')
 })
+
+test('tabs move by drag command or Ctrl+Shift+PageUp/PageDown; Home never moves', () => {
+  const f = fixture()
+  const label = (contents, title) => { contents.emit('page-title-updated', {}, title); f.flush() }
+  label(f.open(`${BASE}/clients/1`), 'A')
+  label(f.open(`${BASE}/clients/2`), 'B')
+  label(f.open(`${BASE}/clients/3`), 'C')
+  const labels = () => f.state().tabs.slice(1).map((tab) => tab.label)
+  const idOf = (name) => f.state().tabs.find((tab) => tab.label === name).id
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'move', idOf('C'), { position: 1 }), true)
+  f.flush()
+  assert.deepEqual(labels(), ['C', 'A', 'B'])
+  for (const bad of [{ position: '1' }, { position: 1.5 }, {}, null]) {
+    assert.equal(f.tabs.stripCommand(f.stripEvent(), 'move', idOf('A'), bad), false)
+  }
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'move', 1, { position: 3 }), false, 'Home stays first')
+  assert.equal(f.tabs.stripCommand(f.stripEvent({ sender: f.tabs.home }), 'move', idOf('A'), { position: 3 }), false)
+  f.tabs.select(idOf('C'))
+  f.flush()
+  const press = (key) => f.strip.emit('before-input-event', { preventDefault() {} }, { type: 'keyDown', key, code: '', control: true, shift: true })
+  press('PageDown')
+  f.flush()
+  assert.deepEqual(labels(), ['A', 'C', 'B'])
+  press('PageUp')
+  press('PageUp')
+  f.flush()
+  assert.deepEqual(labels(), ['C', 'A', 'B'], 'a tab cannot move before Home')
+  assert.equal(f.state().selectedId, idOf('C'), 'moving keeps the selection')
+  f.tabs.selectHome()
+  press('PageDown')
+  f.flush()
+  assert.equal(f.state().tabs[0].home, true, 'Home does not move')
+})
