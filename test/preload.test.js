@@ -58,7 +58,7 @@ function fakePage({ rootReady = true, classes = [] } = {}) {
   return page
 }
 
-function load(protocol = 'http:', isMainFrame = true, page = fakePage()) {
+function load(protocol = 'http:', isMainFrame = true, page = fakePage(), platform = 'linux') {
   let api
   const ipc = new EventEmitter()
   const calls = []
@@ -67,7 +67,7 @@ function load(protocol = 'http:', isMainFrame = true, page = fakePage()) {
   ipc.sendSync = (...args) => { calls.push(['sync', ...args]); return true }
   vm.runInNewContext(source, {
     require: () => ({ contextBridge: { exposeInMainWorld(name, value) { assert.equal(name, 'electronAPI'); api = value } }, ipcRenderer: ipc }),
-    process: { isMainFrame }, location: { protocol, origin: 'https://brinq.io' },
+    process: { isMainFrame, platform }, location: { protocol, origin: 'https://brinq.io' },
     document: page.document, window: page.window, MutationObserver: page.MutationObserver,
     Element: page.Element, HTMLAnchorElement: page.HTMLAnchorElement,
   })
@@ -94,6 +94,21 @@ test('preload exposes fixed file and legacy methods and strips IPC events', asyn
     assert.deepEqual(received, [['payload']])
     assert.equal(ipc.listenerCount(channel), 0)
   }
+})
+
+test('browser sign-in methods exist only on Windows and only invoke their fixed channels', async () => {
+  const methods = ['startBrowserSignIn', 'cancelBrowserSignIn', 'takeBrowserSignIn']
+  for (const platform of ['darwin', 'linux']) {
+    const { api } = load('https:', true, fakePage(), platform)
+    for (const method of methods) assert.equal(api[method], undefined, `${platform} ${method}`)
+  }
+  const { api, calls } = load('https:', true, fakePage(), 'win32')
+  await api.startBrowserSignIn('https://evil.test')
+  await api.cancelBrowserSignIn('ignored')
+  await api.takeBrowserSignIn('ignored')
+  assert.deepEqual(calls.slice(-3), [['browser-sign-in-start'], ['browser-sign-in-cancel'], ['browser-sign-in-take']])
+  for (const protocol of ['about:', 'blob:']) assert.equal(load(protocol, true, fakePage(), 'win32').api, undefined)
+  assert.equal(load('https:', false, fakePage(), 'win32').api, undefined)
 })
 
 test('inherited print preload, opaque documents and subframes expose no bridge', () => {

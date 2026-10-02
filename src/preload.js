@@ -76,6 +76,13 @@ if (process.isMainFrame && ['http:', 'https:'].includes(location.protocol)) {
         attachmentId,
         filename,
       ),
+
+    // Windows only; the page shows browser sign-in when all three exist.
+    ...(process.platform === 'win32' ? {
+      startBrowserSignIn: () => ipcRenderer.invoke('browser-sign-in-start'),
+      cancelBrowserSignIn: () => ipcRenderer.invoke('browser-sign-in-cancel'),
+      takeBrowserSignIn: () => ipcRenderer.invoke('browser-sign-in-take'),
+    } : {}),
   })
 
   // Report Brinq's light/dark theme so the desktop header can match it.

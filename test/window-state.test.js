@@ -32,6 +32,26 @@ test('malformed protocols fail safely and Brinq activation never selects a suppl
   assert.deepEqual(parseProtocolUrl('brinq://https://example.com/private'), { type: 'activate' })
   assert.deepEqual(parseProtocolUrl('mailto:a%40example.com,b@example.com?subject=Hello&body=Line%201%0ALine%202&cc=c@example.com'), { type: 'mailto', data: { to: ['a@example.com', 'b@example.com'], subject: 'Hello', body: 'Line 1\nLine 2', cc: ['c@example.com'] } })
 })
+test('only an exact browser sign-in callback carries its code and state', () => {
+  const code = 'c'.repeat(43)
+  const state = 's'.repeat(43)
+  const callback = { type: 'browser-sign-in', data: { code, state } }
+  assert.deepEqual(parseProtocolUrl(`brinq://sign-in?code=${code}&state=${state}`), callback)
+  // Some browsers add a slash after the host of a custom scheme.
+  assert.deepEqual(parseProtocolUrl(`brinq://sign-in/?state=${state}&code=${code}`), callback)
+  for (const value of [
+    `brinq://sign-in?code=${code}`,
+    `brinq://sign-in?code=${code}&state=${state}&next=https://evil.test`,
+    `brinq://sign-in?code=${code}&code=${code}&state=${state}`,
+    `brinq://sign-in?code=${code.slice(1)}&state=${state}`,
+    `brinq://sign-in?code=${code}!&state=${state}`,
+    `brinq://sign-in/extra?code=${code}&state=${state}`,
+    `brinq://sign-in:8080?code=${code}&state=${state}`,
+    `brinq://user:pass@sign-in?code=${code}&state=${state}`,
+    `brinq://sign-in?code=${code}&state=${state}#x`,
+    `brinq://other?code=${code}&state=${state}`,
+  ]) assert.deepEqual(parseProtocolUrl(value), { type: 'activate' }, value)
+})
 test('pending actions wait for their channel and current document, survive reload/login, and drain once', () => {
   const queue = createNavigationQueue()
   const first = {}; const reloaded = {}; const sent = []

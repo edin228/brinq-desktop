@@ -28,10 +28,26 @@ function visibleBounds(saved, workAreas, primaryArea = workAreas[0]) {
   }
 }
 
+const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/
+
+// brinq://sign-in?code=…&state=… is the browser sign-in callback. Anything
+// unexpected (extra keys, duplicates, credentials, a port, a fragment or a
+// path) is not a callback, so it can never carry data into the app.
+function browserSignInCallback(url) {
+  if (url.hostname !== 'sign-in' || !['', '/'].includes(url.pathname) || url.port ||
+    url.username || url.password || url.hash) return null
+  const keys = [...url.searchParams.keys()].sort()
+  if (keys.length !== 2 || keys[0] !== 'code' || keys[1] !== 'state') return null
+  const code = url.searchParams.get('code')
+  const state = url.searchParams.get('state')
+  if (!CALLBACK_TOKEN.test(code) || !CALLBACK_TOKEN.test(state)) return null
+  return { type: 'browser-sign-in', data: { code, state } }
+}
+
 function parseProtocolUrl(value) {
   try {
     const url = new URL(value)
-    if (url.protocol === 'brinq:') return { type: 'activate' }
+    if (url.protocol === 'brinq:') return browserSignInCallback(url) || { type: 'activate' }
     if (url.protocol !== 'mailto:' || url.host) return null
     const addresses = (text) => text.split(/[;,]/).map((v) => v.trim()).filter(Boolean)
     return { type: 'mailto', data: {
