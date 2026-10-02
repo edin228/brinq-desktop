@@ -38,6 +38,7 @@ const {
 const { createFileActions, CAPABILITIES } = require('./file-actions')
 const { createUpdateStatus } = require('./update-status')
 const { createTabWindow } = require('./tab-window')
+const { installBrowserSignIn } = require('./browser-sign-in')
 
 // Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
 if (process.platform === 'win32') {
@@ -864,6 +865,7 @@ function handleProtocolUrl(url) {
     showMainWindow()
   }
   if (payload.type === 'mailto') queuePayload('mailto', payload.data)
+  if (payload.type === 'browser-sign-in') browserSignIn?.receive(payload.data)
 }
 
 // Register Brinq-owned deep links only. Do not register as the system
@@ -1025,6 +1027,7 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
     onHome: (contents, lastUrl) => {
       const target = approvedAppUrl(lastUrl) ? lastUrl : firstHomeUrl || getModeUrl()
       firstHomeUrl = null
+      browserSignIn?.watchHome(contents)
       attachHome(contents, target)
     },
     isQuitting: () => !!app.isQuitting,
@@ -1202,6 +1205,18 @@ async function switchMode(mode) {
 function validateSender(event) {
   return windowSecurity.validateSender(event)
 }
+
+// Browser sign-in is Windows-only: Desktop ships no brinq: registration elsewhere.
+const browserSignIn = process.platform === 'win32'
+  ? installBrowserSignIn({
+    ipcMain,
+    security: windowSecurity,
+    homeContents: () => homeContents(),
+    selectHome: () => tabWindow?.selectHome(),
+    baseUrl: BASE_URL,
+    openExternal: (url) => shell.openExternal(url),
+  })
+  : null
 
 ipcMain.on('notify', (event, title, body, data) => {
   if (!validateSender(event)) return
