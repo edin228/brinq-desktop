@@ -236,7 +236,7 @@ test('closing honors unload guards and removes a tab only once its page is destr
   assert.deepEqual(a.closes, [{ waitForBeforeUnload: true }])
   assert.equal(f.dialogs.length, 1)
   assert.equal(f.dialogs[0][0], f.host)
-  assert.equal(f.dialogs[0][1].message, 'Leave this page?')
+  assert.equal(f.dialogs[0][1].message, 'Discard unsaved changes?')
   assert.equal(f.dialogs[0][1].cancelId, 1)
   f.flush()
   assert.deepEqual(tabIds(f), [1, idA, idB], 'Stay keeps the tab')

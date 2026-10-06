@@ -37,6 +37,7 @@ const {
 } = require('./attachment-files')
 const { createFileActions, CAPABILITIES } = require('./file-actions')
 const { createUpdateStatus } = require('./update-status')
+const { guardWindowUnload } = require('./unload-guard')
 const { createTabWindow } = require('./tab-window')
 const { installBrowserSignIn } = require('./browser-sign-in')
 
@@ -92,6 +93,12 @@ const updates = createUpdateStatus({
     if (!mainWindow || mainWindow.isDestroyed()) createWindow({ initialUrl: intendedAppUrl })
     showMainWindow()
   },
+})
+
+// A window whose page holds unsaved work asks before closing; Stay also
+// stops a quit or update restart. Tabs ask through the tab window.
+app.on('browser-window-created', (_event, window) => {
+  guardWindowUnload({ window, dialog, onStay: () => updates.cancelQuit() })
 })
 
 // ---------------------------------------------------------------------------

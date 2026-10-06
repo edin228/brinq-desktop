@@ -2,8 +2,26 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
 const { createUpdateStatus } = require('../src/update-status')
+const { guardWindowUnload } = require('../src/unload-guard')
 
-function fixture({ packaged = true, dirty = false, installFailure = false, asyncInstallFailure = false } = {}) {
+// A page window guarded the way main.js guards every window. Its page holds
+// unsaved work when `dirty`; the user answers the prompt with Leave or Stay.
+function guardedWindow(webContents, owner, leave) {
+  const prompts = []
+  const dialog = { showMessageBoxSync: (_window, options) => { prompts.push(options); return leave ? 0 : 1 } }
+  const window = { webContents, isDestroyed: () => false, isMinimized: () => false, show() {} }
+  guardWindowUnload({ window, dialog, onStay: () => owner()?.cancelQuit() })
+  return { window, prompts }
+}
+
+// Emits the page's unload veto; true when a listener let the page unload.
+function unloadVeto(webContents) {
+  const event = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
+  webContents.emit('will-prevent-unload', event)
+  return event.defaultPrevented
+}
+
+function fixture({ packaged = true, dirty = false, leave = false, installFailure = false, asyncInstallFailure = false } = {}) {
   const app = new EventEmitter()
   app.isPackaged = packaged
   const updater = new EventEmitter()
@@ -30,20 +48,16 @@ function fixture({ packaged = true, dirty = false, installFailure = false, async
     app.emit('before-quit', before)
     if (before.defaultPrevented) return
     app.isQuitting = true
-    if (dirty && windows.length) {
-      windows[0].webContents.emit('will-prevent-unload')
-      return
-    }
+    if (dirty && windows.length && !unloadVeto(windows[0].webContents)) return
     windows = []
     const event = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
     app.emit('will-quit', event)
     if (!event.defaultPrevented) { exited = true; app.emit('quit', {}, 0) }
   }
   const owner = createUpdateStatus({ app, updater, schedule: (fn) => scheduled.push(fn), onChange: (state) => changes.push(state), restoreWindow: () => { restored++ } })
-  const window = { webContents: new EventEmitter() }
+  const { window, prompts } = guardedWindow(new EventEmitter(), () => owner, leave)
   windows.push(window)
-  app.emit('browser-window-created', {}, window)
-  return { app, updater, owner, changes, window, flush() { while (scheduled.length) scheduled.shift()() }, get restored() { return restored }, get installs() { return installs }, get quits() { return quits }, get exited() { return exited } }
+  return { app, updater, owner, changes, window, prompts, flush() { while (scheduled.length) scheduled.shift()() }, get restored() { return restored }, get installs() { return installs }, get quits() { return quits }, get exited() { return exited } }
 }
 
 test('unpackaged checks are unavailable and launch checks happen once', async () => {
@@ -110,6 +124,18 @@ test('dirty window veto prevents installer and relaunch and restores normal tray
   assert.equal(f.restored, 1)
   assert.equal(f.app.listenerCount('will-quit'), 0)
   assert.match(f.owner.getState().message, /Restart canceled/)
+  assert.equal(f.prompts.length, 1)
+})
+
+test('choosing Leave on a dirty window lets the restart close it and install', () => {
+  const f = fixture({ dirty: true, leave: true })
+  f.updater.emit('update-downloaded', { version: '2.0.0' })
+  assert.equal(f.owner.restart().ok, true)
+  f.flush()
+  assert.equal(f.prompts.length, 1)
+  assert.equal(f.installs, 1)
+  assert.equal(f.exited, true)
+  assert.equal(f.restored, 0)
 })
 
 test('accepted restart installs once after windows close and lets updater complete quit', () => {
@@ -202,7 +228,7 @@ test('installed updater contract: missing NSIS installer recovers before its sil
       app.emit('before-quit', before)
       if (before.defaultPrevented) return
       app.isQuitting = true
-      if (windowsOpen && dirty) { frame.emit('will-prevent-unload'); return }
+      if (windowsOpen && dirty && !unloadVeto(frame)) return
       windowsOpen = false
       const quitting = event()
       app.emit('will-quit', quitting)
@@ -229,7 +255,7 @@ test('installed updater contract: missing NSIS installer recovers before its sil
     }
     const owner = managed ? createUpdateStatus({ app, updater, restoreWindow: () => { restored++; windowsOpen = true } }) : null
     if (owner) {
-      app.emit('browser-window-created', {}, { webContents: frame })
+      guardedWindow(frame, () => owner, false)
       updater.emit('update-downloaded', { version: '2.0.0' })
     }
     return { app, updater, owner, snapshot: () => ({ exited, restored, spawns, opens, installs, errors }) }

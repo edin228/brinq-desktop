@@ -141,6 +141,10 @@ function createWindowSecurity({ baseUrl, preloadPath, openExternal }) {
       if (privileged || presentationUrl(target)) {
         return {
           action: 'allow',
+          // Electron destroys a child with its opener, skipping the child's
+          // unsaved-work prompt. An app window (an email pop-out with a
+          // draft) stays open when the tab that opened it closes.
+          outlivesOpener: privileged,
           overrideBrowserWindowOptions: {
             width: 1100, height: 700, autoHideMenuBar: true,
             webPreferences: appPreferences(privileged, target),
