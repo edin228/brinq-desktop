@@ -63,9 +63,8 @@ function createUpdateStatus({ app, updater, onChange = () => {}, restoreWindow =
     } catch { fail() }
   }
 
+  // A page kept its unsaved work (the user chose Stay), which stops a quit.
   function cancelQuit() {
-    // Respect the renderer's veto. Calling preventDefault on the Electron
-    // will-prevent-unload event would override it and discard unsaved work.
     app.isQuitting = false
     if (!restartPending) return
     restartPending = false
@@ -78,9 +77,6 @@ function createUpdateStatus({ app, updater, onChange = () => {}, restoreWindow =
       event.preventDefault()
       app.isQuitting = false
     }
-  })
-  app.on('browser-window-created', (_event, window) => {
-    window.webContents.on('will-prevent-unload', cancelQuit)
   })
 
   function check() {

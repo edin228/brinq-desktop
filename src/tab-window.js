@@ -1,4 +1,5 @@
 const { HOME_ID, createTabList, tabKind, pageTitle, tabLabel, linkLabelText, shortcutAction } = require('./tabs')
+const { confirmLeave } = require('./unload-guard')
 
 // Owns the main window: a local tab strip in the window's own page and one
 // WebContentsView per Brinq tab below it. Home is the permanent base tab.
@@ -132,22 +133,12 @@ function createTabWindow({
     if (!entry.contents.isDestroyed()) entry.contents.send('theme-request')
   }
 
-  function confirmLeave(entry) {
+  function confirmTabLeave(entry) {
     if (alive()) {
       if (!host.isVisible()) host.show()
       if (list.selected() !== entry.id) select(entry.id)
     }
-    const choice = dialog.showMessageBoxSync(alive() ? host : undefined, {
-      type: 'question',
-      buttons: ['Leave', 'Stay'],
-      defaultId: 1,
-      cancelId: 1,
-      noLink: true,
-      title: 'Leave this page?',
-      message: 'Leave this page?',
-      detail: 'Changes you made may not be saved.',
-    })
-    return choice === 0
+    return confirmLeave(dialog, alive() ? host : undefined)
   }
 
   function dispatch(action, contents = selectedEntry()?.contents) {
@@ -249,7 +240,7 @@ function createTabWindow({
     contents.on('did-stop-loading', () => { entry.loading = false; push() })
     contents.on('did-finish-load', () => requestTheme(entry))
     contents.on('will-prevent-unload', (event) => {
-      if (confirmLeave(entry)) {
+      if (confirmTabLeave(entry)) {
         event.preventDefault()
         return
       }
