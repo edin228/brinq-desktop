@@ -27,10 +27,13 @@ function popout({ dirty = false, minimized = false } = {}) {
   return window
 }
 
-function fixture({ choice = 1, ...options } = {}) {
+// `choice` answers every prompt; `answers` gives one answer per prompt.
+function fixture({ choice = 1, answers = null, ...options } = {}) {
   const window = popout(options)
   const dialogs = []
-  const dialog = { showMessageBoxSync: (owner, opts) => { dialogs.push([owner, opts]); return choice } }
+  const dialog = {
+    showMessageBoxSync: (owner, opts) => { dialogs.push([owner, opts]); return answers ? answers.shift() : choice },
+  }
   let stays = 0
   guardWindowUnload({ window, dialog, onStay: () => { stays++ } })
   return { window, dialogs, get stays() { return stays } }
@@ -55,15 +58,15 @@ test('closing a pop-out with unsaved changes asks, and Leave closes it', () => {
 })
 
 test('Stay keeps the pop-out and its page open, and a later Leave closes it', () => {
-  const f = fixture({ dirty: true, choice: 1 })
+  const f = fixture({ dirty: true, answers: [1, 0] })
   f.window.close()
   assert.equal(f.dialogs.length, 1)
   assert.equal(f.window.isDestroyed(), false)
   assert.equal(f.stays, 1, 'Stay is reported so a quit or restart stops')
-  f.dialogs.length = 0
   f.window.close()
-  assert.equal(f.dialogs.length, 1, 'every close asks again')
-  assert.equal(f.window.isDestroyed(), false)
+  assert.equal(f.dialogs.length, 2, 'every close asks again')
+  assert.equal(f.window.isDestroyed(), true)
+  assert.equal(f.stays, 1)
 })
 
 test('the prompt also guards reloading a pop-out with unsaved changes', () => {

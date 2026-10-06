@@ -98,6 +98,7 @@ test('email, client and form popouts are registered; print and blob windows have
     const url = `http://localhost:3004${route}`
     const options = f.wc.popup({ url })
     assert.equal(options.action, 'allow')
+    assert.equal(options.outlivesOpener, true, 'closing the opening tab must not discard a draft')
     assert.equal(options.overrideBrowserWindowOptions.webPreferences.sandbox, true)
     const child = f.windowAt(url)
     f.wc.emit('did-create-window', child, { url })
@@ -107,6 +108,7 @@ test('email, client and form popouts are registered; print and blob windows have
     const options = f.wc.popup({ url })
     assert.equal(options.action, 'allow')
     assert.equal(options.overrideBrowserWindowOptions.webPreferences.preload, '')
+    assert.equal(options.outlivesOpener, false)
     const child = f.windowAt(url)
     f.wc.emit('did-create-window', child, { url })
     assert.equal(f.policy.validateSender({ sender: child.webContents, senderFrame: child.webContents.mainFrame }), false)
@@ -193,6 +195,7 @@ test('pop-outs, posts, other dispositions and non-app openers keep windows', () 
     assert.equal(result.action, 'allow', JSON.stringify(details))
     assert.equal(result.createWindow, undefined, JSON.stringify(details))
     assert.equal(result.overrideBrowserWindowOptions.width, 1100)
+    assert.equal(result.outlivesOpener, true, JSON.stringify(details))
   }
   const unavailable = fixture()
   unavailable.policy.setTabHost(tabHost(false))
