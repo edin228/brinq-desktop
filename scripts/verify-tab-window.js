@@ -291,7 +291,7 @@ async function main() {
     answers.push(1)
     tabs.closeTab(dirtyId)
     await wait(800)
-    check('closing a tab with unsaved work asks first', prompts.includes('Leave this page?'))
+    check('closing a tab with unsaved work asks first', prompts.includes('Discard unsaved changes?'))
     check('Stay keeps the tab and its page', !dirtyTab.isDestroyed() && tabs.isTab(dirtyTab))
     answers.push(0)
     tabs.closeTab(dirtyId)
