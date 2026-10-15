@@ -70,6 +70,7 @@ function createTab(tab) {
     bridge.select(tab.id, true)
   })
   wrapper.addEventListener('pointerdown', (event) => startDrag(event, tab.id))
+  wrapper.addEventListener('contextmenu', (event) => openMenu(event, select, tab.id))
   const element = { wrapper, select, icon, label, close, iconKey: null, justDragged: false }
   tabElements.set(tab.id, element)
   return element
@@ -102,6 +103,23 @@ function idOf(button) {
 function updateRovingFocus() {
   const current = focusedId !== null && (focusedId === 1 || tabElements.has(focusedId)) ? focusedId : state.selectedId
   for (const button of focusable()) button.tabIndex = idOf(button) === current ? 0 : -1
+}
+
+// A right-click (Ctrl+click on macOS) opens the tab's menu at the pointer.
+// A request with no pointer, such as a screen reader's, opens it below the
+// tab. The tab list handles the Menu key and Shift+F10 itself, which keeps
+// Chromium from sending a contextmenu for them.
+function openMenu(event, button, id) {
+  event.preventDefault()
+  if (event.button < 0) openMenuBelow(button, id)
+  else bridge.menu(id, Math.round(event.clientX), Math.round(event.clientY), false)
+}
+
+// From the keyboard the menu opens below the tab, inside the strip even
+// when the tab is partly scrolled out of view.
+function openMenuBelow(button, id) {
+  const box = (id === 1 ? button : button.parentNode).getBoundingClientRect()
+  bridge.menu(id, Math.min(Math.max(0, Math.round(box.left)), innerWidth), Math.round(box.bottom), true)
 }
 
 function render(next) {
@@ -232,6 +250,7 @@ document.addEventListener('pointerup', (event) => endDrag(event))
 document.addEventListener('pointercancel', (event) => endDrag(event, true))
 
 homeButton.addEventListener('click', () => bridge.home(true))
+homeButton.addEventListener('contextmenu', (event) => openMenu(event, homeButton, 1))
 refreshButton.addEventListener('click', () => bridge.reload())
 newTabButton.addEventListener('click', () => bridge.newTab())
 retryButton.addEventListener('click', () => {
@@ -239,7 +258,8 @@ retryButton.addEventListener('click', () => {
   bridge.retry(Number(retryButton.dataset.id))
 })
 
-// Arrow keys move focus within the tab list; Enter/Space selects; Delete closes.
+// Arrow keys move focus within the tab list; Enter/Space selects; Delete
+// closes; the Menu key or Shift+F10 opens the tab's menu.
 document.querySelector('.tablist').addEventListener('keydown', (event) => {
   const buttons = focusable()
   const index = buttons.indexOf(document.activeElement)
@@ -259,6 +279,10 @@ document.querySelector('.tablist').addEventListener('keydown', (event) => {
     event.preventDefault()
     bridge.close(idOf(buttons[index]))
     return
+  } else if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey)) {
+    event.preventDefault()
+    openMenuBelow(buttons[index], idOf(buttons[index]))
+    return
   }
   if (!target) return
   event.preventDefault()
@@ -266,6 +290,11 @@ document.querySelector('.tablist').addEventListener('keydown', (event) => {
   updateRovingFocus()
   target.focus()
   target.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+})
+
+// Windows sends the Menu key's contextmenu on key up.
+document.querySelector('.tablist').addEventListener('keyup', (event) => {
+  if (event.key === 'ContextMenu') event.preventDefault()
 })
 
 document.querySelector('.tablist').addEventListener('focusin', (event) => {

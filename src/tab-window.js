@@ -1,4 +1,4 @@
-const { HOME_ID, createTabList, tabKind, pageTitle, tabLabel, linkLabelText, shortcutAction } = require('./tabs')
+const { HOME_ID, createTabList, tabKind, pageTitle, tabLabel, linkLabelText, shareableUrl, shortcutAction } = require('./tabs')
 const { confirmLeave } = require('./unload-guard')
 
 // Owns the main window: a local tab strip in the window's own page and one
@@ -22,8 +22,8 @@ const LINK_LABEL_MS = 2000
 const canonicalUrl = (value) => { try { return new URL(value).href } catch { return null } }
 
 function createTabWindow({
-  electron: { BrowserWindow, WebContentsView, dialog },
-  security, bounds, icon, preloadPath, shellPreloadPath, shellUrl,
+  electron: { BrowserWindow, WebContentsView, dialog, Menu, clipboard },
+  security, bounds, icon, preloadPath, shellPreloadPath, shellUrl, openExternal,
   theme: savedTheme = 'light', platform = process.platform,
   newTabUrl, onTheme = () => {}, onHome = () => {}, schedule = setImmediate,
   now = Date.now, setTimer = setTimeout,
@@ -429,6 +429,37 @@ function createTabWindow({
     } catch { return false }
   }
 
+  // A tab's page as a browser link: its current address, which follows
+  // in-page navigation, else its last approved one. A failed tab has none.
+  function shareLink(entry) {
+    if (entry.failed || entry.contents.isDestroyed()) return null
+    const current = entry.contents.getURL()
+    return shareableUrl(security.isAppUrl(current) ? current : entry.url, security.isAppUrl)
+  }
+
+  // The tab menu opens at a point in the strip; the link comes from main's
+  // own state, never from the strip.
+  function showTabMenu(id, x, y, keyboard) {
+    const [width] = host.getContentSize()
+    if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) ||
+      x < 0 || x > width || y < 0 || y > STRIP_HEIGHT) return false
+    const link = shareLink(entries.get(id))
+    const quietly = (action) => () => { try { Promise.resolve(action()).catch(() => {}) } catch {} }
+    Menu.buildFromTemplate([
+      { label: 'Copy link', enabled: !!link, click: quietly(() => clipboard.writeText(link)) },
+      { label: 'Open in browser', enabled: !!link, click: quietly(() => openExternal(link)) },
+    ]).popup({
+      window: host, x, y, sourceType: keyboard ? 'keyboard' : 'mouse',
+      // A click left the strip focused: give focus back to the page, as a
+      // left-click would. A keyboard user stays on the tab they chose.
+      callback: () => {
+        const entry = selectedEntry()
+        if (!keyboard && alive() && host.isFocused() && entry && !entry.failed && !entry.contents.isDestroyed()) entry.contents.focus()
+      },
+    })
+    return true
+  }
+
   function stripCommand(event, command, id, options) {
     if (!validStripSender(event)) return false
     if (command === 'new') return newTab(), true
@@ -439,6 +470,7 @@ function createTabWindow({
     if (command === 'close') return closeTab(id, { focus: false })
     if (command === 'retry') return retry(id), true
     if (command === 'move') return Number.isSafeInteger(options?.position) && moveTab(id, options.position)
+    if (command === 'menu') return showTabMenu(id, options?.x, options?.y, options?.keyboard === true)
     return false
   }
 

@@ -52,7 +52,7 @@ if (argv.includes('--visual-only')) {
 }
 
 // --- Electron verification -------------------------------------------------
-const { app, BrowserWindow, WebContentsView, ipcMain, webContents: allContents } = require('electron')
+const { app, BrowserWindow, WebContentsView, Menu, clipboard, ipcMain, webContents: allContents } = require('electron')
 const { pathToFileURL } = require('url')
 const { createWindowSecurity } = require('../src/window-security')
 const { createTabWindow } = require('../src/tab-window')
@@ -114,8 +114,23 @@ async function main() {
   const dialog = { showMessageBoxSync: (_owner, options) => { prompts.push(options.message); return answers.shift() ?? 1 } }
   const themes = []
   let quitStops = 0
+  // The real Menu and clipboard; each menu is kept to read and close it.
+  const menus = []
+  const recordingMenu = {
+    buildFromTemplate(template) {
+      const menu = Menu.buildFromTemplate(template)
+      const record = { menu, shown: false }
+      menu.once('menu-will-show', () => { record.shown = true })
+      const popup = menu.popup.bind(menu)
+      menu.popup = (options) => { record.options = options; popup(options) }
+      menus.push(record)
+      return menu
+    },
+  }
+  const opened = []
   const tabs = createTabWindow({
-    electron: { BrowserWindow, WebContentsView, dialog },
+    electron: { BrowserWindow, WebContentsView, dialog, Menu: recordingMenu, clipboard },
+    openExternal: (url) => { opened.push(url) },
     security,
     bounds: { width: 1200, height: 800, x: 0, y: 0 },
     preloadPath: path.join(ROOT, 'src', 'preload.js'),
@@ -305,6 +320,78 @@ async function main() {
     await clientTab.executeJavaScript(`document.documentElement.classList.replace('light', 'dark'); document.documentElement.classList.replace('dark', 'light')`)
     await wait(300)
     check('a background tab does not repaint the header', (await stripState()).theme === 'dark')
+
+    // Tab menu: real right-clicks and keys in the strip, real menu and clipboard.
+    const stripPoint = (selector) => host.webContents.executeJavaScript(`(() => {
+      const box = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect()
+      return { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2), left: Math.round(box.left), bottom: Math.round(box.bottom) }
+    })()`)
+    const takeMenu = async (count) => {
+      const shown = await until(() => menus.length >= count && menus.at(-1).shown, 2000)
+      const record = menus.at(-1)
+      record?.menu.closePopup(host)
+      await wait(150)
+      return shown ? record : null
+    }
+    const rightClick = async (selector) => {
+      const { x, y } = await stripPoint(selector)
+      for (const type of ['mouseDown', 'mouseUp']) host.webContents.sendInputEvent({ type, x, y, button: 'right', clickCount: 1 })
+      return { x, y }
+    }
+    // The client tab moves to a call recording without a full navigation.
+    const recording = `${base}/clients/1/calls/rec_9?standalone=full&t=95#transcript`
+    await clientTab.executeJavaScript(`history.pushState(null, '', ${JSON.stringify(recording.slice(base.length))}); document.title = 'brinq | Call recording'`)
+    await until(async () => clientTab.getURL() === recording && (await stripState()).labels.includes('Call recording'))
+    const clientSelector = await host.webContents.executeJavaScript(
+      `'#' + [...document.querySelectorAll('.tab-select')].find((node) => node.textContent === 'Call recording').id`)
+    await clipboard.writeText('before')
+    const at = await rightClick(clientSelector)
+    const clientMenu = await takeMenu(1)
+    check('right-clicking a tab opens its menu at the pointer', clientMenu && clientMenu.options.window === host &&
+      clientMenu.options.x === at.x && clientMenu.options.y === at.y, JSON.stringify(clientMenu?.options && { x: clientMenu.options.x, y: clientMenu.options.y, at }))
+    check('the menu has Copy link and Open in browser, both enabled',
+      JSON.stringify(clientMenu?.menu.items.map(({ label, enabled }) => [label, enabled])) === JSON.stringify([['Copy link', true], ['Open in browser', true]]))
+    clientMenu?.menu.items[0].click()
+    const copiedText = async (expected) => (await until(async () => (await clipboard.readText()) === expected, 2000)) || clipboard.readText()
+    check('Copy link puts the page\'s browser link on the clipboard', (await copiedText(`${base}/clients/1/calls/rec_9?t=95#transcript`)) === true)
+    clientMenu?.menu.items[1].click()
+    check('Open in browser opens the same link', JSON.stringify(opened) === JSON.stringify([`${base}/clients/1/calls/rec_9?t=95#transcript`]), JSON.stringify(opened))
+    check('the menu does not select the tab', (await stripState()).selected === 'home')
+    check('closing a clicked menu gives focus back to the page', await until(() => tabs.home.isFocused(), 1000))
+    await rightClick('.home')
+    const homeMenu = await takeMenu(2)
+    homeMenu?.menu.items[0].click()
+    const homeCopy = await copiedText(`${base}/home`)
+    check('Home has the menu too, with its page as the link', menus.length === 2 && homeCopy === true, String(homeCopy))
+    // Keyboard: the Menu key and Shift+F10 open it once, below the focused tab.
+    await host.webContents.executeJavaScript(`document.querySelector(${JSON.stringify(clientSelector)}).focus()`)
+    host.webContents.focus()
+    const below = await stripPoint(`.tab:has(> ${clientSelector})`)
+    // Synthetic input has no Menu key; that press uses real X input.
+    const keys = [['Shift+F10', () => {
+      host.webContents.sendInputEvent({ type: 'rawKeyDown', keyCode: 'F10', modifiers: ['shift'] })
+      host.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'F10', modifiers: ['shift'] })
+    }]]
+    if (process.env.XDOTOOL) keys.push(['the Menu key', () => require('child_process').execFileSync(process.env.XDOTOOL, ['key', 'Menu'])])
+    else console.log('SKIP the Menu key: set XDOTOOL to a real input tool')
+    for (const [name, press] of keys) {
+      const before = menus.length
+      host.focus()
+      press()
+      const record = await takeMenu(before + 1)
+      await wait(200)
+      check(`${name} opens the focused tab's menu once, below the tab`, record && menus.length === before + 1 &&
+        record.options.x === below.left && record.options.y === below.bottom && record.options.sourceType === 'keyboard',
+        JSON.stringify({ menus: menus.length - before, at: record?.options && [record.options.x, record.options.y], below }))
+    }
+    // A menu request with no pointer, such as a screen reader's, comes the
+    // way Chromium sends the Menu key's: a PointerEvent with button -1.
+    const beforeAssistive = menus.length
+    await host.webContents.executeJavaScript(`document.querySelector(${JSON.stringify(clientSelector)}).dispatchEvent(new PointerEvent('contextmenu', { bubbles: true, cancelable: true, button: -1 }))`)
+    const assistive = await takeMenu(beforeAssistive + 1)
+    check('a menu request without a pointer opens below the tab', assistive && assistive.options.x === below.left && assistive.options.y === below.bottom,
+      JSON.stringify(assistive?.options && [assistive.options.x, assistive.options.y]))
+    tabs.selectHome()
 
     // Link labels name background tabs before their pages do.
     await tabs.home.loadURL(`${base}/labels`)

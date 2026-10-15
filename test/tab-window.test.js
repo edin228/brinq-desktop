@@ -88,6 +88,7 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1 } = {}) {
     }
     isDestroyed() { return this.destroyed }
     isVisible() { return this.visible }
+    isFocused() { return !this.blurred }
     show() { this.visible = true }
     hide() { this.visible = false }
     focus() { this.focusedCount = (this.focusedCount || 0) + 1 }
@@ -109,10 +110,25 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1 } = {}) {
     setBackgroundColor(color) { this.background = color }
   }
   const dialog = { showMessageBoxSync: (owner, options) => { dialogs.push([owner, options]); return choice } }
+  // Each popped-up menu keeps its template and where it opened.
+  const menus = []
+  const Menu = {
+    buildFromTemplate: (template) => ({ popup: (options) => menus.push({ template, options }) }),
+  }
+  // Copy and open settle like Electron's; `fail` makes them reject.
+  const copied = []
+  const external = []
+  const native = { fail: false }
+  const settle = () => {
+    if (native.fail === 'throw') throw new Error('unavailable')
+    return native.fail ? Promise.reject(new Error('unavailable')) : Promise.resolve()
+  }
+  const clipboard = { writeText: (text) => { copied.push(text); return settle() } }
   const tabs = createTabWindow({
-    electron: { BrowserWindow, WebContentsView, dialog },
+    electron: { BrowserWindow, WebContentsView, dialog, Menu, clipboard },
     security, bounds: { width: 1200, height: 800 }, icon: '/icon.ico',
     preloadPath: '/preload.js', shellPreloadPath: '/shell-preload.js', shellUrl: SHELL,
+    openExternal: (url) => { external.push(url); return settle() },
     theme, platform,
     newTabUrl: (home) => home.getURL() || `${BASE}/dashboard?standalone=full`,
     onTheme: (value) => themes.push(value),
@@ -143,7 +159,7 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1 } = {}) {
     flush()
     return contents
   }
-  return { tabs, host, strip, security, session, windows, dialogs, homes, themes, flush, state, stripEvent, viewOf, open, fakeContents, queue, clock, app }
+  return { tabs, host, strip, security, session, windows, dialogs, homes, themes, flush, state, stripEvent, viewOf, open, fakeContents, queue, clock, app, menus, copied, external, native }
 }
 
 function tabIds(f) { return f.state().tabs.map((tab) => tab.id) }
@@ -693,4 +709,126 @@ test('the synchronous link-label reply is always sent: true only when stored', (
   assert.equal(reply({ linkLabel: () => true }), true)
   assert.equal(reply({ linkLabel: () => false }), false)
   assert.equal(reply({ linkLabel: () => { throw new Error('boom') } }), false)
+})
+
+// The tab menu as the strip opens it: one call per right-click or Menu key.
+function tabMenu(f, id, point = { x: 120, y: 20 }) {
+  const before = f.menus.length
+  const shown = f.tabs.stripCommand(f.stripEvent(), 'menu', id, point)
+  const menu = f.menus.length > before ? f.menus.at(-1) : null
+  return {
+    shown, menu,
+    items: menu?.template.map(({ label, enabled }) => [label, enabled]),
+    copy: () => menu.template[0].click(),
+    open: () => menu.template[1].click(),
+  }
+}
+
+test('the tab menu copies or opens the page the tab shows now, as a browser link', async () => {
+  const f = fixture()
+  // A client tab opened from an in-app link that carried the desktop mode,
+  // then moved to a call recording without a full navigation.
+  const tab = f.open(`${BASE}/clients/42?standalone=full`)
+  const id = tabIds(f)[1]
+  const recording = `${BASE}/clients/42/calls/rec_9?standalone=full&t=95#transcript`
+  tab.mainFrame.url = recording
+  tab.emit('did-navigate-in-page', {}, recording, true)
+  const menu = tabMenu(f, id, { x: 312, y: 27 })
+  assert.equal(menu.shown, true)
+  assert.deepEqual(menu.items, [['Copy link', true], ['Open in browser', true]])
+  const { callback, ...where } = menu.menu.options
+  assert.deepEqual(where, { window: f.host, x: 312, y: 27, sourceType: 'mouse' })
+  assert.equal(typeof callback, 'function')
+  menu.copy()
+  assert.deepEqual(f.copied, [`${BASE}/clients/42/calls/rec_9?t=95#transcript`])
+  assert.deepEqual(f.external, [])
+  menu.open()
+  assert.deepEqual(f.external, [`${BASE}/clients/42/calls/rec_9?t=95#transcript`])
+  f.flush()
+  assert.equal(f.state().selectedId, 1, 'the menu does not select the tab')
+
+  // Home, in either mode.
+  tabMenu(f, 1).copy()
+  assert.equal(f.copied.at(-1), `${BASE}/dashboard`)
+  f.tabs.home.loadURL(`${BASE}/emails?standalone=email`)
+  f.tabs.home.emit('did-navigate', {}, `${BASE}/emails?standalone=email`)
+  tabMenu(f, 1).open()
+  assert.equal(f.external.at(-1), `${BASE}/emails`)
+  // A clipboard or browser that refuses is not an unhandled rejection.
+  for (const fail of [true, 'throw']) {
+    f.native.fail = fail
+    tabMenu(f, 1).copy()
+    tabMenu(f, 1).open()
+  }
+  await new Promise((resolve) => setImmediate(resolve))
+})
+
+test('a clicked tab menu gives focus back to the page; a keyboard one leaves it on the tab', () => {
+  const f = fixture()
+  const tab = f.open(`${BASE}/clients/1`, { background: false })
+  const id = tabIds(f)[1]
+  const focused = tab.focused
+  // Right-click on another tab: the selected page gets focus back.
+  tabMenu(f, 1).menu.options.callback()
+  assert.equal(tab.focused, focused + 1)
+  const keyboard = tabMenu(f, id, { x: 96, y: 36, keyboard: true }).menu.options
+  assert.equal(keyboard.sourceType, 'keyboard')
+  keyboard.callback()
+  assert.equal(tab.focused, focused + 1)
+  // Not when the user has moved to another app, or the page failed.
+  f.host.blurred = true
+  tabMenu(f, id).menu.options.callback()
+  f.host.blurred = false
+  tab.emit('did-fail-load', {}, -106, 'INTERNET_DISCONNECTED', `${BASE}/clients/1`, true)
+  tabMenu(f, id).menu.options.callback()
+  assert.equal(tab.focused, focused + 1)
+})
+
+test('the tab menu offers a link only for an approved app page', () => {
+  const f = fixture()
+  const tab = f.open(`${BASE}/clients/1`)
+  const id = tabIds(f)[1]
+  const disabled = [['Copy link', false], ['Open in browser', false]]
+  // Before the page commits, the link is the approved page it is loading.
+  tab.mainFrame.url = ''
+  tabMenu(f, id).copy()
+  assert.deepEqual(f.copied, [`${BASE}/clients/1`])
+  // A failed or crashed tab shows the strip's panel, not a page.
+  tab.emit('did-fail-load', {}, -106, 'INTERNET_DISCONNECTED', `${BASE}/clients/1`, true)
+  assert.deepEqual(tabMenu(f, id).items, disabled)
+  f.tabs.stripCommand(f.stripEvent(), 'retry', id)
+  assert.deepEqual(tabMenu(f, id).items, [['Copy link', true], ['Open in browser', true]])
+  tab.emit('render-process-gone', {}, { reason: 'crashed' })
+  assert.deepEqual(tabMenu(f, id).items, disabled)
+  // Home before its first page has no link.
+  f.tabs.home.mainFrame.url = 'about:blank'
+  assert.deepEqual(tabMenu(f, 1).items, disabled)
+  f.tabs.home.mainFrame.url = 'chrome-error://chromewebdata/'
+  assert.deepEqual(tabMenu(f, 1).items, disabled)
+  assert.deepEqual(f.copied, [`${BASE}/clients/1`])
+  assert.deepEqual(f.external, [])
+})
+
+test('tab menus come only from the strip, for known tabs, at whole points inside the strip', () => {
+  const f = fixture()
+  f.open(`${BASE}/clients/1`)
+  const id = tabIds(f)[1]
+  const denied = [
+    f.stripEvent({ sender: f.tabs.home }),
+    f.stripEvent({ senderFrame: { ...f.strip.mainFrame } }),
+    f.stripEvent({ senderFrame: { ...f.strip.mainFrame, parent: {} } }),
+    f.stripEvent({ senderFrame: null }),
+  ]
+  for (const event of denied) assert.equal(f.tabs.stripCommand(event, 'menu', id, { x: 10, y: 10 }), false)
+  for (const bad of ['2', 2.5, -1, 999, null, NaN]) assert.equal(tabMenu(f, bad).shown, false)
+  const points = [undefined, null, {}, { x: 10 }, { x: 1.5, y: 10 }, { x: 10, y: 0.5 }, { x: '10', y: 10 },
+    { x: NaN, y: 10 }, { x: -1, y: 10 }, { x: 1201, y: 10 }, { x: 10, y: -1 }, { x: 10, y: 41 }, { x: 10, y: 800 }]
+  for (const point of points) assert.equal(f.tabs.stripCommand(f.stripEvent(), 'menu', id, point), false, String(JSON.stringify(point)))
+  assert.equal(f.menus.length, 0)
+  for (const point of [{ x: 0, y: 0 }, { x: 1200, y: 40 }]) assert.equal(tabMenu(f, id, point).shown, true)
+  // The link is main's own: anything else the strip sends is ignored.
+  tabMenu(f, id, { x: 5, y: 5, url: 'https://evil.example/' }).copy()
+  assert.deepEqual(f.copied, [`${BASE}/clients/1`])
+  f.host.close()
+  assert.equal(tabMenu(f, id).shown, false)
 })

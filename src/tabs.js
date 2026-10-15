@@ -117,6 +117,19 @@ function linkLabelText(value) {
   return value.replace(/\s+/g, ' ').trim() || null
 }
 
+// The address of an app page as a colleague opens it in a browser. The
+// desktop-only `standalone` parameter would put the web app in window mode,
+// so it goes; every other parameter keeps its exact text, as does the hash.
+// Returns null for anything that is not an app URL.
+function shareableUrl(value, isAppUrl) {
+  if (typeof value !== 'string' || !isAppUrl(value)) return null
+  const url = new URL(value)
+  const kept = url.search.slice(1).split('&')
+    .filter((part) => part && !new URLSearchParams(part).has('standalone'))
+  url.search = kept.join('&')
+  return isAppUrl(url.href) ? url.href : null
+}
+
 const FEATURE_TOKENS = new Set(['noopener', 'noreferrer'])
 
 // Only ordinary link or window.open('_blank') opens become tabs. Named or
@@ -162,4 +175,4 @@ function shortcutAction(input, platform = process.platform) {
   return null
 }
 
-module.exports = { HOME_ID, createTabList, tabKind, pageTitle, tabLabel, linkLabelText, MAX_LINK_LABEL, openAsTab, shortcutAction }
+module.exports = { HOME_ID, createTabList, tabKind, pageTitle, tabLabel, linkLabelText, MAX_LINK_LABEL, shareableUrl, openAsTab, shortcutAction }

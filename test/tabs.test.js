@@ -1,6 +1,8 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { HOME_ID, createTabList, tabKind, tabLabel, openAsTab, shortcutAction } = require('../src/tabs')
+const { HOME_ID, createTabList, tabKind, tabLabel, shareableUrl, openAsTab, shortcutAction } = require('../src/tabs')
+const { modeUrl } = require('../src/window-state')
+const { createWindowSecurity } = require('../src/window-security')
 
 test('Home is permanent and closing picks the right neighbor, else the left', () => {
   const tabs = createTabList()
@@ -180,4 +182,29 @@ test('a page title wins over the link name, which wins over the route fallback',
   assert.equal(linkLabelText('a'.repeat(121)), null)
   assert.equal(linkLabelText('😀'.repeat(120)), '😀'.repeat(120), 'the cap counts characters, not UTF-16 units')
   assert.equal(linkLabelText('<img src=x>'), '<img src=x>')
+})
+
+test('a shared link drops only the desktop standalone parameter', () => {
+  const base = 'https://brinq.io'
+  const { isAppUrl } = createWindowSecurity({ baseUrl: base, preloadPath: '/preload.js', openExternal() {} })
+  const share = (url) => shareableUrl(url, isAppUrl)
+  // Home in either mode.
+  assert.equal(share(modeUrl(base, 'full')), `${base}/dashboard`)
+  assert.equal(share(modeUrl(base, 'email')), `${base}/emails`)
+  // A call recording reached from a client page: every other parameter keeps
+  // its exact text, and so does the hash.
+  assert.equal(share(`${base}/clients/42/calls/rec_9?standalone=full&t=95&q=a%20b+c&flag#transcript`),
+    `${base}/clients/42/calls/rec_9?t=95&q=a%20b+c&flag#transcript`)
+  assert.equal(share(`${base}/settings?tab=email&standalone=email`), `${base}/settings?tab=email`)
+  assert.equal(share(`${base}/clients/42#notes?standalone=full`), `${base}/clients/42#notes?standalone=full`, 'the hash is not the query')
+  // Any spelling the web app would read as standalone goes, every time.
+  assert.equal(share(`${base}/emails?standalone=email&a=1&standalone=full`), `${base}/emails?a=1`)
+  assert.equal(share(`${base}/emails?%73tandalone=email&a=1`), `${base}/emails?a=1`)
+  assert.equal(share(`${base}/emails?standalone`), `${base}/emails`)
+  assert.equal(share(`${base}/clients/42?standalones=1`), `${base}/clients/42?standalones=1`)
+  assert.equal(share(`${base}/clients/42`), `${base}/clients/42`)
+  for (const url of ['https://evil.example/clients/42', 'http://brinq.io/clients/42', 'https://user:pw@brinq.io/x',
+    'about:blank', 'chrome-error://chromewebdata/', 'brinq://sign-in', '', null, undefined, 42]) {
+    assert.equal(share(url), null, String(url))
+  }
 })
