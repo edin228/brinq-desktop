@@ -42,6 +42,7 @@ window.brinqTabs = {
   close: (id) => calls.push(['close', id]),
   move: (id, position) => calls.push(['move', id, position]),
   retry: (id) => calls.push(['retry', id]),
+  menu: (id, x, y, keyboard) => calls.push(['menu', id, x, y, keyboard]),
   newTab: () => calls.push(['new']),
   home: (focus) => calls.push(['home', focus]),
   reload: () => calls.push(['reload']),

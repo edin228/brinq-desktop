@@ -20,8 +20,8 @@ function load(protocol = 'file:', isMainFrame = true, state = { selectedId: 1 })
 
 test('the strip bridge exposes fixed tab commands only', () => {
   const { api, calls } = load()
-  assert.deepEqual(Object.keys(api).sort(), ['close', 'home', 'move', 'newTab', 'onState', 'reload', 'retry', 'select'])
-  api.select(4, true); api.select(5, 'yes'); api.close(4); api.retry(4); api.newTab(); api.home(true); api.reload(); api.move(4, 2)
+  assert.deepEqual(Object.keys(api).sort(), ['close', 'home', 'menu', 'move', 'newTab', 'onState', 'reload', 'retry', 'select'])
+  api.select(4, true); api.select(5, 'yes'); api.close(4); api.retry(4); api.newTab(); api.home(true); api.reload(); api.move(4, 2); api.menu(4, 120, 18); api.menu(4, 96, 36, true); api.menu(4, 1, 2, 'yes')
   assert.equal(JSON.stringify(calls), JSON.stringify([
     ['tabs:command', 'select', 4, { focus: true }],
     ['tabs:command', 'select', 5, { focus: false }],
@@ -31,6 +31,9 @@ test('the strip bridge exposes fixed tab commands only', () => {
     ['tabs:command', 'home', null, { focus: true }],
     ['tabs:command', 'reload', null, null],
     ['tabs:command', 'move', 4, { position: 2 }],
+    ['tabs:command', 'menu', 4, { x: 120, y: 18, keyboard: false }],
+    ['tabs:command', 'menu', 4, { x: 96, y: 36, keyboard: true }],
+    ['tabs:command', 'menu', 4, { x: 1, y: 2, keyboard: false }],
   ]))
 })
 

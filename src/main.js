@@ -9,6 +9,7 @@ const {
   shell,
   dialog,
   screen,
+  clipboard,
 } = require('electron')
 const { randomUUID } = require('crypto')
 const fs = require('fs')
@@ -1017,13 +1018,14 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
   let firstHomeUrl = approvedAppUrl(initialUrl) ? initialUrl : navigationQueue.hasPending() ? modeUrl(BASE_URL, config.getMode(), true) : getModeUrl()
 
   tabWindow = createTabWindow({
-    electron: { BrowserWindow, WebContentsView, dialog },
+    electron: { BrowserWindow, WebContentsView, dialog, Menu, clipboard },
     security: windowSecurity,
     bounds,
     icon: WINDOW_ICON_PATH,
     preloadPath: PRELOAD_PATH,
     shellPreloadPath: SHELL_PRELOAD_PATH,
     shellUrl: SHELL_URL,
+    openExternal: (url) => shell.openExternal(url),
     theme: config.getTheme(),
     // + and Ctrl+T open the page Home is showing.
     newTabUrl: (home) => {
