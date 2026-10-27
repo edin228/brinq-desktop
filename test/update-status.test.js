@@ -718,7 +718,18 @@ test('the installer download\'s 429 and GitHub\'s secondary limit also hold chec
   try { parseUpdateInfo('version: 1.3.8\nreleaseNotes: API rate limit exceeded is fixed\n  - bad: x: y', 'latest.yml', 'https://github.com/x/latest.yml') } catch (error) { parseError = error }
   assert.equal(parseError?.code, 'ERR_UPDATER_INVALID_UPDATE_INFO')
   assert.match(parseError.message.split('rawData:')[0], /API rate limit exceeded/)
+  // GitHubProvider 6.8.3 wraps a /releases/latest failure twice, the outer
+  // one as ERR_UPDATER_INVALID_RELEASE_FEED with the feed XML appended.
+  const { createHttpError, newError } = require('builder-util-runtime')
+  const viaFeed = (statusCode, statusMessage, remaining) => {
+    const http = createHttpError({ statusCode, statusMessage, headers: { 'x-ratelimit-remaining': remaining } })
+    const latest = newError(`Unable to find latest version on GitHub (https://github.com/x/releases/latest), please ensure a production release exists: ${http.stack || http.message}`, 'ERR_UPDATER_LATEST_VERSION_NOT_FOUND')
+    return newError(`Cannot parse releases feed: ${latest.stack || latest.message},\nXML:\n<feed><entry><content>Improve rate limit handling; API rate limit exceeded no more</content></entry></feed>`, 'ERR_UPDATER_INVALID_RELEASE_FEED')
+  }
   const cases = [
+    [viaFeed(429, 'Too Many Requests', '0'), true],
+    [viaFeed(403, 'Forbidden', '0'), true],
+    [viaFeed(403, 'Forbidden', '59'), false],
     [parseError, false],
     [downloadError, true],
     [new Error('You have exceeded a secondary rate limit. Please wait a few minutes before you try again.'), true],
