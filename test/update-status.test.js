@@ -715,6 +715,9 @@ test('the installer download\'s 429 and GitHub\'s secondary limit also hold chec
     [downloadError, true],
     [new Error('You have exceeded a secondary rate limit. Please wait a few minutes before you try again.'), true],
     [new Error('Cannot download "https://github.com/x", status 404: Not Found'), false],
+    // Release notes echoed into a wrapped error are not GitHub throttling.
+    [new Error('Unable to find latest version on GitHub: HttpError: 403 Forbidden\nHeaders: {"x-ratelimit-remaining":"59"}, XML:\n<entry><content>Improve rate limit handling; rate limit exceeded no more</content></entry>'), false],
+    [new Error('Cannot parse update info from latest.yml: YAMLException: bad, rawData: releaseNotes: secondary rate limit fixes'), false],
   ]
   for (const [error, limited] of cases) {
     const f = fixture()

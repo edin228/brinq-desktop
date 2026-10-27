@@ -21,10 +21,12 @@ const MESSAGES = {
 // `Cannot download "…", status 429: …`. Retry-After is lost either way, so
 // back off an hour.
 function rateLimited(error) {
-  const text = String(error?.message || '')
+  // Only the HTTP part: a wrapped error can echo the release feed or update
+  // file, whose release notes may mention rate limits.
+  const text = String(error?.message || '').replace(/,?\s*(?:XML|rawData):[\s\S]*$/, '')
   return error?.statusCode === 429 ||
     /(?:^|HttpError: |HTTP error: |status )429\b/m.test(text) ||
-    /\brate limit\b/i.test(text) ||
+    /rate limit exceeded|exceeded a secondary rate limit/i.test(text) ||
     /"x-ratelimit-remaining":\s*"0"/i.test(text)
 }
 
