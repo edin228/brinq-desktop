@@ -47,6 +47,7 @@ const ROUTES = {
 async function main() {
   const server = http.createServer((request, response) => {
     const route = new URL(request.url, 'http://localhost').pathname
+    if (route === '/broken') { request.socket.destroy(); return }
     const body = ROUTES[route] || page(`brinq | ${route}`, `<p>${route}</p>`)
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
     response.end(body)
@@ -76,6 +77,7 @@ async function main() {
   updater.checkForUpdates = () => { throw new Error('The harness never checks a feed') }
 
   let tabs = null
+  let forcedView = null
   let quitStops = 0
   // The same wiring main.js uses, with the real app.quit(). Showing the
   // main window works like main.js showMainWindow: a closed window is
@@ -116,7 +118,8 @@ async function main() {
       isQuitting: () => !!app.isQuitting,
       requestQuit: () => app.quit(),
       // The header's Update action, wired as main.js wires it.
-      updateView: () => headerView(updates.getState()),
+      // `forcedView` lets the harness show a header state directly.
+      updateView: () => forcedView ?? headerView(updates.getState()),
       onUpdateCommand: (command) => {
         if (command === 'restart-update') updates.restart()
         else updates.check({ manual: true })
@@ -195,6 +198,54 @@ async function main() {
     await until(() => tabs.home.getURL().endsWith('/home') && !tabs.home.isLoading())
     const baseListeners = quitListeners()
     check('the header shows no update before one is ready', await until(async () => !(await header()).shown, 2000))
+
+    // Header states shown directly: dismissal, and narrow windows.
+    const failed = { view: 'failed', message: "The update couldn't download. Check your connection and try again." }
+    const show = async (view) => { forcedView = view; tabs.refreshUpdate(); await wait(250) }
+    const failedShown = () => tabs.window.webContents.executeJavaScript(`!document.querySelector('.update-failed').hidden`)
+    await show(failed)
+    check('a failure the user asked about shows its notice', await failedShown())
+    await tabs.window.webContents.executeJavaScript(`document.querySelector('.update-dismiss').click()`)
+    await wait(150)
+    check('dismissing hides the notice', !(await failedShown()))
+    await show(null)
+    await show(failed)
+    check('a later failure with the same words shows again after dismissal', await failedShown())
+    // The native window buttons' space (138 px on Windows) must stay clear.
+    await tabs.window.webContents.executeJavaScript(`document.documentElement.style.setProperty('--controls-right', '138px')`)
+    const overlaps = []
+    for (const view of [{ view: 'ready', note: 'Update postponed', noteDetail: 'Update postponed. Some tabs may have closed.' }, failed]) {
+      await show(view)
+      for (const width of [1200, 800, 640, 520, 440]) {
+        tabs.window.setContentSize(width, 600)
+        await wait(250)
+        const edge = await tabs.window.webContents.executeJavaScript(`(() => {
+          const right = Math.max(...[...document.querySelectorAll('.update > :not([hidden])')].map((node) => node.getBoundingClientRect().right))
+          return { right, limit: innerWidth - 138 }
+        })()`)
+        if (edge.right > edge.limit + 0.5) overlaps.push({ view: view.view, width, ...edge })
+      }
+    }
+    check('the update action stays clear of the window buttons down to 440 px', overlaps.length === 0, JSON.stringify(overlaps))
+    tabs.window.setContentSize(1200, 800)
+    await tabs.window.webContents.executeJavaScript(`document.documentElement.style.removeProperty('--controls-right')`)
+    await show(null)
+    forcedView = null
+
+    // F6 on a failed tab: its panel is in the header page, so F6 moves
+    // between the header and the panel's Try again.
+    const brokenTab = await open('/broken', false)
+    const active = () => tabs.window.webContents.executeJavaScript('document.activeElement?.className ?? null')
+    await until(async () => (await tabs.window.webContents.executeJavaScript(`!document.querySelector('.panel').hidden`)), 3000)
+    tabs.window.webContents.focus()
+    await tabs.window.webContents.executeJavaScript(`document.querySelector('.home').focus()`)
+    key(tabs.window.webContents, 'F6')
+    check('F6 on a failed tab moves from the header to its Try again', await until(async () => (await active()) === 'retry', 2000), String(await active()))
+    key(tabs.window.webContents, 'F6')
+    check('F6 again returns to the header', await until(async () => ['home', 'tab-select'].includes(await active()), 2000), String(await active()))
+    brokenTab.close()
+    await until(() => brokenTab.isDestroyed())
+    tabs.selectHome()
     updater.emit('update-downloaded', { version: '9.9.9' })
     check('a downloaded update is ready', state().status === 'ready')
     check('the header shows "Update", with no tooltip', await until(async () => {

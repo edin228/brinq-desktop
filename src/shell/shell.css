@@ -392,3 +392,13 @@ svg {
 @media (prefers-reduced-motion: reduce) {
   .update-button { transition: none; }
 }
+
+/* Narrow windows: keep the update action clear of the window buttons. The
+   note and the failure's words are still announced and described. */
+@media (max-width: 720px) {
+  .update-note, .update-failed-label span { display: none; }
+}
+
+@media (max-width: 520px) {
+  .drag { flex-basis: 12px; }
+}

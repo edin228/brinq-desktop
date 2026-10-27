@@ -182,16 +182,17 @@ function createTabWindow({
   }
 
   // F6 and Shift+F6 move keyboard focus between the page and the header:
-  // they are separate pages, so Tab alone cannot cross between them.
+  // they are separate pages, so Tab alone cannot cross between them. A
+  // failed tab shows its panel in the strip, so the strip moves focus itself.
   function switchPane(from) {
     if (!alive()) return
     const entry = selectedEntry()
-    if (from === strip) {
-      if (entry && !entry.failed && !entry.contents.isDestroyed()) entry.contents.focus()
+    if (from === strip && entry && !entry.failed && !entry.contents.isDestroyed()) {
+      entry.contents.focus()
       return
     }
     strip.focus()
-    strip.send('tabs:focus')
+    strip.send('tabs:focus', from === strip ? 'toggle' : 'header')
   }
 
   function reload(entry, hard) {

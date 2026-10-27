@@ -67,12 +67,14 @@ test('the update commands carry nothing from the page', () => {
   ]))
 })
 
-test('a focus request reaches the strip without IPC event data', () => {
+test('a focus request reaches the strip as header or toggle only, without IPC event data', () => {
   const { api, ipc } = load()
   const received = []
   const off = api.onFocusRequest((...args) => received.push(args))
-  ipc.emit('tabs:focus', { sender: 'main' }, 'extra')
-  assert.deepEqual(received, [[]])
+  ipc.emit('tabs:focus', { sender: 'main' }, 'header')
+  ipc.emit('tabs:focus', { sender: 'main' }, 'toggle')
+  ipc.emit('tabs:focus', { sender: 'main' }, { evil: true })
+  assert.deepEqual(received, [['header'], ['toggle'], ['header']])
   off()
   assert.equal(ipc.listenerCount('tabs:focus'), 0)
 })

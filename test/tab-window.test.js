@@ -887,7 +887,8 @@ test('F6 and Shift+F6 move focus between the page and the header', () => {
     contents.emit('before-input-event', { preventDefault() { prevented = true } }, { type: 'keyDown', key: 'F6', code: 'F6', ...extra })
     return prevented
   }
-  const focusRequests = () => f.strip.sent.filter(([channel]) => channel === 'tabs:focus').length
+  const requests = () => f.strip.sent.filter(([channel]) => channel === 'tabs:focus').map(([, mode]) => mode)
+  const focusRequests = () => requests().length
   assert.equal(press(tab), true)
   assert.equal(f.strip.focused, 1)
   assert.equal(focusRequests(), 1)
@@ -898,4 +899,12 @@ test('F6 and Shift+F6 move focus between the page and the header', () => {
   assert.equal(focusRequests(), 2)
   assert.equal(press(f.tabs.home, { isAutoRepeat: true }), false, 'a held key moves once')
   assert.equal(press(tab, { control: true }), false, 'Ctrl+F6 is left alone')
+  assert.deepEqual(requests(), ['header', 'header'])
+  // A failed tab's panel lives in the strip: F6 there moves focus within it.
+  tab.emit('did-fail-load', {}, -105, 'NAME_NOT_RESOLVED', `${BASE}/clients/1`, true)
+  f.flush()
+  const pageFocus = tab.focused
+  assert.equal(press(f.strip), true)
+  assert.equal(tab.focused, pageFocus, 'the failed page is not focused')
+  assert.deepEqual(requests().at(-1), 'toggle')
 })

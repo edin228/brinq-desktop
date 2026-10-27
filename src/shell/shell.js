@@ -206,6 +206,8 @@ function setUpdateButton(icon, label, disabled) {
 
 function renderUpdate(update) {
   const view = update?.view ?? null
+  // A dismissal covers that failure only; the next one shows again.
+  if (view !== 'failed') dismissedFailure = null
   const failed = view === 'failed' && update.message !== dismissedFailure
   const action = view === 'ready' || view === 'restarting'
   updateGroup.hidden = !(action || failed)
@@ -368,9 +370,12 @@ document.querySelector('.tablist').addEventListener('focusin', (event) => {
 })
 
 // F6 from the page lands on the current tab, as Tab into the list would.
-bridge.onFocusRequest?.(() => {
-  const target = focusable().find((button) => button.tabIndex === 0) || homeButton
-  target.focus()
+// A failed tab's panel is part of this page, so F6 there moves between the
+// header and the panel's Try again.
+bridge.onFocusRequest?.((mode) => {
+  const header = focusable().find((button) => button.tabIndex === 0) || homeButton
+  if (mode === 'toggle' && !panel.hidden && !panel.contains(document.activeElement)) retryButton.focus()
+  else header.focus()
 })
 
 bridge.onState(render)

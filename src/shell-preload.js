@@ -23,9 +23,10 @@ if (process.isMainFrame && location.protocol === 'file:') {
     reload: () => command('reload'),
     restartUpdate: () => command('restart-update'),
     retryUpdate: () => command('retry-update'),
-    // F6 from the page: main asks the strip to take keyboard focus.
+    // F6: main asks the strip to take keyboard focus ('header'), or, for a
+    // failed tab's panel, to move it between header and panel ('toggle').
     onFocusRequest(callback) {
-      const handler = () => callback()
+      const handler = (_event, mode) => callback(mode === 'toggle' ? 'toggle' : 'header')
       ipcRenderer.on('tabs:focus', handler)
       return () => ipcRenderer.removeListener('tabs:focus', handler)
     },
