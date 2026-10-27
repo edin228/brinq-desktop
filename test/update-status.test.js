@@ -207,10 +207,12 @@ test('installed updater contract: missing NSIS installer recovers before its sil
   t.after(() => { Module._load = originalLoad; fs.rmSync(directory, { recursive: true, force: true }) })
   const settle = async () => { for (let turn = 0; turn < 4; turn++) await new Promise(setImmediate) }
 
-  function installedFixture({ file = missing, dirty = false, mac = false, managed = true } = {}) {
+  function installedFixture({ file = missing, dirty = false, mac = false, managed = true, spawnErrors = [], adminRights = false } = {}) {
     const app = new EventEmitter()
     app.isPackaged = true
     const frame = new EventEmitter()
+    const calls = []
+    let quitHandler = null
     let windowsOpen = true
     let exited = false
     let restored = 0
@@ -232,23 +234,30 @@ test('installed updater contract: missing NSIS installer recovers before its sil
       windowsOpen = false
       const quitting = event()
       app.emit('will-quit', quitting)
-      if (!quitting.defaultPrevented) exited = true
+      if (quitting.defaultPrevented) return
+      exited = true
+      // Electron's quit event, where BaseUpdater installs on an ordinary quit.
+      quitHandler?.(0)
     }
     electron.autoUpdater.quitAndInstall = () => {
       assert.equal(windowsOpen, false)
       installs++
       setImmediate(app.quit)
     }
-    const updater = new (mac ? MacUpdater : NsisUpdater)(null, { version: '1.2.5', quit: app.quit })
+    const adapter = { version: '1.2.5', quit: app.quit, onQuit: (handler) => { quitHandler = handler } }
+    const updater = new (mac ? MacUpdater : NsisUpdater)(null, adapter)
     updater.logger = null
     updater.on('error', () => { errors++ })
     if (mac) updater.squirrelDownloadedUpdate = true
-    else updater.downloadedUpdateHelper = { file, downloadedFileInfo: { isAdminRightsRequired: false } }
+    else updater.downloadedUpdateHelper = { file, downloadedFileInfo: { isAdminRightsRequired: adminRights } }
     // Stub only OS execution. Installed BaseUpdater.quitAndInstall and
-    // NsisUpdater.doInstall, including the ENOENT fallback, remain real.
-    updater.spawnLog = async () => {
+    // NsisUpdater.doInstall, including the ENOENT and elevate fallbacks, remain real.
+    updater.spawnLog = async (command, args) => {
       spawns++
+      calls.push([path.basename(command), args])
       if (file === missing) throw Object.assign(new Error('missing fixture'), { code: 'ENOENT' })
+      const code = spawnErrors.shift()
+      if (code) throw Object.assign(new Error('spawn fixture'), { code })
       assert.equal(windowsOpen, false)
       installs++
       return true
@@ -258,7 +267,7 @@ test('installed updater contract: missing NSIS installer recovers before its sil
       guardedWindow(frame, () => owner, false)
       updater.emit('update-downloaded', { version: '2.0.0' })
     }
-    return { app, updater, owner, snapshot: () => ({ exited, restored, spawns, opens, installs, errors }) }
+    return { app, updater, owner, calls, exitWith: (code) => quitHandler(code), snapshot: () => ({ exited, restored, spawns, opens, installs, errors }) }
   }
 
   await t.test('reproduces the installed ENOENT/openPath contract without Brinq protection', async () => {
@@ -312,4 +321,102 @@ test('installed updater contract: missing NSIS installer recovers before its sil
     assert.equal(f.snapshot().exited, true)
     assert.equal(f.snapshot().restored, 0)
   })
+
+  // The assisted installer shows its own pages and relaunches Brinq only from
+  // its Finish page: --force-run is ignored unless /S is also given.
+  await t.test('Restart to update runs the assisted installer: --updated --force-run, never /S', async () => {
+    const f = installedFixture({ file: installer })
+    f.owner.restart()
+    await settle()
+    assert.deepEqual(f.calls, [['installer.exe', ['--updated', '--force-run']]])
+  })
+  await t.test('an ordinary quit installs without installer pages and without relaunching', async () => {
+    const f = installedFixture({ file: installer, managed: false })
+    updaterArmed(f.updater)
+    f.exitWith(1)
+    assert.deepEqual(f.calls, [], 'a failed exit never installs')
+    f.app.quit()
+    await settle()
+    assert.deepEqual(f.calls, [['installer.exe', ['--updated', '/S']]])
+    assert.deepEqual(f.snapshot(), { exited: true, restored: 0, spawns: 1, opens: 0, installs: 1, errors: 0 })
+  })
+
+  // elevate.exe lives in Electron's resources directory, which Node lacks.
+  const resourcesPath = Object.getOwnPropertyDescriptor(process, 'resourcesPath')
+  process.resourcesPath = directory
+  t.after(() => {
+    if (resourcesPath) Object.defineProperty(process, 'resourcesPath', resourcesPath)
+    else delete process.resourcesPath
+  })
+  for (const code of ['UNKNOWN', 'EACCES']) {
+    await t.test(`an ${code} installer spawn retries through elevate.exe with no error and quits`, async () => {
+      const f = installedFixture({ file: installer, spawnErrors: [code] })
+      f.owner.restart()
+      await settle()
+      assert.deepEqual(f.calls.map(([command]) => command), ['installer.exe', 'elevate.exe'])
+      assert.deepEqual(f.calls[1][1], [installer, '--updated', '--force-run'])
+      assert.deepEqual(f.snapshot(), { exited: true, restored: 0, spawns: 2, opens: 0, installs: 1, errors: 0 })
+    })
+  }
+  await t.test('an installer that requires admin rights starts through elevate.exe', async () => {
+    const f = installedFixture({ file: installer, adminRights: true })
+    f.owner.restart()
+    await settle()
+    assert.deepEqual(f.calls.map(([command]) => command), ['elevate.exe'])
+    assert.equal(f.snapshot().exited, true)
+  })
+  await t.test('elevate.exe failing to start recovers like any asynchronous installer error', async () => {
+    const f = installedFixture({ file: installer, spawnErrors: ['EACCES', 'ENOENT'] })
+    f.owner.restart()
+    await settle()
+    assert.deepEqual(f.snapshot(), { exited: false, restored: 1, spawns: 2, opens: 0, installs: 0, errors: 1 })
+    assert.equal(f.owner.getState().status, 'error')
+    assert.equal(f.updater.autoInstallOnAppQuit, false)
+  })
+})
+
+// Arms BaseUpdater's own install-on-quit handler, as a finished download does.
+function updaterArmed(updater) {
+  updater.autoInstallOnAppQuit = true
+  updater.addQuitHandler()
+}
+
+// Characterization: today's behavior that the scheduler work replaces. Each
+// test names the change it expects.
+test('today: after an install failure, a cached re-download re-arms install-on-quit and offers Update again', async () => {
+  const f = fixture({ installFailure: true })
+  f.updater.emit('update-downloaded', { version: '2.0.0' })
+  f.owner.restart()
+  f.flush()
+  assert.equal(f.owner.getState().status, 'error')
+  assert.equal(f.updater.autoInstallOnAppQuit, false)
+  // electron-updater re-emits update-downloaded from its cache for the same version.
+  f.updater.checkForUpdates = async () => {
+    f.updater.emit('update-downloaded', { version: '2.0.0' })
+    return { downloadPromise: Promise.resolve() }
+  }
+  await f.owner.check()
+  // Planned: an automatic check must not re-arm or offer the failed version.
+  assert.equal(f.owner.getState().status, 'ready')
+  assert.equal(f.updater.autoInstallOnAppQuit, true)
+})
+
+test('today: an updater error while an update is ready replaces ready with an error', () => {
+  const f = fixture()
+  f.updater.emit('update-downloaded', { version: '2.0.0' })
+  f.updater.emit('error', new Error('late provider error'))
+  // Planned: a still-valid downloaded installer keeps Update available.
+  assert.equal(f.owner.getState().status, 'error')
+  assert.equal(f.owner.restart().ok, false)
+})
+
+test('today: a failed check publishes its error twice, from the event and the rejection', async () => {
+  const f = fixture()
+  f.updater.checkForUpdates = async () => {
+    f.updater.emit('error', new Error('offline'))
+    throw new Error('offline')
+  }
+  assert.equal((await f.owner.check()).ok, false)
+  // Planned: one published error per failure.
+  assert.deepEqual(f.changes.map((state) => state.status), ['checking', 'error', 'error'])
 })
