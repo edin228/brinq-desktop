@@ -32,7 +32,20 @@ function fixture({ packaged = true, dirty = false, leave = false, installFailure
   let quits = 0
   let exited = false
   let windows = []
-  updater.quitAndInstall = () => {
+  const installArgs = []
+  // A fake clock and timers: `advance(ms)` runs timers that come due.
+  const clock = { now: 1_000_000 }
+  const timers = new Set()
+  const setTimer = (fn, ms) => { const timer = { fn, at: clock.now + ms }; timers.add(timer); return timer }
+  const clearTimer = (timer) => timers.delete(timer)
+  const advance = (ms) => {
+    clock.now += ms
+    for (const timer of [...timers].sort((a, b) => a.at - b.at)) {
+      if (timer.at <= clock.now && timers.delete(timer)) timer.fn()
+    }
+  }
+  updater.quitAndInstall = (...args) => {
+    installArgs.push(args)
     installs++
     assert.equal(windows.length, 0, 'installation must wait until all windows closed')
     if (asyncInstallFailure) {
@@ -54,10 +67,14 @@ function fixture({ packaged = true, dirty = false, leave = false, installFailure
     app.emit('will-quit', event)
     if (!event.defaultPrevented) { exited = true; app.emit('quit', {}, 0) }
   }
-  const owner = createUpdateStatus({ app, updater, schedule: (fn) => scheduled.push(fn), onChange: (state) => changes.push(state), restoreWindow: () => { restored++ } })
+  app.getVersion = () => '1.3.6'
+  const owner = createUpdateStatus({
+    app, updater, schedule: (fn) => scheduled.push(fn), onChange: (state) => changes.push(state), restoreWindow: () => { restored++ },
+    now: () => clock.now, setTimer, clearTimer,
+  })
   const { window, prompts } = guardedWindow(new EventEmitter(), () => owner, leave)
   windows.push(window)
-  return { app, updater, owner, changes, window, prompts, flush() { while (scheduled.length) scheduled.shift()() }, get restored() { return restored }, get installs() { return installs }, get quits() { return quits }, get exited() { return exited } }
+  return { app, updater, owner, changes, window, prompts, installArgs, timers, advance, clock, flush() { while (scheduled.length) scheduled.shift()() }, get restored() { return restored }, get installs() { return installs }, get quits() { return quits }, get exited() { return exited } }
 }
 
 test('unpackaged checks are unavailable and launch checks happen once', async () => {
@@ -123,7 +140,7 @@ test('dirty window veto prevents installer and relaunch and restores normal tray
   assert.equal(f.app.isQuitting, false)
   assert.equal(f.restored, 1)
   assert.equal(f.app.listenerCount('will-quit'), 0)
-  assert.match(f.owner.getState().message, /Restart canceled/)
+  assert.match(f.owner.getState().message, /Update postponed/)
   assert.equal(f.prompts.length, 1)
 })
 
@@ -277,14 +294,15 @@ test('installed updater contract: missing NSIS installer recovers before its sil
     assert.deepEqual(f.snapshot(), { exited: true, restored: 0, spawns: 1, opens: 1, installs: 0, errors: 0 })
   })
   for (const [label, file] of [['missing', missing], ['directory', directory], ['absent metadata', null]]) {
-    await t.test(`${label} installer recovers without invoking native execution`, async () => {
+    await t.test(`${label} installer is refused before any window closes`, async () => {
       const f = installedFixture({ file })
-      f.owner.restart()
+      assert.equal(f.owner.restart().ok, false)
       await settle()
-      assert.deepEqual(f.snapshot(), { exited: false, restored: 1, spawns: 0, opens: 0, installs: 0, errors: 0 })
+      assert.deepEqual(f.snapshot(), { exited: false, restored: 0, spawns: 0, opens: 0, installs: 0, errors: 0 })
       assert.equal(f.owner.getState().status, 'error')
+      assert.equal(f.owner.getState().failure, 'install')
       assert.equal(f.updater.autoInstallOnAppQuit, false)
-      assert.equal(f.app.isQuitting, false)
+      assert.ok(!f.app.isQuitting)
     })
   }
   await t.test('checks again after restart is requested, immediately before installer invocation', async () => {
@@ -322,13 +340,13 @@ test('installed updater contract: missing NSIS installer recovers before its sil
     assert.equal(f.snapshot().restored, 0)
   })
 
-  // The assisted installer shows its own pages and relaunches Brinq only from
-  // its Finish page: --force-run is ignored unless /S is also given.
-  await t.test('Restart to update runs the assisted installer: --updated --force-run, never /S', async () => {
+  // The assisted installer reopens Brinq by itself only when silent:
+  // --force-run is ignored without /S (installSection.nsh in app-builder-lib).
+  await t.test('Restart to update installs silently and reopens Brinq: --updated /S --force-run', async () => {
     const f = installedFixture({ file: installer })
     f.owner.restart()
     await settle()
-    assert.deepEqual(f.calls, [['installer.exe', ['--updated', '--force-run']]])
+    assert.deepEqual(f.calls, [['installer.exe', ['--updated', '/S', '--force-run']]])
   })
   await t.test('an ordinary quit installs without installer pages and without relaunching', async () => {
     const f = installedFixture({ file: installer, managed: false })
@@ -354,7 +372,7 @@ test('installed updater contract: missing NSIS installer recovers before its sil
       f.owner.restart()
       await settle()
       assert.deepEqual(f.calls.map(([command]) => command), ['installer.exe', 'elevate.exe'])
-      assert.deepEqual(f.calls[1][1], [installer, '--updated', '--force-run'])
+      assert.deepEqual(f.calls[1][1], [installer, '--updated', '/S', '--force-run'])
       assert.deepEqual(f.snapshot(), { exited: true, restored: 0, spawns: 2, opens: 0, installs: 1, errors: 0 })
     })
   }
@@ -381,42 +399,208 @@ function updaterArmed(updater) {
   updater.addQuitHandler()
 }
 
-// Characterization: today's behavior that the scheduler work replaces. Each
-// test names the change it expects.
-test('today: after an install failure, a cached re-download re-arms install-on-quit and offers Update again', async () => {
-  const f = fixture({ installFailure: true })
-  f.updater.emit('update-downloaded', { version: '2.0.0' })
-  f.owner.restart()
-  f.flush()
-  assert.equal(f.owner.getState().status, 'error')
-  assert.equal(f.updater.autoInstallOnAppQuit, false)
-  // electron-updater re-emits update-downloaded from its cache for the same version.
+const ready = (f, version = '2.0.0') => f.updater.emit('update-downloaded', { version })
+// A check that finds the same version already downloaded, as
+// electron-updater's cache reports it.
+const cachedCheck = (f, version = '2.0.0') => {
   f.updater.checkForUpdates = async () => {
-    f.updater.emit('update-downloaded', { version: '2.0.0' })
+    f.updater.emit('checking-for-update')
+    f.updater.emit('update-available', { version })
+    f.updater.emit('update-downloaded', { version })
     return { downloadPromise: Promise.resolve() }
   }
-  await f.owner.check()
-  // Planned: an automatic check must not re-arm or offer the failed version.
+}
+
+test('after an install failure, background checks never re-arm or offer that version', async () => {
+  const f = fixture({ installFailure: true })
+  ready(f)
+  f.owner.restart()
+  f.flush()
+  assert.equal(f.owner.getState().failure, 'install')
+  assert.match(f.owner.getState().message, /still on version 1\.3\.6\. Try again/)
+  cachedCheck(f)
+  const changes = f.changes.length
+  assert.equal((await f.owner.check()).ok, true)
+  assert.equal(f.owner.getState().failure, 'install', 'the install notice stays')
+  assert.equal(f.changes.length, changes, 'a background check does not flicker the state')
+  assert.equal(f.updater.autoInstallOnAppQuit, false)
+  // A person's Try again offers it once more and arms install-on-quit.
+  f.clock.now += 10_000
+  await f.owner.check({ manual: true })
   assert.equal(f.owner.getState().status, 'ready')
+  assert.equal(f.updater.autoInstallOnAppQuit, true)
+  // A second failure of the same version stops offering it, even to a person.
+  f.owner.restart()
+  f.flush()
+  assert.match(f.owner.getState().message, /Reinstall Brinq/)
+  f.clock.now += 10_000
+  await f.owner.check({ manual: true })
+  assert.equal(f.owner.getState().status, 'error')
+  assert.match(f.owner.getState().message, /Reinstall Brinq/)
+  assert.equal(f.updater.autoInstallOnAppQuit, false)
+  // A newer version is offered as usual.
+  cachedCheck(f, '2.0.1')
+  f.clock.now += 10_000
+  await f.owner.check()
+  assert.equal(f.owner.getState().status, 'ready')
+  assert.equal(f.owner.getState().version, '2.0.1')
   assert.equal(f.updater.autoInstallOnAppQuit, true)
 })
 
-test('today: an updater error while an update is ready replaces ready with an error', () => {
+test('an updater error while an update is ready keeps it ready', () => {
   const f = fixture()
-  f.updater.emit('update-downloaded', { version: '2.0.0' })
+  ready(f)
   f.updater.emit('error', new Error('late provider error'))
-  // Planned: a still-valid downloaded installer keeps Update available.
-  assert.equal(f.owner.getState().status, 'error')
-  assert.equal(f.owner.restart().ok, false)
+  assert.equal(f.owner.getState().status, 'ready')
+  assert.equal(f.owner.restart().ok, true)
 })
 
-test('today: a failed check publishes its error twice, from the event and the rejection', async () => {
+test('a failed check publishes one error, labelled by phase and by who asked', async () => {
   const f = fixture()
   f.updater.checkForUpdates = async () => {
     f.updater.emit('error', new Error('offline'))
     throw new Error('offline')
   }
   assert.equal((await f.owner.check()).ok, false)
-  // Planned: one published error per failure.
-  assert.deepEqual(f.changes.map((state) => state.status), ['checking', 'error', 'error'])
+  assert.deepEqual(f.changes.map((state) => state.status), ['checking', 'error'])
+  assert.deepEqual(f.owner.getState(), { status: 'error', failure: 'check', manual: false, message: "Brinq couldn't check for updates. It will try again. You can keep working." })
+  // A download that fails after its error event reports once, as a download.
+  f.updater.checkForUpdates = async () => {
+    f.updater.emit('update-available', { version: '2.0.0' })
+    return { downloadPromise: new Promise((_resolve, reject) => setImmediate(() => { f.updater.emit('error', new Error('reset')); reject(new Error('reset')) })) }
+  }
+  f.clock.now += 10_000
+  const before = f.changes.length
+  await f.owner.check({ manual: true })
+  assert.deepEqual(f.changes.slice(before).map((state) => state.status), ['checking', 'downloading', 'error'])
+  assert.equal(f.owner.getState().failure, 'download')
+  assert.equal(f.owner.getState().manual, true)
+})
+
+test('GitHub rate limits hold every check for an hour, with or without the status code', async () => {
+  for (const error of [Object.assign(new Error('HTTP error: 429'), { statusCode: 429 }), new Error('Unable to find latest version on GitHub: API rate limit exceeded')]) {
+    const f = fixture()
+    let calls = 0
+    f.updater.checkForUpdates = async () => { calls++; throw error }
+    const result = await f.owner.check()
+    assert.equal(result.retryAt, f.clock.now + 60 * 60 * 1000)
+    assert.match(f.owner.getState().message, /right now/)
+    f.clock.now += 30 * 60 * 1000
+    assert.equal((await f.owner.check({ manual: true })).retryAt, result.retryAt)
+    assert.equal(calls, 1, 'no request while limited, even when a person asks')
+    f.clock.now += 31 * 60 * 1000
+    await f.owner.check()
+    assert.equal(calls, 2)
+  }
+})
+
+test('a person asking again within seconds reuses the last answer; checks skip while quitting', async () => {
+  const f = fixture()
+  let calls = 0
+  f.updater.checkForUpdates = async () => { calls++; f.updater.emit('update-not-available'); return {} }
+  await f.owner.check({ manual: true })
+  await f.owner.check({ manual: true })
+  assert.equal(calls, 1)
+  await f.owner.check()
+  assert.equal(calls, 2, 'the schedule is not held back by the cooldown')
+  f.app.isQuitting = true
+  assert.equal((await f.owner.check()).ok, false)
+  assert.equal(calls, 2)
+})
+
+test('restart publishes the restarting phase at once and refuses a second request plainly', () => {
+  const f = fixture({ dirty: true })
+  ready(f)
+  assert.equal(f.owner.restart().ok, true)
+  assert.deepEqual(f.owner.getState(), { status: 'ready', version: '2.0.0', phase: 'restarting', message: 'Updating… Brinq will reopen.' })
+  assert.deepEqual(f.changes.at(-1), f.owner.getState())
+  const again = f.owner.restart()
+  assert.equal(again.ok, false)
+  assert.equal(again.error, 'Brinq is already restarting to update.')
+  assert.equal(fixture().owner.restart().error, 'Download an update before restarting.')
+})
+
+test('Stay returns to ready, keeps install-on-quit armed, and repeated stops are harmless', () => {
+  const f = fixture({ dirty: true })
+  ready(f)
+  f.owner.restart()
+  f.flush()
+  f.owner.cancelQuit()
+  f.flush()
+  assert.deepEqual(f.owner.getState(), { status: 'ready', version: '2.0.0', message: 'Update postponed. Some tabs may have closed.' })
+  assert.equal(f.restored, 1, 'one restore for one stopped restart')
+  assert.equal(f.updater.autoInstallOnAppQuit, true)
+  assert.equal(f.timers.size, 0, 'no watchdog left behind')
+  assert.equal(f.installs, 0)
+})
+
+test('a restart that stalls closing windows is postponed after a minute', () => {
+  const f = fixture()
+  ready(f)
+  // A page that never answers its unsaved-work check: windows never close.
+  f.app.quit = () => { f.app.isQuitting = true }
+  f.owner.restart()
+  f.flush()
+  f.advance(59_000)
+  assert.equal(f.owner.getState().phase, 'restarting')
+  f.advance(1_000)
+  assert.equal(f.owner.getState().status, 'ready')
+  assert.equal(f.owner.getState().phase, undefined)
+  assert.match(f.owner.getState().message, /A window didn't close/)
+  assert.equal(f.app.isQuitting, false)
+  assert.equal(f.app.listenerCount('will-quit'), 0)
+  f.flush()
+  assert.equal(f.restored, 1)
+  // A late close no longer installs: the restart was given up.
+  f.app.emit('will-quit', { preventDefault() {} })
+  assert.equal(f.installs, 0)
+})
+
+test('an accepted restart installs silently and asks the installer to reopen Brinq', () => {
+  const f = fixture()
+  ready(f)
+  f.owner.restart()
+  f.flush()
+  assert.deepEqual(f.installArgs, [[true, true]])
+  assert.equal(f.timers.size, 0, 'the watchdog ends when installation starts')
+})
+
+// The web Settings page renders these shapes (brinq-mono
+// frontend/types/desktop.ts DesktopUpdateState); unknown statuses show
+// `message`. Every published state must keep to them.
+test('every published state keeps the shape the Settings page reads', async () => {
+  const shapes = {
+    idle: [], checking: [], 'up-to-date': [],
+    unavailable: ['message'], error: ['message'],
+    downloading: ['version', 'percent'], ready: ['version', 'message'],
+  }
+  const seen = []
+  const record = (f) => seen.push(...f.changes, f.owner.getState())
+  const a = fixture({ dirty: true, installFailure: true })
+  a.updater.checkForUpdates = async () => {
+    a.updater.emit('checking-for-update')
+    a.updater.emit('update-available', { version: '2.0.0' })
+    a.updater.emit('download-progress', { percent: 50 })
+    a.updater.emit('update-downloaded', { version: '2.0.0' })
+    return { downloadPromise: Promise.resolve() }
+  }
+  await a.owner.check()
+  a.owner.restart()
+  a.flush()
+  record(a)
+  const b = fixture({ installFailure: true })
+  ready(b)
+  b.owner.restart()
+  b.flush()
+  b.updater.checkForUpdates = async () => { throw new Error('offline') }
+  b.clock.now += 10_000
+  await b.owner.check({ manual: true })
+  record(b)
+  record(fixture({ packaged: false }))
+  for (const state of seen) {
+    assert.ok(state.status in shapes, `unknown status ${state.status}`)
+    for (const field of shapes[state.status]) assert.notEqual(state[field], undefined, `${state.status} lacks ${field}`)
+    if (state.message !== undefined) assert.equal(typeof state.message, 'string')
+  }
+  assert.ok(seen.some((state) => state.phase === 'restarting'))
 })

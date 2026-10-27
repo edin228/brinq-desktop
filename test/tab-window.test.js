@@ -548,6 +548,22 @@ test('Stay during quit, or a quit stopped by another window, keeps the tabs', as
   assert.equal(g.tabs.home.isDestroyed(), false)
   assert.equal(g.app.stopped, 1)
   assert.equal(g.app.quitRequests, 0)
+
+  // A pop-out's Stay can land while Home, the last page, is closing. The
+  // loop finished, but the quit was stopped: it must not quit again (which
+  // would ask the pop-out twice), and a stopped quit can bring Home back.
+  const h = fixture()
+  const other = h.open(`${BASE}/clients/1`)
+  h.tabs.home.on('destroyed', () => { h.app.quitting = false })
+  h.app.quitting = true
+  h.host.emit('close', { preventDefault() {} })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(other.isDestroyed(), true)
+  assert.equal(h.tabs.home.isDestroyed(), true)
+  assert.equal(h.app.quitRequests, 0)
+  assert.equal(h.app.stopped, 1)
+  h.tabs.ensureHome()
+  assert.equal(h.tabs.home.isDestroyed(), false)
 })
 
 test('closing from the strip keeps keyboard focus in the strip', () => {

@@ -10,6 +10,7 @@ const {
   dialog,
   screen,
   clipboard,
+  powerMonitor,
 } = require('electron')
 const { randomUUID } = require('crypto')
 const fs = require('fs')
@@ -38,6 +39,8 @@ const {
 } = require('./attachment-files')
 const { createFileActions, CAPABILITIES } = require('./file-actions')
 const { createUpdateStatus } = require('./update-status')
+const { createUpdateSchedule } = require('./update-schedule')
+const { sanitizedLogger } = require('./update-log')
 const { guardWindowUnload } = require('./unload-guard')
 const { createTabWindow } = require('./tab-window')
 const { installBrowserSignIn } = require('./browser-sign-in')
@@ -83,8 +86,11 @@ let recoveryRetry = null
 // Home could not load; the recovery window explains it until a load succeeds.
 let homeUnavailable = false
 const RECOVERY_URL = pathToFileURL(path.join(__dirname, 'offline.html')).href
+// Update records stay in the local log only, without URLs' queries or feeds.
+const updateLog = sanitizedLogger(require('electron-log'))
+const logUpdate = (event, fields) => updateLog.info(`[update] ${event} ${JSON.stringify(fields)}`)
 const updates = createUpdateStatus({
-  app, updater: autoUpdater,
+  app, updater: autoUpdater, log: logUpdate,
   onChange: (state) => {
     if (tray) updateTrayMenu()
     // Every validated app page, whether a tab or a pop-out window.
@@ -95,6 +101,7 @@ const updates = createUpdateStatus({
     showMainWindow()
   },
 })
+const updateSchedule = createUpdateSchedule({ check: () => updates.check(), log: logUpdate })
 
 // A window whose page holds unsaved work asks before closing; Stay also
 // stops a quit or update restart. Tabs ask through the tab window.
@@ -1122,7 +1129,8 @@ function createTray() {
 function updateTrayMenu() {
   const currentMode = config.getMode()
   const update = updates.getState()
-  const updateLabel = {
+  const restarting = update.phase === 'restarting'
+  const updateLabel = restarting ? 'Updating… Brinq will reopen' : {
     idle: 'Check for updates', checking: 'Checking for updates…',
     'up-to-date': 'Brinq is up to date. Check again',
     downloading: `Downloading update (${Math.round(update.percent || 0)}%)`,
@@ -1159,11 +1167,11 @@ function updateTrayMenu() {
     {
       label: updateLabel,
       enabled: ['idle', 'up-to-date', 'error'].includes(update.status),
-      click: () => updates.check(),
+      click: () => updates.check({ manual: true }),
     },
     {
-      label: 'Restart to update (closes Brinq)',
-      enabled: update.status === 'ready',
+      label: 'Restart to update (Brinq reopens)',
+      enabled: update.status === 'ready' && !restarting,
       click: () => updates.restart(),
     },
     {
@@ -1247,7 +1255,7 @@ ipcMain.on('notify', (event, title, body, data) => {
 })
 
 ipcMain.handle('update-status', (event) => validateSender(event) ? updates.getState() : null)
-ipcMain.handle('check-for-updates', (event) => validateSender(event) ? updates.check() : { ok: false, error: 'Unauthorized sender.' })
+ipcMain.handle('check-for-updates', (event) => validateSender(event) ? updates.check({ manual: true }) : { ok: false, error: 'Unauthorized sender.' })
 ipcMain.handle('restart-to-update', (event) => validateSender(event) ? updates.restart() : { ok: false, error: 'Unauthorized sender.' })
 
 ipcMain.handle('desktop-state', (event) => validateSender(event) ? desktopState() : null)
@@ -1348,8 +1356,13 @@ app.on('ready', async () => {
   )
   if (protocolArg) handleProtocolUrl(protocolArg)
 
-  autoUpdater.logger = require('electron-log')
-  updates.checkOnLaunch()
+  autoUpdater.logger = updateLog
+  // Only Windows builds publish an update feed. Elsewhere the installed app
+  // checks once at launch, as before.
+  if (app.isPackaged && process.platform === 'win32') {
+    updateSchedule.start()
+    powerMonitor.on('resume', () => updateSchedule.resume())
+  } else updates.checkOnLaunch()
 })
 
 // macOS: re-show window when dock icon clicked
@@ -1363,6 +1376,8 @@ app.on('activate', () => {
 app.on('before-quit', (event) => {
   if (!event.defaultPrevented) app.isQuitting = true
 })
+
+app.on('quit', () => updateSchedule.stop())
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

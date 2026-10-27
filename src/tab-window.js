@@ -500,8 +500,10 @@ function createTabWindow({
     }
     if (entries.size === 0) return
     event.preventDefault()
+    // Another window may stop the quit while the last page closes; then the
+    // loop finished but must not quit again.
     closeAllForQuit().then((closed) => {
-      if (closed) requestQuit()
+      if (closed && isQuitting()) requestQuit()
       else onQuitStopped()
     })
   })
