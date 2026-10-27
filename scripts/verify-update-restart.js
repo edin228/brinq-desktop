@@ -66,8 +66,9 @@ async function main() {
   updater.installerPath = path.join(directory, 'Brinq-Setup.exe')
   fs.writeFileSync(updater.installerPath, 'fixture; never executed')
   const installs = []
-  updater.quitAndInstall = () => {
+  updater.quitAndInstall = (...args) => {
     installs.push({
+      args,
       windows: BrowserWindow.getAllWindows().filter((window) => !window.isDestroyed()).length,
       pages: allContents.getAllWebContents().filter((wc) => !wc.isDestroyed()).length,
     })
@@ -76,16 +77,15 @@ async function main() {
 
   let tabs = null
   let quitStops = 0
-  // The same wiring main.js uses, with the real app.quit(). A Stay can
-  // arrive after the main window already closed; like main.js, restoring
-  // then creates a new main window with a fresh Home.
-  const updates = createUpdateStatus({
-    app, updater,
-    restoreWindow: () => {
-      if (tabs.window.isDestroyed()) createHost()
-      tabs.window.show()
-    },
-  })
+  // The same wiring main.js uses, with the real app.quit(). Showing the
+  // main window works like main.js showMainWindow: a closed window is
+  // created again, and a closed Home comes back.
+  const showMain = () => {
+    if (tabs.window.isDestroyed()) createHost()
+    tabs.ensureHome()
+    tabs.window.show()
+  }
+  const updates = createUpdateStatus({ app, updater, restoreWindow: showMain })
   app.on('browser-window-created', (_event, window) => {
     guardWindowUnload({ window, dialog, onStay: () => updates.cancelQuit() })
   })
@@ -107,7 +107,7 @@ async function main() {
       onQuitStopped: () => {
         quitStops++
         updates.cancelQuit()
-        tabs.window.show()
+        showMain()
       },
     })
     security.setTabHost({ available: tabs.available, openTab: (args) => tabs.openTab(args) })
@@ -167,7 +167,8 @@ async function main() {
     check('the pop-out draft holds unsaved work', await type(popout.webContents, 'p'))
     answers.push(1)
     check('Restart to update is accepted', updates.restart().ok === true)
-    check('a second request while it runs is refused', updates.restart().ok === false)
+    check('the restarting phase is published at once', state().phase === 'restarting')
+    check('a second request while it runs is refused', updates.restart().error === 'Brinq is already restarting to update.')
     await until(() => !app.isQuitting && prompts.length === 1)
     // Restoring may have to create a new main window; wait for its Home.
     await until(() => !tabs.window.isDestroyed() && tabs.window.isVisible() && !tabs.home.isDestroyed() && !tabs.home.isLoading())
@@ -175,7 +176,7 @@ async function main() {
     check('the pop-out asked about its unsaved changes', prompts.length === 1, JSON.stringify(prompts))
     check('Stay in a pop-out keeps the pop-out', !popout.isDestroyed())
     check('Stay in a pop-out runs no installer', installs.length === 0)
-    check('Stay in a pop-out keeps the update ready', state().status === 'ready' && /Restart canceled/.test(state().message), JSON.stringify(state()))
+    check('Stay in a pop-out keeps the update ready', state().status === 'ready' && /Update postponed/.test(state().message), JSON.stringify(state()))
     check('Stay in a pop-out ends the quit and drops the pending install', !app.isQuitting && quitListeners() === baseListeners,
       JSON.stringify({ quitting: app.isQuitting, listeners: quitListeners() - baseListeners }))
     check('Stay in a pop-out shows the main window again, with Home', tabs.window.isVisible() && tabs.home.getURL().endsWith('/home'))
@@ -184,9 +185,8 @@ async function main() {
     popout.destroy()
     if (cleanA.isDestroyed()) await open('/clients/a')
 
-    // 1b. Today: a pop-out's Stay that arrives after Home closed. The tab
-    // loop has finished, so it quits again and the pop-out is asked twice;
-    // the main window is left without Home. The scheduler work fixes both.
+    // 1b. A pop-out's Stay that arrives after Home closed: the tab loop has
+    // finished, but the quit was stopped, so it must not quit again.
     const slowBefore = BrowserWindow.getAllWindows().length
     await tabs.home.executeJavaScript(`document.getElementById('slow-popout').click()`)
     await until(() => BrowserWindow.getAllWindows().length === slowBefore + 1)
@@ -194,21 +194,17 @@ async function main() {
     await until(() => slow && !slow.webContents.isLoading())
     check('the slow pop-out draft holds unsaved work', await type(slow.webContents, 's'))
     const slowPrompts = prompts.length
-    answers.push(1, 1)
+    answers.push(1)
     check('Restart to update is accepted with a slow pop-out', updates.restart().ok === true)
-    await until(() => prompts.length >= slowPrompts + 2, 5000)
+    await until(() => prompts.length >= slowPrompts + 1, 5000)
+    await until(() => !tabs.window.isDestroyed() && tabs.window.isVisible() && !tabs.home.isDestroyed() && !tabs.home.isLoading())
     await wait(800)
-    const homeGone = tabs.window.isDestroyed() || tabs.home.isDestroyed()
-    check('today: a Stay after Home closed is asked twice', prompts.length === slowPrompts + 2, JSON.stringify(prompts.slice(slowPrompts)))
-    check('today: a Stay after Home closed leaves the main window without Home', homeGone)
+    check('a Stay after Home closed is asked once', prompts.length === slowPrompts + 1, JSON.stringify(prompts.slice(slowPrompts)))
+    check('a Stay after Home closed brings the main window back with Home',
+      !tabs.window.isDestroyed() && tabs.window.isVisible() && !tabs.home.isDestroyed() && tabs.home.getURL().endsWith('/home'))
     check('a Stay after Home closed runs no installer and keeps the update ready',
       installs.length === 0 && state().status === 'ready' && !app.isQuitting && quitListeners() === baseListeners && !slow.isDestroyed())
-    // Harness recovery only: start again with a fresh main window.
     slow.destroy()
-    if (!tabs.window.isDestroyed()) tabs.window.destroy()
-    createHost()
-    tabs.window.show()
-    await until(() => tabs.home.getURL().endsWith('/home') && !tabs.home.isLoading())
 
     // 2. A tab in the middle of the close order answers Stay after earlier
     // tabs already closed.
@@ -231,7 +227,7 @@ async function main() {
     check('tabs before the draft closed; the draft and later tabs stayed', first.isDestroyed() && !draft.isDestroyed() && !last.isDestroyed() && !tabs.home.isDestroyed(),
       JSON.stringify({ first: first.isDestroyed(), draft: draft.isDestroyed(), last: last.isDestroyed() }))
     check('Stay on a tab runs no installer', installs.length === 0)
-    check('Stay on a tab keeps the update ready', state().status === 'ready' && /Restart canceled/.test(state().message))
+    check('Stay on a tab keeps the update ready', state().status === 'ready' && /Update postponed/.test(state().message))
     check('Stay on a tab ends the quit and drops the pending install', !app.isQuitting && quitListeners() === baseListeners)
     check('Stay on a tab shows the main window', tabs.window.isVisible())
 
@@ -242,6 +238,7 @@ async function main() {
     check('Leave lets the restart reach the installer', await until(() => installs.length > 0))
     await wait(500)
     check('the installer ran exactly once', installs.length === 1, JSON.stringify(installs))
+    check('the installer runs silently and reopens Brinq', JSON.stringify(installs[0]?.args) === '[true,true]')
     check('the installer ran after every window and page closed', installs[0]?.windows === 0 && installs[0]?.pages === 0, JSON.stringify(installs[0]))
     check('the main window and every tab closed', tabs.window.isDestroyed() && draft.isDestroyed() && last.isDestroyed())
   } catch (error) {
