@@ -9,7 +9,11 @@ const ICONS = {
   email: '<svg width="14" height="14" viewBox="0 0 24 24"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>',
   page: '<svg width="14" height="14" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 4v4"/><path d="M2 8h20"/><path d="M6 4v4"/></svg>',
   spinner: '<svg class="spinner" width="14" height="14" viewBox="0 0 14 14"><circle class="track" cx="7" cy="7" r="5.5"/><path class="arc" d="M7 1.5a5.5 5.5 0 0 1 5.5 5.5"/></svg>',
+  update: '<svg width="14" height="14" viewBox="0 0 24 24"><path d="M12 2a10 10 0 0 1 7.38 16.75"/><path d="m16 12-4-4-4 4"/><path d="M12 16V8"/><path d="M2.5 8.875a10 10 0 0 0-.5 3"/><path d="M2.83 16a10 10 0 0 0 2.43 3.4"/><path d="M4.636 5.235a10 10 0 0 1 .891-.857"/><path d="M8.644 21.42a10 10 0 0 0 7.631-.38"/></svg>',
+  alert: '<svg width="14" height="14" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></svg>',
 }
+
+
 
 const FAILURES = {
   load: ['This page couldn’t load', 'Check your connection and try again.'],
@@ -22,15 +26,26 @@ const homeButton = document.querySelector('.home')
 const tabsElement = document.querySelector('.tabs')
 const refreshButton = document.querySelector('.refresh')
 const newTabButton = document.querySelector('.new-tab')
+const updateGroup = document.querySelector('.update')
+const updateNote = updateGroup.querySelector('.update-note')
+const updateButton = updateGroup.querySelector('.update-button')
+const updateFailed = updateGroup.querySelector('.update-failed')
+const updateFailedLabel = updateGroup.querySelector('.update-failed-label')
+const updateDescription = document.getElementById('update-description')
+const updateStatus = document.querySelector('.update-status')
 const panel = document.querySelector('.panel')
 const retryButton = panel.querySelector('.retry')
 const tabElements = new Map()
 let state = { tabs: [], selectedId: 1 }
 let focusedId = null
+// The update view last shown, and a failure message the user dismissed.
+let updateView = null
+let dismissedFailure = null
 
 homeButton.innerHTML = ICONS.home
 refreshButton.innerHTML = ICONS.refresh
 newTabButton.innerHTML = ICONS.plus
+updateGroup.querySelector('.update-dismiss').innerHTML = ICONS.close
 
 function iconHtml(tab) {
   return tab.loading ? ICONS.spinner : ICONS[tab.kind] || ICONS.page
@@ -130,6 +145,7 @@ function render(next) {
   if (drag && !next.tabs.some((tab) => tab.id === drag.id)) clearDrag()
   root.dataset.theme = next.theme === 'light' ? 'light' : 'dark'
   root.dataset.platform = next.platform || ''
+  renderUpdate(next.update)
   const home = next.tabs.find((tab) => tab.home)
   homeButton.setAttribute('aria-selected', String(next.selectedId === 1))
   homeButton.title = home && home.label !== 'Brinq' ? `Home: ${home.label}` : 'Home'
@@ -173,6 +189,51 @@ function render(next) {
     retryButton.disabled = false
     retryButton.dataset.id = String(selected.id)
   }
+}
+
+// The update action: main sends a small view of the updater, never paths,
+// URLs or commands. Ready shows "Update"; restarting disables it; a failure
+// shows a notice with Try again until dismissed. Otherwise nothing shows.
+// The button explains nothing: its label is its name. Only a failure has
+// more to say, in the notice's tooltip.
+function setUpdateButton(icon, label, disabled) {
+  updateButton.innerHTML = icon
+  const text = document.createElement('span')
+  text.textContent = label
+  updateButton.append(text)
+  updateButton.disabled = disabled
+}
+
+function renderUpdate(update) {
+  const view = update?.view ?? null
+  // A dismissal covers that failure only; the next one shows again.
+  if (view !== 'failed') dismissedFailure = null
+  const failed = view === 'failed' && update.message !== dismissedFailure
+  const action = view === 'ready' || view === 'restarting'
+  updateGroup.hidden = !(action || failed)
+  updateButton.hidden = !action
+  updateFailed.hidden = !failed
+  updateNote.hidden = !(view === 'ready' && update.note)
+  if (view === 'ready') {
+    setUpdateButton(ICONS.update, 'Update', false)
+    if (update.note) updateNote.textContent = update.note
+  } else if (view === 'restarting') setUpdateButton(ICONS.spinner, 'Updating…', true)
+  updateDescription.textContent = failed ? update.message : ''
+  if (failed) {
+    updateFailedLabel.innerHTML = ICONS.alert
+    const text = document.createElement('span')
+    text.textContent = 'Update failed'
+    updateFailedLabel.append(text)
+    updateFailed.title = update.message
+  }
+  // Announce arrivals once, politely; never move focus.
+  if (view !== updateView) {
+    if (view === 'ready' && updateView === 'restarting') updateStatus.textContent = update.noteDetail || ''
+    else if (view === 'ready') updateStatus.textContent = 'Update ready.'
+    else if (failed) updateStatus.textContent = `Update failed. ${update.message}`
+    else updateStatus.textContent = ''
+  }
+  updateView = view
 }
 
 // Dragging a tab reorders it: the others slide aside and the tab drops into
@@ -253,6 +314,12 @@ homeButton.addEventListener('click', () => bridge.home(true))
 homeButton.addEventListener('contextmenu', (event) => openMenu(event, homeButton, 1))
 refreshButton.addEventListener('click', () => bridge.reload())
 newTabButton.addEventListener('click', () => bridge.newTab())
+updateButton.addEventListener('click', () => { if (!updateButton.disabled) bridge.restartUpdate() })
+updateGroup.querySelector('.update-retry').addEventListener('click', () => bridge.retryUpdate())
+updateGroup.querySelector('.update-dismiss').addEventListener('click', () => {
+  dismissedFailure = state.update?.message ?? null
+  renderUpdate(state.update)
+})
 retryButton.addEventListener('click', () => {
   retryButton.disabled = true
   bridge.retry(Number(retryButton.dataset.id))
@@ -300,6 +367,15 @@ document.querySelector('.tablist').addEventListener('keyup', (event) => {
 document.querySelector('.tablist').addEventListener('focusin', (event) => {
   const button = event.target.closest('[role="tab"]')
   if (button) { focusedId = idOf(button); updateRovingFocus() }
+})
+
+// F6 from the page lands on the current tab, as Tab into the list would.
+// A failed tab's panel is part of this page, so F6 there moves between the
+// header and the panel's Try again.
+bridge.onFocusRequest?.((mode) => {
+  const header = focusable().find((button) => button.tabIndex === 0) || homeButton
+  if (mode === 'toggle' && !panel.hidden && !panel.contains(document.activeElement)) retryButton.focus()
+  else header.focus()
 })
 
 bridge.onState(render)

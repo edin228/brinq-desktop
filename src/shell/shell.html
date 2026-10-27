@@ -18,6 +18,18 @@
     <span class="divider" aria-hidden="true"></span>
     <button class="icon-button new-tab" type="button" aria-label="New tab" title="New tab"></button>
     <div class="drag" aria-hidden="true"></div>
+    <!-- Shown only when an update is ready, restarting or failed. -->
+    <div class="update" hidden>
+      <span class="update-note" hidden></span>
+      <button class="update-button" type="button" hidden></button>
+      <div class="update-failed" hidden>
+        <span class="update-failed-label"></span>
+        <button class="update-retry" type="button" aria-describedby="update-description">Try again</button>
+        <button class="update-dismiss" type="button" aria-label="Dismiss update message" title="Dismiss"></button>
+      </div>
+      <span class="visually-hidden" id="update-description"></span>
+    </div>
+    <span class="visually-hidden update-status" role="status"></span>
   </header>
   <main class="panel" hidden>
     <div class="panel-body" role="alert">

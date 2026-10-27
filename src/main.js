@@ -38,7 +38,7 @@ const {
   MAX_EMAIL_BYTES,
 } = require('./attachment-files')
 const { createFileActions, CAPABILITIES } = require('./file-actions')
-const { createUpdateStatus } = require('./update-status')
+const { createUpdateStatus, headerView } = require('./update-status')
 const { createUpdateSchedule } = require('./update-schedule')
 const { sanitizedLogger } = require('./update-log')
 const { guardWindowUnload } = require('./unload-guard')
@@ -92,8 +92,10 @@ const logUpdate = (event, fields) => updateLog.info(`[update] ${event} ${JSON.st
 const updates = createUpdateStatus({
   app, updater: autoUpdater, log: logUpdate,
   onCheckEnd: (result) => updateSchedule.record(result),
+  abandonClose: () => tabWindow?.abandonQuit(),
   onChange: (state) => {
     if (tray) updateTrayMenu()
+    tabWindow?.refreshUpdate()
     // Every validated app page, whether a tab or a pop-out window.
     for (const contents of windowSecurity.appContents()) contents.send('update-status', state)
   },
@@ -1049,6 +1051,12 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
     },
     isQuitting: () => !!app.isQuitting,
     requestQuit: () => app.quit(),
+    updateView: () => headerView(updates.getState()),
+    // Fixed commands from the validated strip; the owner checks readiness.
+    onUpdateCommand: (command) => {
+      if (command === 'restart-update') updates.restart()
+      else updates.check({ manual: true })
+    },
     onQuitStopped: () => {
       updates.cancelQuit()
       // Quitting closed the recovery window; bring it back if Home still

@@ -20,7 +20,7 @@ function load(protocol = 'file:', isMainFrame = true, state = { selectedId: 1 })
 
 test('the strip bridge exposes fixed tab commands only', () => {
   const { api, calls } = load()
-  assert.deepEqual(Object.keys(api).sort(), ['close', 'home', 'menu', 'move', 'newTab', 'onState', 'reload', 'retry', 'select'])
+  assert.deepEqual(Object.keys(api).sort(), ['close', 'home', 'menu', 'move', 'newTab', 'onFocusRequest', 'onState', 'reload', 'restartUpdate', 'retry', 'retryUpdate', 'select'])
   api.select(4, true); api.select(5, 'yes'); api.close(4); api.retry(4); api.newTab(); api.home(true); api.reload(); api.move(4, 2); api.menu(4, 120, 18); api.menu(4, 96, 36, true); api.menu(4, 1, 2, 'yes')
   assert.equal(JSON.stringify(calls), JSON.stringify([
     ['tabs:command', 'select', 4, { focus: true }],
@@ -55,4 +55,26 @@ test('web pages, other documents and subframes get no strip bridge', () => {
   for (const [protocol, isMainFrame] of [['https:', true], ['http:', true], ['about:', true], ['file:', false]]) {
     assert.equal(load(protocol, isMainFrame).api, undefined)
   }
+})
+
+test('the update commands carry nothing from the page', () => {
+  const { api, calls } = load()
+  api.restartUpdate('https://evil.example/installer.exe', { path: 'C:/x' })
+  api.retryUpdate({ url: 'https://evil.example/latest.yml' })
+  assert.equal(JSON.stringify(calls), JSON.stringify([
+    ['tabs:command', 'restart-update', null, null],
+    ['tabs:command', 'retry-update', null, null],
+  ]))
+})
+
+test('a focus request reaches the strip as header or toggle only, without IPC event data', () => {
+  const { api, ipc } = load()
+  const received = []
+  const off = api.onFocusRequest((...args) => received.push(args))
+  ipc.emit('tabs:focus', { sender: 'main' }, 'header')
+  ipc.emit('tabs:focus', { sender: 'main' }, 'toggle')
+  ipc.emit('tabs:focus', { sender: 'main' }, { evil: true })
+  assert.deepEqual(received, [['header'], ['toggle'], ['header']])
+  off()
+  assert.equal(ipc.listenerCount('tabs:focus'), 0)
 })

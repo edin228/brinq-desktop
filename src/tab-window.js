@@ -30,6 +30,9 @@ function createTabWindow({
   // Quit wiring: whether the app is quitting, how to quit again once every
   // tab closed, and what to do when an unsaved-work prompt stops the quit.
   isQuitting = () => false, requestQuit = () => {}, onQuitStopped = () => {},
+  // The header's update action: main's small view of the updater, and the
+  // two fixed commands the strip may send for it.
+  updateView = () => null, onUpdateCommand = () => {},
 }) {
   const appPreferences = () => ({
     preload: preloadPath, contextIsolation: true, nodeIntegration: false,
@@ -58,6 +61,8 @@ function createTabWindow({
   let pushScheduled = false
   let disposed = false
   let quitting = null
+  // Each quit's close loop; abandonQuit() retires the current one.
+  let quitAttempt = 0
   // One pending link label per opener page: its latest gesture.
   const linkLabels = new Map()
   const watchedOpeners = new WeakSet()
@@ -78,6 +83,7 @@ function createTabWindow({
           kind: tabKind(entry.url), loading: entry.loading, failed: entry.failed,
         }
       }),
+      update: updateView(),
     }
   }
 
@@ -168,11 +174,27 @@ function createTabWindow({
     if (action === 'zoom-reset') return contentsOf.setZoomLevel(0)
   }
 
-  function onInput(event, input) {
+  // `from` is the page or strip the key was pressed in.
+  function onInput(event, input, from) {
     const action = shortcutAction(input, platform)
     if (!action) return
     event.preventDefault()
-    dispatch(action)
+    if (action === 'switch-pane') switchPane(from)
+    else dispatch(action)
+  }
+
+  // F6 and Shift+F6 move keyboard focus between the page and the header:
+  // they are separate pages, so Tab alone cannot cross between them. A
+  // failed tab shows its panel in the strip, so the strip moves focus itself.
+  function switchPane(from) {
+    if (!alive()) return
+    const entry = selectedEntry()
+    if (from === strip && entry && !entry.failed && !entry.contents.isDestroyed()) {
+      entry.contents.focus()
+      return
+    }
+    strip.focus()
+    strip.send('tabs:focus', from === strip ? 'toggle' : 'header')
   }
 
   function reload(entry, hard) {
@@ -221,7 +243,7 @@ function createTabWindow({
     host.contentView.addChildView(view)
     layout()
     view.setVisible(false)
-    contents.on('before-input-event', onInput)
+    contents.on('before-input-event', (event, input) => onInput(event, input, contents))
     contents.on('page-title-updated', (_event, title) => {
       entry.title = title
       // The page named itself; the link's name is no longer needed.
@@ -399,18 +421,30 @@ function createTabWindow({
   // prompt is answered in context. Resolves false if the user chose Stay.
   function closeAllForQuit() {
     if (quitting) return quitting
-    quitting = (async () => {
+    const attempt = ++quitAttempt
+    const current = (async () => {
       const order = [...list.ids().filter((id) => id !== HOME_ID), HOME_ID]
       for (const id of order) {
-        // Another window (an email pop-out) may have stopped the quit; keep
-        // the remaining tabs rather than closing them for nothing.
-        if (!isQuitting()) return false
+        // Another window (an email pop-out) may have stopped the quit, or
+        // it was abandoned; keep the remaining tabs rather than closing them
+        // for nothing.
+        if (!isQuitting() || attempt !== quitAttempt) return false
         const entry = entries.get(id)
         if (entry && !(await closeAndWait(entry))) return false
       }
-      return true
-    })().finally(() => { quitting = null })
+      return attempt === quitAttempt
+    })().finally(() => { if (quitting === current) quitting = null })
+    quitting = current
     return quitting
+  }
+
+  // A page that never answers its unsaved-work check holds the close loop.
+  // Give up on it, so the next quit or update asks every page again.
+  function abandonQuit() {
+    if (!quitting) return
+    quitAttempt++
+    quitting = null
+    for (const entry of entries.values()) entry.settle?.(false)
   }
 
   function reportTheme(contents, value) {
@@ -465,6 +499,7 @@ function createTabWindow({
     if (command === 'new') return newTab(), true
     if (command === 'home') return select(HOME_ID, { focus: options?.focus === true })
     if (command === 'reload') return dispatch('reload'), true
+    if (command === 'restart-update' || command === 'retry-update') return onUpdateCommand(command), true
     if (!Number.isSafeInteger(id) || !entries.has(id)) return false
     if (command === 'select') return select(id, { focus: options?.focus === true })
     if (command === 'close') return closeTab(id, { focus: false })
@@ -482,7 +517,7 @@ function createTabWindow({
   strip.setWindowOpenHandler(() => ({ action: 'deny' }))
   strip.on('will-navigate', (event) => event.preventDefault())
   strip.on('will-redirect', (event) => event.preventDefault())
-  strip.on('before-input-event', onInput)
+  strip.on('before-input-event', (event, input) => onInput(event, input, strip))
   // Keep the selected tab's name as the window title.
   strip.on('page-title-updated', (event) => event.preventDefault())
   const reloadStrip = () => { if (alive()) strip.loadURL(shellUrl).catch(() => {}) }
@@ -545,10 +580,13 @@ function createTabWindow({
     dispatch,
     closeTab,
     closeAllForQuit,
+    abandonQuit,
     linkLabel,
     reportTheme,
     stripCommand,
     stripState,
+    // The updater changed: send the header its new view.
+    refreshUpdate: push,
     // Dialog owner for a tab page; null when the page is not a tab.
     windowFor: (contents) => (entryFor(contents) && alive() ? host : null),
     isTab: (contents) => !!entryFor(contents),

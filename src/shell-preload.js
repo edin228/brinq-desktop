@@ -1,7 +1,8 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
 // The tab strip gets fixed tab commands only: no destinations, files, modes
-// or other native features. Main also checks each command's sender.
+// or other native features. Main also checks each command's sender. The
+// update commands take no arguments: main decides what restart or retry do.
 if (process.isMainFrame && location.protocol === 'file:') {
   const command = (name, id, options) => ipcRenderer.send('tabs:command', name, id, options)
   contextBridge.exposeInMainWorld('brinqTabs', {
@@ -20,5 +21,14 @@ if (process.isMainFrame && location.protocol === 'file:') {
     newTab: () => command('new'),
     home: (focus) => command('home', undefined, { focus: focus === true }),
     reload: () => command('reload'),
+    restartUpdate: () => command('restart-update'),
+    retryUpdate: () => command('retry-update'),
+    // F6: main asks the strip to take keyboard focus ('header'), or, for a
+    // failed tab's panel, to move it between header and panel ('toggle').
+    onFocusRequest(callback) {
+      const handler = (_event, mode) => callback(mode === 'toggle' ? 'toggle' : 'header')
+      ipcRenderer.on('tabs:focus', handler)
+      return () => ipcRenderer.removeListener('tabs:focus', handler)
+    },
   })
 }

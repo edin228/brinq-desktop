@@ -32,9 +32,11 @@ function fixture({ packaged = true, dirty = false, leave = false, installFailure
   let quits = 0
   let exited = false
   let windows = []
+  let abandoned = 0
   const installArgs = []
   // A fake clock and timers: `advance(ms)` runs timers that come due.
-  const clock = { now: 1_000_000 }
+  // `now` is elapsed time; `wallShift` moves only the wall clock.
+  const clock = { now: 1_000_000, wallShift: 0 }
   const timers = new Set()
   const setTimer = (fn, ms) => { const timer = { fn, at: clock.now + ms }; timers.add(timer); return timer }
   const clearTimer = (timer) => timers.delete(timer)
@@ -70,11 +72,12 @@ function fixture({ packaged = true, dirty = false, leave = false, installFailure
   app.getVersion = () => '1.3.6'
   const owner = createUpdateStatus({
     app, updater, schedule: (fn) => scheduled.push(fn), onChange: (state) => changes.push(state), restoreWindow: () => { restored++ },
-    now: () => clock.now, setTimer, clearTimer,
+    now: () => clock.now + clock.wallShift, monotonic: () => clock.now, setTimer, clearTimer,
+    abandonClose: () => { abandoned++ },
   })
   const { window, prompts } = guardedWindow(new EventEmitter(), () => owner, leave)
   windows.push(window)
-  return { app, updater, owner, changes, window, prompts, installArgs, timers, advance, clock, flush() { while (scheduled.length) scheduled.shift()() }, get restored() { return restored }, get installs() { return installs }, get quits() { return quits }, get exited() { return exited } }
+  return { app, updater, owner, changes, window, prompts, installArgs, timers, advance, clock, get abandoned() { return abandoned }, flush() { while (scheduled.length) scheduled.shift()() }, get restored() { return restored }, get installs() { return installs }, get quits() { return quits }, get exited() { return exited } }
 }
 
 test('unpackaged checks are unavailable and launch checks happen once', async () => {
@@ -549,6 +552,7 @@ test('a restart that stalls closing windows is postponed after a minute', () => 
   assert.match(f.owner.getState().message, /A window didn't close/)
   assert.equal(f.app.isQuitting, false)
   assert.equal(f.app.listenerCount('will-quit'), 0)
+  assert.equal(f.abandoned, 1, 'the stuck close loop is abandoned so a retry asks every page again')
   f.flush()
   assert.equal(f.restored, 1)
   // A late close no longer installs: the restart was given up.
@@ -669,4 +673,99 @@ test('every check that reaches the feed is reported for scheduling, including a 
   // An answer given without checking is not a report.
   await owner.check({ manual: true })
   assert.deepEqual(reports, [false, true])
+})
+
+test('the header shows only an installable, installing or user-facing failed update', () => {
+  const { headerView, MESSAGES } = require('../src/update-status')
+  const cases = [
+    [{ status: 'idle' }, null],
+    [{ status: 'checking' }, null],
+    [{ status: 'up-to-date' }, null],
+    [{ status: 'downloading', version: '2.0.0', percent: 40 }, null],
+    [{ status: 'unavailable', message: 'x' }, null],
+    [{ status: 'error', failure: 'check', manual: false, message: MESSAGES.check }, null],
+    [{ status: 'error', failure: 'download', manual: false, message: MESSAGES.download }, null],
+    [{ status: 'error', failure: 'download', manual: true, message: MESSAGES.download }, { view: 'failed', message: MESSAGES.download }],
+    [{ status: 'error', failure: 'install', manual: true, message: 'm' }, { view: 'failed', message: 'm' }],
+    [{ status: 'ready', version: '2.0.0', message: MESSAGES.ready }, { view: 'ready' }],
+    [{ status: 'ready', version: '2.0.0', phase: 'restarting', message: MESSAGES.restarting }, { view: 'restarting' }],
+    [{ status: 'ready', version: '2.0.0', message: MESSAGES.postponed }, { view: 'ready', note: 'Update postponed', noteDetail: MESSAGES.postponed }],
+    [{ status: 'ready', version: '2.0.0', message: MESSAGES.stalled }, { view: 'ready', note: 'Update postponed', noteDetail: MESSAGES.stalled }],
+  ]
+  for (const [state, expected] of cases) assert.deepEqual(headerView(state), expected, JSON.stringify(state))
+})
+
+test('the installer download\'s 429 and GitHub\'s secondary limit also hold checks for an hour', async () => {
+  const { HttpExecutor } = require('builder-util-runtime')
+  // The installed downloader's own error for a 429 response.
+  class Executor extends HttpExecutor {
+    createRequest(_options, callback) {
+      const request = new EventEmitter()
+      request.end = () => callback({ statusCode: 429, statusMessage: 'Too Many Requests', headers: {} })
+      request.abort = () => {}
+      request.setTimeout = () => {}
+      return request
+    }
+  }
+  const downloadError = await new Promise((resolve) => {
+    new Executor().doDownload({ protocol: 'https:', hostname: 'github.com', path: '/x/releases/download/v1.3.7/Brinq-Setup.exe' }, { callback: resolve, options: {} }, 0)
+  })
+  assert.match(downloadError.message, /status 429/)
+  // The installed parser's error for a malformed update file whose release
+  // notes mention a rate limit, quoted before its rawData.
+  const { parseUpdateInfo } = require('electron-updater/out/providers/Provider')
+  let parseError = null
+  try { parseUpdateInfo('version: 1.3.8\nreleaseNotes: API rate limit exceeded is fixed\n  - bad: x: y', 'latest.yml', 'https://github.com/x/latest.yml') } catch (error) { parseError = error }
+  assert.equal(parseError?.code, 'ERR_UPDATER_INVALID_UPDATE_INFO')
+  assert.match(parseError.message.split('rawData:')[0], /API rate limit exceeded/)
+  // GitHubProvider 6.8.3 wraps a /releases/latest failure twice, the outer
+  // one as ERR_UPDATER_INVALID_RELEASE_FEED with the feed XML appended.
+  const { createHttpError, newError } = require('builder-util-runtime')
+  const viaFeed = (statusCode, statusMessage, remaining) => {
+    const http = createHttpError({ statusCode, statusMessage, headers: { 'x-ratelimit-remaining': remaining } })
+    const latest = newError(`Unable to find latest version on GitHub (https://github.com/x/releases/latest), please ensure a production release exists: ${http.stack || http.message}`, 'ERR_UPDATER_LATEST_VERSION_NOT_FOUND')
+    return newError(`Cannot parse releases feed: ${latest.stack || latest.message},\nXML:\n<feed><entry><content>Improve rate limit handling; API rate limit exceeded no more</content></entry></feed>`, 'ERR_UPDATER_INVALID_RELEASE_FEED')
+  }
+  const cases = [
+    [viaFeed(429, 'Too Many Requests', '0'), true],
+    [viaFeed(403, 'Forbidden', '0'), true],
+    [viaFeed(403, 'Forbidden', '59'), false],
+    [parseError, false],
+    [downloadError, true],
+    [new Error('You have exceeded a secondary rate limit. Please wait a few minutes before you try again.'), true],
+    [new Error('Cannot download "https://github.com/x", status 404: Not Found'), false],
+    // Release notes echoed into a wrapped error are not GitHub throttling.
+    [new Error('Unable to find latest version on GitHub: HttpError: 403 Forbidden\nHeaders: {"x-ratelimit-remaining":"59"}, XML:\n<entry><content>Improve rate limit handling; rate limit exceeded no more</content></entry>'), false],
+    [new Error('Cannot parse update info from latest.yml: YAMLException: bad, rawData: releaseNotes: secondary rate limit fixes'), false],
+  ]
+  for (const [error, limited] of cases) {
+    const f = fixture()
+    f.updater.checkForUpdates = async () => {
+      f.updater.emit('update-available', { version: '2.0.0' })
+      return { downloadPromise: Promise.reject(error) }
+    }
+    const result = await f.owner.check()
+    assert.equal(result.retryAt !== undefined, limited, error.message)
+  }
+})
+
+test('a clock set back does not stretch the rate-limit hold or the manual cooldown', async () => {
+  const f = fixture()
+  let calls = 0
+  f.updater.checkForUpdates = async () => { calls++; throw Object.assign(new Error('HTTP error: 429'), { statusCode: 429 }) }
+  await f.owner.check()
+  f.clock.wallShift = -48 * 60 * 60 * 1000
+  f.clock.now += 30 * 60 * 1000
+  const held = await f.owner.check()
+  assert.equal(calls, 1)
+  assert.equal(held.retryAt, f.clock.now + f.clock.wallShift + 30 * 60 * 1000, 'retryAt is half an hour of wall clock away')
+  f.updater.checkForUpdates = async () => { calls++; f.updater.emit('update-not-available'); return {} }
+  f.clock.now += 31 * 60 * 1000
+  await f.owner.check()
+  assert.equal(calls, 2, 'one hour of elapsed time ends the hold, whatever the clock says')
+  // A person's quick repeat is measured in elapsed time too.
+  f.clock.wallShift -= 24 * 60 * 60 * 1000
+  f.clock.now += 6000
+  await f.owner.check({ manual: true })
+  assert.equal(calls, 3)
 })

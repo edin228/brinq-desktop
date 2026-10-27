@@ -15,14 +15,23 @@ const MESSAGES = {
   installBlocked: (version) => `The update couldn't be installed. Brinq is still on version ${version}. Reinstall Brinq to update.`,
 }
 
-// GitHub answers too many update checks with 429, or 403 with no quota left.
-// electron-updater can wrap the HTTP error in a generic one (keeping its
-// text), and Retry-After is lost either way, so back off an hour.
+// GitHub answers too many update checks with 429, or 403 with no quota left
+// or a secondary rate limit. electron-updater can wrap the HTTP error in a
+// generic one (keeping its text), and the installer download reports only
+// `Cannot download "…", status 429: …`. Retry-After is lost either way, so
+// back off an hour.
 function rateLimited(error) {
-  const text = String(error?.message || '')
+  // An update file that could not be parsed is never throttling, though its
+  // YAML excerpt can quote release notes. (ERR_UPDATER_INVALID_RELEASE_FEED
+  // is not excluded: GitHubProvider also wraps /releases/latest HTTP
+  // failures in it; its echoed feed comes after "XML:" and is cut below.)
+  if (error?.code === 'ERR_UPDATER_INVALID_UPDATE_INFO') return false
+  // Only the HTTP part: a wrapped error can echo the release feed or update
+  // file, whose release notes may mention rate limits.
+  const text = String(error?.message || '').replace(/,?\s*(?:XML|rawData):[\s\S]*$/, '')
   return error?.statusCode === 429 ||
-    /(?:^|HttpError: |HTTP error: )429\b/m.test(text) ||
-    /rate limit exceeded/i.test(text) ||
+    /(?:^|HttpError: |HTTP error: |status )429\b/m.test(text) ||
+    /rate limit exceeded|exceeded a secondary rate limit/i.test(text) ||
     /"x-ratelimit-remaining":\s*"0"/i.test(text)
 }
 
@@ -37,6 +46,11 @@ function createUpdateStatus({
   app, updater, onChange = () => {}, onCheckEnd = () => {}, restoreWindow = () => {}, schedule = setImmediate,
   now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, log = () => {},
   watchdogMs = 60 * 1000, manualCooldownMs = 5 * 1000,
+  // Elapsed time for holds and cooldowns: a clock set back must not stretch
+  // them. `now` (wall clock) only dates the retryAt given to the schedule.
+  monotonic = () => performance.now(),
+  // The watchdog gives up a stalled restart: drop the stuck close loop too.
+  abandonClose = () => {},
 }) {
   let state = app.isPackaged
     ? { status: 'idle' }
@@ -44,8 +58,8 @@ function createUpdateStatus({
   let checking = null
   // The check in progress: who asked, and an error its events reported.
   let attempt = null
-  let lastCheckEnded = 0
-  let limitedUntil = 0
+  let lastCheckEnded = -Infinity
+  let limitedAt = -Infinity
   let restartPending = false
   let installing = false
   let blockInstallerQuit = false
@@ -183,6 +197,13 @@ function createUpdateStatus({
     if (!restartPending) return
     app.isQuitting = false
     postpone(MESSAGES.stalled)
+    abandonClose()
+  }
+
+  // Wall-clock time the rate-limit hold ends, or 0 when not held.
+  const heldUntil = () => {
+    const left = HOUR - (monotonic() - limitedAt)
+    return left > 0 ? now() + left : 0
   }
 
   app.on('before-quit', (event) => {
@@ -203,10 +224,10 @@ function createUpdateStatus({
     }
     if (state.status === 'ready' || installing || restartPending) return Promise.resolve({ ok: true, state: getState() })
     if (app.isQuitting) return Promise.resolve({ ok: false, state: getState() })
-    if (now() < limitedUntil) {
-      return Promise.resolve({ ok: false, state: getState(), error: state.message, retryAt: limitedUntil })
+    if (heldUntil()) {
+      return Promise.resolve({ ok: false, state: getState(), error: state.message, retryAt: heldUntil() })
     }
-    if (manual && now() - lastCheckEnded < manualCooldownMs) {
+    if (manual && monotonic() - lastCheckEnded < manualCooldownMs) {
       return Promise.resolve({ ok: state.status !== 'error', state: getState() })
     }
     attempt = { manual, error: null }
@@ -235,7 +256,7 @@ function createUpdateStatus({
       } finally {
         checking = null
         attempt = null
-        lastCheckEnded = now()
+        lastCheckEnded = monotonic()
       }
     }).then((result) => {
       // Whoever asked, the schedule plans from this answer.
@@ -248,15 +269,15 @@ function createUpdateStatus({
   function failCheck(error, current) {
     const failure = state.status === 'downloading' ? 'download' : 'check'
     const limited = rateLimited(error)
-    if (limited) limitedUntil = now() + HOUR
-    log('check-failed', { failure, manual: current.manual, category: category(error), retryAt: limited ? limitedUntil : null })
+    if (limited) limitedAt = monotonic()
+    log('check-failed', { failure, manual: current.manual, category: category(error), retryAt: limited ? heldUntil() : null })
     // Keep an install failure's notice; a background check failing too
     // changes nothing the user can act on.
     if (!(state.failure === 'install' && !current.manual)) {
       const message = limited ? MESSAGES.limited : MESSAGES[failure]
       publish({ status: 'error', failure, manual: current.manual, message })
     }
-    return { ok: false, state: getState(), error: state.message, ...(limited && { retryAt: limitedUntil }) }
+    return { ok: false, state: getState(), error: state.message, ...(limited && { retryAt: heldUntil() }) }
   }
 
   function restart() {
@@ -291,4 +312,21 @@ function createUpdateStatus({
   }
 }
 
-module.exports = { createUpdateStatus, MESSAGES }
+// What the title-bar header shows for an updater state: only an update
+// that can be installed, one that is installing, or a failure the user
+// should see (one they asked about, or an install). Background check and
+// download failures stay in the tray and Settings. Messages are the fixed
+// texts above; no paths, URLs or versions reach the strip.
+function headerView(state) {
+  if (state.status === 'ready') {
+    if (state.phase === 'restarting') return { view: 'restarting' }
+    const postponed = state.message === MESSAGES.postponed || state.message === MESSAGES.stalled
+    return postponed ? { view: 'ready', note: 'Update postponed', noteDetail: state.message } : { view: 'ready' }
+  }
+  if (state.status === 'error' && (state.manual || state.failure === 'install')) {
+    return { view: 'failed', message: state.message }
+  }
+  return null
+}
+
+module.exports = { createUpdateStatus, headerView, MESSAGES }

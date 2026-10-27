@@ -50,7 +50,7 @@ function fakeContents(session, url = '') {
   return wc
 }
 
-function fixture({ platform = 'win32', theme = 'light', choice = 1 } = {}) {
+function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, onUpdateCommand } = {}) {
   const session = { setPermissionCheckHandler() {}, setPermissionRequestHandler() {} }
   const security = createWindowSecurity({ baseUrl: BASE, preloadPath: '/preload.js', openExternal() {} })
   const queue = []
@@ -142,6 +142,7 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1 } = {}) {
     isQuitting: () => app.quitting,
     requestQuit: () => { app.quitRequests++ },
     onQuitStopped: () => { app.stopped++; app.quitting = false },
+    updateView, onUpdateCommand,
   })
   const host = windows[0]
   const strip = host.webContents
@@ -847,4 +848,88 @@ test('tab menus come only from the strip, for known tabs, at whole points inside
   assert.deepEqual(f.copied, [`${BASE}/clients/1`])
   f.host.close()
   assert.equal(tabMenu(f, id).shown, false)
+})
+
+test('the header gets the update view and may send only the two fixed update commands', () => {
+  let view = null
+  const commands = []
+  const f = fixture({ updateView: () => view, onUpdateCommand: (command) => commands.push(command) })
+  assert.equal(f.state().update, null)
+  view = { view: 'ready' }
+  f.tabs.refreshUpdate()
+  f.flush()
+  assert.deepEqual(f.state().update, { view: 'ready' })
+  // No tab id needed; anything passed along is ignored.
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'restart-update'), true)
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'retry-update', 999, { url: 'https://evil.example' }), true)
+  assert.deepEqual(commands, ['restart-update', 'retry-update'])
+  // Only the strip page itself may send them.
+  const denied = [
+    f.stripEvent({ sender: f.tabs.home }),
+    f.stripEvent({ senderFrame: { ...f.strip.mainFrame, parent: {} } }),
+    f.stripEvent({ senderFrame: null }),
+  ]
+  for (const event of denied) assert.equal(f.tabs.stripCommand(event, 'restart-update'), false)
+  f.strip.mainFrame.url = `${BASE}/evil`
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'restart-update'), false)
+  f.strip.mainFrame.url = SHELL
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'install-update'), false)
+  f.host.close()
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'restart-update'), false)
+  assert.deepEqual(commands, ['restart-update', 'retry-update'])
+})
+
+test('F6 and Shift+F6 move focus between the page and the header', () => {
+  const f = fixture()
+  const tab = f.open(`${BASE}/clients/1`, { background: false })
+  const press = (contents, extra = {}) => {
+    let prevented = false
+    contents.emit('before-input-event', { preventDefault() { prevented = true } }, { type: 'keyDown', key: 'F6', code: 'F6', ...extra })
+    return prevented
+  }
+  const requests = () => f.strip.sent.filter(([channel]) => channel === 'tabs:focus').map(([, mode]) => mode)
+  const focusRequests = () => requests().length
+  assert.equal(press(tab), true)
+  assert.equal(f.strip.focused, 1)
+  assert.equal(focusRequests(), 1)
+  const before = tab.focused
+  assert.equal(press(f.strip), true)
+  assert.equal(tab.focused, before + 1, 'from the header, back to the selected page')
+  assert.equal(press(tab, { shift: true }), true)
+  assert.equal(focusRequests(), 2)
+  assert.equal(press(f.tabs.home, { isAutoRepeat: true }), false, 'a held key moves once')
+  assert.equal(press(tab, { control: true }), false, 'Ctrl+F6 is left alone')
+  assert.deepEqual(requests(), ['header', 'header'])
+  // A failed tab's panel lives in the strip: F6 there moves focus within it.
+  tab.emit('did-fail-load', {}, -105, 'NAME_NOT_RESOLVED', `${BASE}/clients/1`, true)
+  f.flush()
+  const pageFocus = tab.focused
+  assert.equal(press(f.strip), true)
+  assert.equal(tab.focused, pageFocus, 'the failed page is not focused')
+  assert.deepEqual(requests().at(-1), 'toggle')
+})
+
+test('an abandoned quit settles its stuck close loop, so the next quit asks every page again', async () => {
+  const f = fixture()
+  const hung = f.open(`${BASE}/clients/1`)
+  // A page that never answers its unsaved-work check.
+  hung.close = function (options) { this.closes.push(options) }
+  f.app.quitting = true
+  f.host.emit('close', { preventDefault() {} })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(hung.closes.length, 1)
+  const stuck = f.tabs.closeAllForQuit()
+  // The watchdog gives up: the update owner stops quitting and abandons.
+  f.app.quitting = false
+  f.tabs.abandonQuit()
+  assert.equal(await stuck, false)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(f.app.quitRequests, 0)
+  assert.equal(hung.isDestroyed(), false)
+  // A new attempt sends a new close request instead of joining the old loop.
+  f.app.quitting = true
+  f.host.emit('close', { preventDefault() {} })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(hung.closes.length, 2)
+  f.tabs.abandonQuit()
 })
