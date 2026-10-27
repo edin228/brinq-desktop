@@ -61,6 +61,8 @@ function createTabWindow({
   let pushScheduled = false
   let disposed = false
   let quitting = null
+  // Each quit's close loop; abandonQuit() retires the current one.
+  let quitAttempt = 0
   // One pending link label per opener page: its latest gesture.
   const linkLabels = new Map()
   const watchedOpeners = new WeakSet()
@@ -419,18 +421,30 @@ function createTabWindow({
   // prompt is answered in context. Resolves false if the user chose Stay.
   function closeAllForQuit() {
     if (quitting) return quitting
-    quitting = (async () => {
+    const attempt = ++quitAttempt
+    const current = (async () => {
       const order = [...list.ids().filter((id) => id !== HOME_ID), HOME_ID]
       for (const id of order) {
-        // Another window (an email pop-out) may have stopped the quit; keep
-        // the remaining tabs rather than closing them for nothing.
-        if (!isQuitting()) return false
+        // Another window (an email pop-out) may have stopped the quit, or
+        // it was abandoned; keep the remaining tabs rather than closing them
+        // for nothing.
+        if (!isQuitting() || attempt !== quitAttempt) return false
         const entry = entries.get(id)
         if (entry && !(await closeAndWait(entry))) return false
       }
-      return true
-    })().finally(() => { quitting = null })
+      return attempt === quitAttempt
+    })().finally(() => { if (quitting === current) quitting = null })
+    quitting = current
     return quitting
+  }
+
+  // A page that never answers its unsaved-work check holds the close loop.
+  // Give up on it, so the next quit or update asks every page again.
+  function abandonQuit() {
+    if (!quitting) return
+    quitAttempt++
+    quitting = null
+    for (const entry of entries.values()) entry.settle?.(false)
   }
 
   function reportTheme(contents, value) {
@@ -566,6 +580,7 @@ function createTabWindow({
     dispatch,
     closeTab,
     closeAllForQuit,
+    abandonQuit,
     linkLabel,
     reportTheme,
     stripCommand,

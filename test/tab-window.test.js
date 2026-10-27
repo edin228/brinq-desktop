@@ -908,3 +908,28 @@ test('F6 and Shift+F6 move focus between the page and the header', () => {
   assert.equal(tab.focused, pageFocus, 'the failed page is not focused')
   assert.deepEqual(requests().at(-1), 'toggle')
 })
+
+test('an abandoned quit settles its stuck close loop, so the next quit asks every page again', async () => {
+  const f = fixture()
+  const hung = f.open(`${BASE}/clients/1`)
+  // A page that never answers its unsaved-work check.
+  hung.close = function (options) { this.closes.push(options) }
+  f.app.quitting = true
+  f.host.emit('close', { preventDefault() {} })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(hung.closes.length, 1)
+  const stuck = f.tabs.closeAllForQuit()
+  // The watchdog gives up: the update owner stops quitting and abandons.
+  f.app.quitting = false
+  f.tabs.abandonQuit()
+  assert.equal(await stuck, false)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(f.app.quitRequests, 0)
+  assert.equal(hung.isDestroyed(), false)
+  // A new attempt sends a new close request instead of joining the old loop.
+  f.app.quitting = true
+  f.host.emit('close', { preventDefault() {} })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(hung.closes.length, 2)
+  f.tabs.abandonQuit()
+})
