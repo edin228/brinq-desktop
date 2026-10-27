@@ -711,7 +711,15 @@ test('the installer download\'s 429 and GitHub\'s secondary limit also hold chec
     new Executor().doDownload({ protocol: 'https:', hostname: 'github.com', path: '/x/releases/download/v1.3.7/Brinq-Setup.exe' }, { callback: resolve, options: {} }, 0)
   })
   assert.match(downloadError.message, /status 429/)
+  // The installed parser's error for a malformed update file whose release
+  // notes mention a rate limit, quoted before its rawData.
+  const { parseUpdateInfo } = require('electron-updater/out/providers/Provider')
+  let parseError = null
+  try { parseUpdateInfo('version: 1.3.8\nreleaseNotes: API rate limit exceeded is fixed\n  - bad: x: y', 'latest.yml', 'https://github.com/x/latest.yml') } catch (error) { parseError = error }
+  assert.equal(parseError?.code, 'ERR_UPDATER_INVALID_UPDATE_INFO')
+  assert.match(parseError.message.split('rawData:')[0], /API rate limit exceeded/)
   const cases = [
+    [parseError, false],
     [downloadError, true],
     [new Error('You have exceeded a secondary rate limit. Please wait a few minutes before you try again.'), true],
     [new Error('Cannot download "https://github.com/x", status 404: Not Found'), false],

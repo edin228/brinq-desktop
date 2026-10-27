@@ -20,7 +20,12 @@ const MESSAGES = {
 // generic one (keeping its text), and the installer download reports only
 // `Cannot download "…", status 429: …`. Retry-After is lost either way, so
 // back off an hour.
+// electron-updater's errors for a feed or update file it could not parse:
+// never throttling, though their text can quote release notes.
+const PARSE_ERRORS = new Set(['ERR_UPDATER_INVALID_UPDATE_INFO', 'ERR_UPDATER_INVALID_RELEASE_FEED'])
+
 function rateLimited(error) {
+  if (PARSE_ERRORS.has(error?.code)) return false
   // Only the HTTP part: a wrapped error can echo the release feed or update
   // file, whose release notes may mention rate limits.
   const text = String(error?.message || '').replace(/,?\s*(?:XML|rawData):[\s\S]*$/, '')
