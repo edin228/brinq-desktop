@@ -31,11 +31,17 @@ const DRAFT = `document.getElementById('draft').addEventListener('input', () => 
   window.onbeforeunload = (event) => { event.preventDefault(); event.returnValue = '' }
 })`
 
+// A slow guard answers after Home has already closed, the latest a pop-out
+// can stop a quit.
+const SLOW_DRAFT = DRAFT.replace('event.preventDefault()', 'const end = Date.now() + 400; while (Date.now() < end) {} event.preventDefault()')
+
 const ROUTES = {
   '/home': page('brinq | Home', `
-    <button id="popout" onclick="window.open('/email/draft','email-1','width=900,height=600')">Pop out email</button>`),
+    <button id="popout" onclick="window.open('/email/draft','email-1','width=900,height=600')">Pop out email</button>
+    <button id="slow-popout" onclick="window.open('/email/slow-draft','email-2','width=900,height=600')">Pop out slow email</button>`),
   '/dirty': page('brinq | Draft', '<input id="draft" value="">', DRAFT),
   '/email/draft': page('brinq | Email draft', '<input id="draft" value="">', DRAFT),
+  '/email/slow-draft': page('brinq | Email draft', '<input id="draft" value="">', SLOW_DRAFT),
 }
 
 async function main() {
@@ -70,41 +76,48 @@ async function main() {
 
   let tabs = null
   let quitStops = 0
-  // The same wiring main.js uses, with the real app.quit().
+  // The same wiring main.js uses, with the real app.quit(). A Stay can
+  // arrive after the main window already closed; like main.js, restoring
+  // then creates a new main window with a fresh Home.
   const updates = createUpdateStatus({
     app, updater,
-    restoreWindow: () => { if (tabs && !tabs.window.isDestroyed()) tabs.window.show() },
+    restoreWindow: () => {
+      if (tabs.window.isDestroyed()) createHost()
+      tabs.window.show()
+    },
   })
   app.on('browser-window-created', (_event, window) => {
     guardWindowUnload({ window, dialog, onStay: () => updates.cancelQuit() })
   })
-  tabs = createTabWindow({
-    electron: { BrowserWindow, WebContentsView, dialog, Menu, clipboard },
-    openExternal: () => {},
-    security,
-    bounds: { width: 1200, height: 800, x: 0, y: 0 },
-    preloadPath: path.join(ROOT, 'src', 'preload.js'),
-    shellPreloadPath: path.join(ROOT, 'src', 'shell-preload.js'),
-    shellUrl: pathToFileURL(path.join(ROOT, 'src', 'shell', 'shell.html')).href,
-    theme: 'light',
-    newTabUrl: (home) => home.getURL(),
-    onTheme: () => {},
-    onHome: (contents) => contents.loadURL(`${base}/home`),
-    isQuitting: () => !!app.isQuitting,
-    requestQuit: () => app.quit(),
-    onQuitStopped: () => {
-      quitStops++
-      updates.cancelQuit()
-      tabs.window.show()
-    },
-  })
+  const createHost = () => {
+    tabs = createTabWindow({
+      electron: { BrowserWindow, WebContentsView, dialog, Menu, clipboard },
+      openExternal: () => {},
+      security,
+      bounds: { width: 1200, height: 800, x: 0, y: 0 },
+      preloadPath: path.join(ROOT, 'src', 'preload.js'),
+      shellPreloadPath: path.join(ROOT, 'src', 'shell-preload.js'),
+      shellUrl: pathToFileURL(path.join(ROOT, 'src', 'shell', 'shell.html')).href,
+      theme: 'light',
+      newTabUrl: (home) => home.getURL(),
+      onTheme: () => {},
+      onHome: (contents) => contents.loadURL(`${base}/home`),
+      isQuitting: () => !!app.isQuitting,
+      requestQuit: () => app.quit(),
+      onQuitStopped: () => {
+        quitStops++
+        updates.cancelQuit()
+        tabs.window.show()
+      },
+    })
+    security.setTabHost({ available: tabs.available, openTab: (args) => tabs.openTab(args) })
+  }
+  createHost()
   app.on('before-quit', (event) => { if (!event.defaultPrevented) app.isQuitting = true })
   app.on('window-all-closed', () => {})
-  security.setTabHost({ available: tabs.available, openTab: (args) => tabs.openTab(args) })
   ipcMain.on('tabs:command', (event, command, id, options) => tabs.stripCommand(event, command, id, options))
   ipcMain.handle('tabs:state', (event) => tabs.stripState(event))
-  const host = tabs.window
-  host.show()
+  tabs.window.show()
 
   const results = []
   const check = (name, ok, detail = '') => {
@@ -142,17 +155,22 @@ async function main() {
     check('a downloaded update is ready', state().status === 'ready')
 
     // 1. A pop-out with an unsaved draft answers Stay while the tab loop runs.
+    // Several tabs keep the loop busy so the Stay lands before Home closes;
+    // 1b covers a Stay that lands after.
     const cleanA = await open('/clients/a')
+    for (const route of ['/clients/b', '/clients/c', '/clients/d']) await open(route)
     const windowsBefore = BrowserWindow.getAllWindows().length
     await tabs.home.executeJavaScript(`document.getElementById('popout').click()`)
     await until(() => BrowserWindow.getAllWindows().length === windowsBefore + 1)
-    const popout = BrowserWindow.getAllWindows().find((window) => window !== host)
+    const popout = BrowserWindow.getAllWindows().find((window) => window !== tabs.window)
     await until(() => popout && !popout.webContents.isLoading())
     check('the pop-out draft holds unsaved work', await type(popout.webContents, 'p'))
     answers.push(1)
     check('Restart to update is accepted', updates.restart().ok === true)
     check('a second request while it runs is refused', updates.restart().ok === false)
     await until(() => !app.isQuitting && prompts.length === 1)
+    // Restoring may have to create a new main window; wait for its Home.
+    await until(() => !tabs.window.isDestroyed() && tabs.window.isVisible() && !tabs.home.isDestroyed() && !tabs.home.isLoading())
     await wait(600)
     check('the pop-out asked about its unsaved changes', prompts.length === 1, JSON.stringify(prompts))
     check('Stay in a pop-out keeps the pop-out', !popout.isDestroyed())
@@ -160,11 +178,37 @@ async function main() {
     check('Stay in a pop-out keeps the update ready', state().status === 'ready' && /Restart canceled/.test(state().message), JSON.stringify(state()))
     check('Stay in a pop-out ends the quit and drops the pending install', !app.isQuitting && quitListeners() === baseListeners,
       JSON.stringify({ quitting: app.isQuitting, listeners: quitListeners() - baseListeners }))
-    check('Stay in a pop-out shows the main window again', host.isVisible())
-    // Informational: which tabs closed before the pop-out's Stay arrived.
-    console.log(`INFO tab still open after pop-out Stay: ${!cleanA.isDestroyed()}`)
+    check('Stay in a pop-out shows the main window again, with Home', tabs.window.isVisible() && tabs.home.getURL().endsWith('/home'))
+    // Informational: how far the tab loop got before the pop-out's Stay arrived.
+    console.log(`INFO after pop-out Stay: first tab still open ${!cleanA.isDestroyed()}, tabs left ${allContents.getAllWebContents().filter((wc) => tabs.isTab(wc) && wc !== tabs.home).length}`)
     popout.destroy()
     if (cleanA.isDestroyed()) await open('/clients/a')
+
+    // 1b. Today: a pop-out's Stay that arrives after Home closed. The tab
+    // loop has finished, so it quits again and the pop-out is asked twice;
+    // the main window is left without Home. The scheduler work fixes both.
+    const slowBefore = BrowserWindow.getAllWindows().length
+    await tabs.home.executeJavaScript(`document.getElementById('slow-popout').click()`)
+    await until(() => BrowserWindow.getAllWindows().length === slowBefore + 1)
+    const slow = BrowserWindow.getAllWindows().find((window) => window !== tabs.window)
+    await until(() => slow && !slow.webContents.isLoading())
+    check('the slow pop-out draft holds unsaved work', await type(slow.webContents, 's'))
+    const slowPrompts = prompts.length
+    answers.push(1, 1)
+    check('Restart to update is accepted with a slow pop-out', updates.restart().ok === true)
+    await until(() => prompts.length >= slowPrompts + 2, 5000)
+    await wait(800)
+    const homeGone = tabs.window.isDestroyed() || tabs.home.isDestroyed()
+    check('today: a Stay after Home closed is asked twice', prompts.length === slowPrompts + 2, JSON.stringify(prompts.slice(slowPrompts)))
+    check('today: a Stay after Home closed leaves the main window without Home', homeGone)
+    check('a Stay after Home closed runs no installer and keeps the update ready',
+      installs.length === 0 && state().status === 'ready' && !app.isQuitting && quitListeners() === baseListeners && !slow.isDestroyed())
+    // Harness recovery only: start again with a fresh main window.
+    slow.destroy()
+    if (!tabs.window.isDestroyed()) tabs.window.destroy()
+    createHost()
+    tabs.window.show()
+    await until(() => tabs.home.getURL().endsWith('/home') && !tabs.home.isLoading())
 
     // 2. A tab in the middle of the close order answers Stay after earlier
     // tabs already closed.
@@ -176,7 +220,7 @@ async function main() {
     check('the middle tab holds unsaved work', await type(draft, 'k'))
     tabs.selectHome()
     const last = await open('/clients/last')
-    host.hide()
+    tabs.window.hide()
     const promptsBefore = prompts.length
     const stopsBefore = quitStops
     answers.push(1)
@@ -189,7 +233,7 @@ async function main() {
     check('Stay on a tab runs no installer', installs.length === 0)
     check('Stay on a tab keeps the update ready', state().status === 'ready' && /Restart canceled/.test(state().message))
     check('Stay on a tab ends the quit and drops the pending install', !app.isQuitting && quitListeners() === baseListeners)
-    check('Stay on a tab shows the main window', host.isVisible())
+    check('Stay on a tab shows the main window', tabs.window.isVisible())
 
     // 3. Leave everywhere: exactly one install, after every window closed.
     await type(draft, 'm')
@@ -199,7 +243,7 @@ async function main() {
     await wait(500)
     check('the installer ran exactly once', installs.length === 1, JSON.stringify(installs))
     check('the installer ran after every window and page closed', installs[0]?.windows === 0 && installs[0]?.pages === 0, JSON.stringify(installs[0]))
-    check('the main window and every tab closed', host.isDestroyed() && draft.isDestroyed() && last.isDestroyed())
+    check('the main window and every tab closed', tabs.window.isDestroyed() && draft.isDestroyed() && last.isDestroyed())
   } catch (error) {
     check('harness completed', false, error?.stack || String(error))
   }
@@ -208,7 +252,7 @@ async function main() {
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   server.close()
   fs.rmSync(directory, { recursive: true, force: true })
-  if (!host.isDestroyed()) host.destroy()
+  if (!tabs.window.isDestroyed()) tabs.window.destroy()
   app.exit(failed.length ? 1 : 0)
 }
 

@@ -234,7 +234,10 @@ test('installed updater contract: missing NSIS installer recovers before its sil
       windowsOpen = false
       const quitting = event()
       app.emit('will-quit', quitting)
-      if (!quitting.defaultPrevented) exited = true
+      if (quitting.defaultPrevented) return
+      exited = true
+      // Electron's quit event, where BaseUpdater installs on an ordinary quit.
+      quitHandler?.(0)
     }
     electron.autoUpdater.quitAndInstall = () => {
       assert.equal(windowsOpen, false)
@@ -264,7 +267,7 @@ test('installed updater contract: missing NSIS installer recovers before its sil
       guardedWindow(frame, () => owner, false)
       updater.emit('update-downloaded', { version: '2.0.0' })
     }
-    return { app, updater, owner, calls, quit: (code) => quitHandler(code), snapshot: () => ({ exited, restored, spawns, opens, installs, errors }) }
+    return { app, updater, owner, calls, exitWith: (code) => quitHandler(code), snapshot: () => ({ exited, restored, spawns, opens, installs, errors }) }
   }
 
   await t.test('reproduces the installed ENOENT/openPath contract without Brinq protection', async () => {
@@ -330,15 +333,21 @@ test('installed updater contract: missing NSIS installer recovers before its sil
   await t.test('an ordinary quit installs without installer pages and without relaunching', async () => {
     const f = installedFixture({ file: installer, managed: false })
     updaterArmed(f.updater)
-    f.quit(1)
+    f.exitWith(1)
     assert.deepEqual(f.calls, [], 'a failed exit never installs')
-    f.quit(0)
+    f.app.quit()
+    await settle()
     assert.deepEqual(f.calls, [['installer.exe', ['--updated', '/S']]])
+    assert.deepEqual(f.snapshot(), { exited: true, restored: 0, spawns: 1, opens: 0, installs: 1, errors: 0 })
   })
 
-  const resourcesPath = process.resourcesPath
+  // elevate.exe lives in Electron's resources directory, which Node lacks.
+  const resourcesPath = Object.getOwnPropertyDescriptor(process, 'resourcesPath')
   process.resourcesPath = directory
-  t.after(() => { process.resourcesPath = resourcesPath })
+  t.after(() => {
+    if (resourcesPath) Object.defineProperty(process, 'resourcesPath', resourcesPath)
+    else delete process.resourcesPath
+  })
   for (const code of ['UNKNOWN', 'EACCES']) {
     await t.test(`an ${code} installer spawn retries through elevate.exe with no error and quits`, async () => {
       const f = installedFixture({ file: installer, spawnErrors: [code] })
