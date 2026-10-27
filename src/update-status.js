@@ -15,13 +15,15 @@ const MESSAGES = {
   installBlocked: (version) => `The update couldn't be installed. Brinq is still on version ${version}. Reinstall Brinq to update.`,
 }
 
-// GitHub answers too many update checks with 429, or 403 naming the rate
-// limit. electron-updater can wrap the HTTP error in a generic one, and drops
-// Retry-After either way, so back off an hour.
+// GitHub answers too many update checks with 429, or 403 with no quota left.
+// electron-updater can wrap the HTTP error in a generic one (keeping its
+// text), and Retry-After is lost either way, so back off an hour.
 function rateLimited(error) {
-  const status = error?.statusCode
   const text = String(error?.message || '')
-  return status === 429 || /\b429\b|rate limit/i.test(text) || (status === 403 && /limit/i.test(text))
+  return error?.statusCode === 429 ||
+    /(?:^|HttpError: |HTTP error: )429\b/m.test(text) ||
+    /rate limit exceeded/i.test(text) ||
+    /"x-ratelimit-remaining":\s*"0"/i.test(text)
 }
 
 // Electron updater 6.8.3 starts installation inside quitAndInstall, before its
@@ -32,7 +34,7 @@ function rateLimited(error) {
 // closes windows, and on errors `failure` (check, download or install) and
 // `manual` (a person asked, so the error may be shown in place).
 function createUpdateStatus({
-  app, updater, onChange = () => {}, restoreWindow = () => {}, schedule = setImmediate,
+  app, updater, onChange = () => {}, onCheckEnd = () => {}, restoreWindow = () => {}, schedule = setImmediate,
   now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, log = () => {},
   watchdogMs = 60 * 1000, manualCooldownMs = 5 * 1000,
 }) {
@@ -79,7 +81,8 @@ function createUpdateStatus({
     if (failures >= 2 || (failures && !attempt?.manual)) {
       updater.autoInstallOnAppQuit = false
       log('downloaded-held', { version: info.version, failures })
-      if (failures >= 2) publish({ status: 'error', failure: 'install', manual: true, message: MESSAGES.installBlocked(currentVersion()) })
+      const message = failures >= 2 ? MESSAGES.installBlocked(currentVersion()) : MESSAGES.installFailed(currentVersion())
+      publish({ status: 'error', failure: 'install', manual: true, message })
       return
     }
     updater.autoInstallOnAppQuit = true
@@ -191,6 +194,7 @@ function createUpdateStatus({
 
   // `manual` is a person asking (tray, Settings, the header's Try again).
   // Every caller shares one check; a check holds until its download is done.
+  // Each check that reached the feed is reported to onCheckEnd.
   function check({ manual = false } = {}) {
     if (!app.isPackaged) return Promise.resolve({ ok: false, state: getState(), error: state.message })
     if (checking) {
@@ -221,12 +225,22 @@ function createUpdateStatus({
         if (current.error) throw current.error
         return { ok: true, state: getState() }
       } catch (error) {
+        // electron-updater announces the download before tidying its cache
+        // (copying the blockmap); a failure there leaves a valid installer.
+        if (state.status === 'ready') {
+          log('error-after-ready', { category: category(current.error || error) })
+          return { ok: true, state: getState() }
+        }
         return failCheck(current.error || error, current)
       } finally {
         checking = null
         attempt = null
         lastCheckEnded = now()
       }
+    }).then((result) => {
+      // Whoever asked, the schedule plans from this answer.
+      onCheckEnd(result)
+      return result
     })
     return checking
   }

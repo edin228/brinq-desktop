@@ -23,3 +23,11 @@ test('very long messages are cut short', () => {
   assert.equal(text.length, 301)
   assert.ok(text.endsWith('…'))
 })
+
+test('HTTP errors keep their status line, never their headers or update file', () => {
+  const { createHttpError } = require('builder-util-runtime')
+  const http = createHttpError({ statusCode: 403, statusMessage: 'Forbidden', headers: { 'set-cookie': 'session=secret', 'x-ratelimit-remaining': '0' } })
+  assert.equal(cleanText(http.message), '403 Forbidden')
+  const yaml = 'Cannot parse update info from latest.yml in the latest release artifacts (https://github.com/x/latest.yml?token=t): YAMLException: bad indentation, rawData: version: 9.9.9\nsha512: abc\npath: secret.exe'
+  assert.equal(cleanText(yaml), 'Cannot parse update info from latest.yml in the latest release artifacts (https://github.com/x/latest.yml): YAMLException: bad indentation')
+})

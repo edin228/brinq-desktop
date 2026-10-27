@@ -422,7 +422,7 @@ test('after an install failure, background checks never re-arm or offer that ver
   const changes = f.changes.length
   assert.equal((await f.owner.check()).ok, true)
   assert.equal(f.owner.getState().failure, 'install', 'the install notice stays')
-  assert.equal(f.changes.length, changes, 'a background check does not flicker the state')
+  assert.ok(f.changes.slice(changes).every((state) => state.failure === 'install'), 'a background check does not flicker the state')
   assert.equal(f.updater.autoInstallOnAppQuit, false)
   // A person's Try again offers it once more and arms install-on-quit.
   f.clock.now += 10_000
@@ -603,4 +603,70 @@ test('every published state keeps the shape the Settings page reads', async () =
     if (state.message !== undefined) assert.equal(typeof state.message, 'string')
   }
   assert.ok(seen.some((state) => state.phase === 'restarting'))
+})
+
+test('an install failure stays the notice even after an offline Try again and a later background download', async () => {
+  const f = fixture({ installFailure: true })
+  ready(f)
+  f.owner.restart()
+  f.flush()
+  f.updater.checkForUpdates = async () => { throw new Error('offline') }
+  f.clock.now += 10_000
+  await f.owner.check({ manual: true })
+  assert.equal(f.owner.getState().failure, 'check')
+  cachedCheck(f)
+  f.clock.now += 10_000
+  await f.owner.check()
+  assert.deepEqual(f.owner.getState(), { status: 'error', failure: 'install', manual: true, message: "The update couldn't start. Brinq is still on version 1.3.6. Try again when you're ready." })
+  assert.equal(f.updater.autoInstallOnAppQuit, false)
+})
+
+test('a download that fails after announcing its installer stays ready', async () => {
+  const f = fixture()
+  f.updater.checkForUpdates = async () => {
+    f.updater.emit('update-available', { version: '2.0.0' })
+    f.updater.emit('update-downloaded', { version: '2.0.0' })
+    // electron-updater 6.8.3 then copies the blockmap into its cache.
+    return { downloadPromise: new Promise((_resolve, reject) => setImmediate(() => { f.updater.emit('error', new Error('EPERM copyfile')); reject(new Error('EPERM copyfile')) })) }
+  }
+  assert.equal((await f.owner.check()).ok, true)
+  assert.equal(f.owner.getState().status, 'ready')
+  assert.equal(f.changes.at(-1).status, 'ready')
+  assert.equal(f.owner.restart().ok, true)
+})
+
+test('only real throttling holds checks: 429, or a 403 with no quota left', async () => {
+  const { createHttpError } = require('builder-util-runtime')
+  const response = (statusCode, statusMessage, remaining) => ({ statusCode, statusMessage, headers: { 'x-ratelimit-limit': '60', 'x-ratelimit-remaining': remaining, 'set-cookie': 'secret' } })
+  const cases = [
+    [createHttpError(response(429, 'Too Many Requests', '0')), true],
+    [createHttpError(response(403, 'Forbidden', '0')), true],
+    [createHttpError(response(403, 'Forbidden', '59')), false],
+    [createHttpError(response(404, 'Not Found', '59')), false],
+    // GitHubProvider wraps HTTP errors in plain ones that keep their text.
+    [new Error(`Unable to find latest version on GitHub (https://github.com/x/releases/latest), please ensure a production release exists: HttpError: 429 Too Many Requests\n${'Headers: {}'}`), true],
+    [new Error('API rate limit exceeded for 203.0.113.9.'), true],
+    [new Error('net::ERR_INTERNET_DISCONNECTED'), false],
+  ]
+  for (const [error, limited] of cases) {
+    const f = fixture()
+    f.updater.checkForUpdates = async () => { throw error }
+    const result = await f.owner.check()
+    assert.equal(result.retryAt !== undefined, limited, error.message.split('\n')[0])
+  }
+})
+
+test('every check that reaches the feed is reported for scheduling, including a person\'s', async () => {
+  const reports = []
+  const app = new EventEmitter()
+  app.isPackaged = true
+  const updater = new EventEmitter()
+  const owner = createUpdateStatus({ app, updater, schedule: () => {}, onCheckEnd: (result) => reports.push(result.ok) })
+  updater.checkForUpdates = async () => { throw new Error('offline') }
+  await owner.check({ manual: true })
+  updater.checkForUpdates = async () => { updater.emit('update-not-available'); return {} }
+  await owner.check()
+  // An answer given without checking is not a report.
+  await owner.check({ manual: true })
+  assert.deepEqual(reports, [false, true])
 })

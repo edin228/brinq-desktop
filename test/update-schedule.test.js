@@ -171,3 +171,33 @@ test('a check that throws counts as a failure', async () => {
   await f.advance(30 * SECOND)
   assert.equal(f.delay(), 15 * MINUTE)
 })
+
+test('a person\'s check counts: an offline one backs off the planned check, a good one resets', async () => {
+  const f = fixture()
+  f.schedule.start()
+  await f.advance(29 * SECOND)
+  f.schedule.record({ ok: false })
+  assert.equal(f.delay(), 15 * MINUTE, 'the launch check waits out the backoff')
+  f.schedule.record({ ok: false })
+  assert.equal(f.delay(), HOUR)
+  f.schedule.record({ ok: true })
+  assert.equal(f.delay(), 6 * HOUR)
+})
+
+test('the schedule\'s own check is planned from once when the owner reports it', async () => {
+  const f = fixture()
+  let schedule
+  const answers = [{ ok: false }, { ok: false }]
+  schedule = createUpdateSchedule({
+    now: () => f.clock.now, random: () => 0.5,
+    setTimer: (fn, ms) => { const timer = { fn, at: f.clock.now + ms, ms }; f.timers.add(timer); return timer },
+    clearTimer: (timer) => f.timers.delete(timer),
+    // Like the update owner: report, then answer.
+    check: async () => { const result = answers.shift(); schedule.record(result); return result },
+  })
+  schedule.start()
+  await f.advance(30 * SECOND)
+  assert.equal(f.delay(), 15 * MINUTE)
+  await f.advance(15 * MINUTE)
+  assert.equal(f.delay(), HOUR, 'one failure counted per check')
+})

@@ -91,6 +91,7 @@ const updateLog = sanitizedLogger(require('electron-log'))
 const logUpdate = (event, fields) => updateLog.info(`[update] ${event} ${JSON.stringify(fields)}`)
 const updates = createUpdateStatus({
   app, updater: autoUpdater, log: logUpdate,
+  onCheckEnd: (result) => updateSchedule.record(result),
   onChange: (state) => {
     if (tray) updateTrayMenu()
     // Every validated app page, whether a tab or a pop-out window.

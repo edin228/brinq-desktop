@@ -13,13 +13,15 @@ const RESUME_DELAY = [30 * SECOND, 120 * SECOND]
 const LONGEST = INTERVAL * (1 + JITTER)
 
 // `check` is the update owner's check: it returns { ok, retryAt? } and
-// shares one check between every caller.
+// shares one check between every caller. The owner reports every finished
+// check, whoever asked, to record(), so a person's check counts too.
 function createUpdateSchedule({ check, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, random = Math.random, log = () => {} }) {
   let timer = null
   let due = null
   let failures = 0
   let limitedUntil = 0
   let running = false
+  let recorded = 0
   let started = false
   let stopped = false
 
@@ -43,9 +45,17 @@ function createUpdateSchedule({ check, now = Date.now, setTimer = setTimeout, cl
     due = null
     if (stopped || running) return
     running = true
+    const before = recorded
     let result
     try { result = await check() } catch { result = { ok: false } } finally { running = false }
-    if (stopped) return
+    // An answer the owner gave without checking (still rate limited, an
+    // update already ready) is not recorded; plan from it here.
+    if (recorded === before) record(result)
+  }
+
+  function record(result) {
+    recorded++
+    if (!started || stopped) return
     if (result?.ok) {
       failures = 0
       limitedUntil = 0
@@ -71,6 +81,7 @@ function createUpdateSchedule({ check, now = Date.now, setTimer = setTimeout, cl
       const at = Math.max(Math.min(due ?? Infinity, now() + between(RESUME_DELAY)), soonest, limitedUntil)
       arm(at, 'resume')
     },
+    record,
     stop() {
       stopped = true
       if (timer) clearTimer(timer)
