@@ -50,7 +50,7 @@ function fakeContents(session, url = '') {
   return wc
 }
 
-function fixture({ platform = 'win32', theme = 'light', choice = 1 } = {}) {
+function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, onUpdateCommand } = {}) {
   const session = { setPermissionCheckHandler() {}, setPermissionRequestHandler() {} }
   const security = createWindowSecurity({ baseUrl: BASE, preloadPath: '/preload.js', openExternal() {} })
   const queue = []
@@ -142,6 +142,7 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1 } = {}) {
     isQuitting: () => app.quitting,
     requestQuit: () => { app.quitRequests++ },
     onQuitStopped: () => { app.stopped++; app.quitting = false },
+    updateView, onUpdateCommand,
   })
   const host = windows[0]
   const strip = host.webContents
@@ -847,4 +848,54 @@ test('tab menus come only from the strip, for known tabs, at whole points inside
   assert.deepEqual(f.copied, [`${BASE}/clients/1`])
   f.host.close()
   assert.equal(tabMenu(f, id).shown, false)
+})
+
+test('the header gets the update view and may send only the two fixed update commands', () => {
+  let view = null
+  const commands = []
+  const f = fixture({ updateView: () => view, onUpdateCommand: (command) => commands.push(command) })
+  assert.equal(f.state().update, null)
+  view = { view: 'ready' }
+  f.tabs.refreshUpdate()
+  f.flush()
+  assert.deepEqual(f.state().update, { view: 'ready' })
+  // No tab id needed; anything passed along is ignored.
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'restart-update'), true)
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'retry-update', 999, { url: 'https://evil.example' }), true)
+  assert.deepEqual(commands, ['restart-update', 'retry-update'])
+  // Only the strip page itself may send them.
+  const denied = [
+    f.stripEvent({ sender: f.tabs.home }),
+    f.stripEvent({ senderFrame: { ...f.strip.mainFrame, parent: {} } }),
+    f.stripEvent({ senderFrame: null }),
+  ]
+  for (const event of denied) assert.equal(f.tabs.stripCommand(event, 'restart-update'), false)
+  f.strip.mainFrame.url = `${BASE}/evil`
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'restart-update'), false)
+  f.strip.mainFrame.url = SHELL
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'install-update'), false)
+  f.host.close()
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'restart-update'), false)
+  assert.deepEqual(commands, ['restart-update', 'retry-update'])
+})
+
+test('F6 and Shift+F6 move focus between the page and the header', () => {
+  const f = fixture()
+  const tab = f.open(`${BASE}/clients/1`, { background: false })
+  const press = (contents, extra = {}) => {
+    let prevented = false
+    contents.emit('before-input-event', { preventDefault() { prevented = true } }, { type: 'keyDown', key: 'F6', code: 'F6', ...extra })
+    return prevented
+  }
+  const focusRequests = () => f.strip.sent.filter(([channel]) => channel === 'tabs:focus').length
+  assert.equal(press(tab), true)
+  assert.equal(f.strip.focused, 1)
+  assert.equal(focusRequests(), 1)
+  const before = tab.focused
+  assert.equal(press(f.strip), true)
+  assert.equal(tab.focused, before + 1, 'from the header, back to the selected page')
+  assert.equal(press(tab, { shift: true }), true)
+  assert.equal(focusRequests(), 2)
+  assert.equal(press(f.tabs.home, { isAutoRepeat: true }), false, 'a held key moves once')
+  assert.equal(press(tab, { control: true }), false, 'Ctrl+F6 is left alone')
 })

@@ -291,4 +291,21 @@ function createUpdateStatus({
   }
 }
 
-module.exports = { createUpdateStatus, MESSAGES }
+// What the title-bar header shows for an updater state: only an update
+// that can be installed, one that is installing, or a failure the user
+// should see (one they asked about, or an install). Background check and
+// download failures stay in the tray and Settings. Messages are the fixed
+// texts above; no paths, URLs or versions reach the strip.
+function headerView(state) {
+  if (state.status === 'ready') {
+    if (state.phase === 'restarting') return { view: 'restarting' }
+    const postponed = state.message === MESSAGES.postponed || state.message === MESSAGES.stalled
+    return postponed ? { view: 'ready', note: 'Update postponed', noteDetail: state.message } : { view: 'ready' }
+  }
+  if (state.status === 'error' && (state.manual || state.failure === 'install')) {
+    return { view: 'failed', message: state.message }
+  }
+  return null
+}
+
+module.exports = { createUpdateStatus, headerView, MESSAGES }

@@ -1,6 +1,7 @@
 // Renders the production strip (markup, CSS and script) with a stub bridge,
 // in the states drawn on the Paper page "Desktop · Tab header bar".
 //   ?state=home-hover|client|refreshing|many|failed|stress&theme=dark|light
+//   &update=ready|postponed|restarting|failed (absent: no update to show)
 const params = new URLSearchParams(location.search)
 const client = (id, label, extra = {}) => ({ id, home: false, label, kind: 'client', loading: false, failed: null, ...extra })
 const home = { id: 1, home: true, label: 'Brinq', kind: 'page', loading: false, failed: null }
@@ -26,7 +27,17 @@ const states = {
   failed: { selectedId: 3, tabs: [home, three[0], { ...three[1], failed: 'load' }, three[2]] },
   stress: { selectedId: 33, tabs: [home, ...stress] },
 }
-const state = { platform: 'win32', theme: params.get('theme') === 'light' ? 'light' : 'dark', ...(states[params.get('state')] || states['home-hover']) }
+const updates = {
+  ready: { view: 'ready' },
+  postponed: { view: 'ready', note: 'Update postponed', noteDetail: 'Update postponed. Some tabs may have closed.' },
+  restarting: { view: 'restarting' },
+  failed: { view: 'failed', message: "The update couldn't download. Check your connection and try again." },
+}
+const state = {
+  platform: 'win32', theme: params.get('theme') === 'light' ? 'light' : 'dark',
+  ...(states[params.get('state')] || states['home-hover']),
+  update: updates[params.get('update')] ?? null,
+}
 
 const html = await (await fetch('/src/shell/shell.html')).text()
 const shell = new DOMParser().parseFromString(html, 'text/html')
@@ -46,6 +57,8 @@ window.brinqTabs = {
   newTab: () => calls.push(['new']),
   home: (focus) => calls.push(['home', focus]),
   reload: () => calls.push(['reload']),
+  restartUpdate: () => calls.push(['restart-update']),
+  retryUpdate: () => calls.push(['retry-update']),
 }
 const script = document.createElement('script')
 script.src = '/src/shell/shell.js'

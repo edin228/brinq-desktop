@@ -670,3 +670,23 @@ test('every check that reaches the feed is reported for scheduling, including a 
   await owner.check({ manual: true })
   assert.deepEqual(reports, [false, true])
 })
+
+test('the header shows only an installable, installing or user-facing failed update', () => {
+  const { headerView, MESSAGES } = require('../src/update-status')
+  const cases = [
+    [{ status: 'idle' }, null],
+    [{ status: 'checking' }, null],
+    [{ status: 'up-to-date' }, null],
+    [{ status: 'downloading', version: '2.0.0', percent: 40 }, null],
+    [{ status: 'unavailable', message: 'x' }, null],
+    [{ status: 'error', failure: 'check', manual: false, message: MESSAGES.check }, null],
+    [{ status: 'error', failure: 'download', manual: false, message: MESSAGES.download }, null],
+    [{ status: 'error', failure: 'download', manual: true, message: MESSAGES.download }, { view: 'failed', message: MESSAGES.download }],
+    [{ status: 'error', failure: 'install', manual: true, message: 'm' }, { view: 'failed', message: 'm' }],
+    [{ status: 'ready', version: '2.0.0', message: MESSAGES.ready }, { view: 'ready' }],
+    [{ status: 'ready', version: '2.0.0', phase: 'restarting', message: MESSAGES.restarting }, { view: 'restarting' }],
+    [{ status: 'ready', version: '2.0.0', message: MESSAGES.postponed }, { view: 'ready', note: 'Update postponed', noteDetail: MESSAGES.postponed }],
+    [{ status: 'ready', version: '2.0.0', message: MESSAGES.stalled }, { view: 'ready', note: 'Update postponed', noteDetail: MESSAGES.stalled }],
+  ]
+  for (const [state, expected] of cases) assert.deepEqual(headerView(state), expected, JSON.stringify(state))
+})

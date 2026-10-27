@@ -157,6 +157,7 @@ function shortcutAction(input, platform = process.platform) {
 
   if (!primary) {
     if (key === 'F5') return shift ? 'reload-hard' : 'reload'
+    if (key === 'F6') return once('switch-pane')
     if (key === 'F12' && !shift) return 'devtools'
     return null
   }

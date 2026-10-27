@@ -17,7 +17,7 @@ const { app, BrowserWindow, WebContentsView, Menu, clipboard, ipcMain, webConten
 const { pathToFileURL } = require('url')
 const { createWindowSecurity } = require('../src/window-security')
 const { createTabWindow } = require('../src/tab-window')
-const { createUpdateStatus } = require('../src/update-status')
+const { createUpdateStatus, headerView } = require('../src/update-status')
 const { guardWindowUnload } = require('../src/unload-guard')
 
 const ROOT = path.join(__dirname, '..')
@@ -85,7 +85,18 @@ async function main() {
     tabs.ensureHome()
     tabs.window.show()
   }
-  const updates = createUpdateStatus({ app, updater, restoreWindow: showMain })
+  // Every published state, and what a second request answered while the
+  // first was restarting.
+  const published = []
+  let secondRequest = null
+  const updates = createUpdateStatus({
+    app, updater, restoreWindow: showMain,
+    onChange: (next) => {
+      published.push(next)
+      if (next.phase === 'restarting' && secondRequest === null) secondRequest = updates.restart().error
+      tabs?.refreshUpdate()
+    },
+  })
   app.on('browser-window-created', (_event, window) => {
     guardWindowUnload({ window, dialog, onStay: () => updates.cancelQuit() })
   })
@@ -104,6 +115,12 @@ async function main() {
       onHome: (contents) => contents.loadURL(`${base}/home`),
       isQuitting: () => !!app.isQuitting,
       requestQuit: () => app.quit(),
+      // The header's Update action, wired as main.js wires it.
+      updateView: () => headerView(updates.getState()),
+      onUpdateCommand: (command) => {
+        if (command === 'restart-update') updates.restart()
+        else updates.check({ manual: true })
+      },
       onQuitStopped: () => {
         quitStops++
         updates.cancelQuit()
@@ -146,13 +163,44 @@ async function main() {
     return until(() => contents.executeJavaScript(`document.getElementById('draft').value.includes(${JSON.stringify(key)})`))
   }
   const quitListeners = () => app.listenerCount('will-quit')
+  // What the header's update area shows.
+  const header = () => tabs.window.webContents.executeJavaScript(`(() => {
+    const group = document.querySelector('.update'), button = document.querySelector('.update-button'), note = document.querySelector('.update-note')
+    return { shown: !group.hidden, label: button.hidden ? null : button.textContent, disabled: button.disabled, title: button.title,
+      note: note.hidden ? null : note.textContent, focused: document.activeElement?.className ?? null }
+  })()`)
+  // A real click on the header's Update button.
+  const clickUpdate = async () => {
+    const strip = tabs.window.webContents
+    const point = await strip.executeJavaScript(`(() => { const b = document.querySelector('.update-button').getBoundingClientRect(); return { x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2) } })()`)
+    strip.focus()
+    for (const type of ['mouseDown', 'mouseUp']) strip.sendInputEvent({ type, x: point.x, y: point.y, button: 'left', clickCount: 1 })
+  }
+  const key = (contents, keyCode, modifiers = []) => {
+    contents.sendInputEvent({ type: 'keyDown', keyCode, modifiers })
+    if (keyCode === 'Enter') contents.sendInputEvent({ type: 'char', keyCode: '\r', modifiers })
+    contents.sendInputEvent({ type: 'keyUp', keyCode, modifiers })
+  }
+  // Records each label the header's Update button shows, as it changes.
+  const watchHeader = () => tabs.window.webContents.executeJavaScript(`(() => {
+    window.__labels = []
+    const button = document.querySelector('.update-button')
+    const record = () => window.__labels.push([button.textContent, button.disabled])
+    new MutationObserver(record).observe(button, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled'] })
+  })()`)
+  const headerLabels = () => tabs.window.webContents.executeJavaScript('window.__labels')
   const state = () => updates.getState()
 
   try {
     await until(() => tabs.home.getURL().endsWith('/home') && !tabs.home.isLoading())
     const baseListeners = quitListeners()
+    check('the header shows no update before one is ready', await until(async () => !(await header()).shown, 2000))
     updater.emit('update-downloaded', { version: '9.9.9' })
     check('a downloaded update is ready', state().status === 'ready')
+    check('the header shows "Update", with no tooltip', await until(async () => {
+      const shown = await header()
+      return shown.shown && shown.label === 'Update' && !shown.disabled && shown.title === ''
+    }, 3000), JSON.stringify(await header()))
 
     // 1. A pop-out with an unsaved draft answers Stay while the tab loop runs.
     // Several tabs keep the loop busy so the Stay lands before Home closes;
@@ -166,9 +214,12 @@ async function main() {
     await until(() => popout && !popout.webContents.isLoading())
     check('the pop-out draft holds unsaved work', await type(popout.webContents, 'p'))
     answers.push(1)
-    check('Restart to update is accepted', updates.restart().ok === true)
-    check('the restarting phase is published at once', state().phase === 'restarting')
-    check('a second request while it runs is refused', updates.restart().error === 'Brinq is already restarting to update.')
+    await watchHeader()
+    await clickUpdate()
+    check('clicking Update in the header starts the restart', await until(() => published.some((next) => next.phase === 'restarting'), 3000))
+    check('the header showed Updating…, disabled', await until(async () => (await headerLabels()).some(([label, disabled]) => label === 'Updating…' && disabled), 3000),
+      JSON.stringify(await headerLabels()))
+    check('a second request while it runs is refused', secondRequest === 'Brinq is already restarting to update.', String(secondRequest))
     await until(() => !app.isQuitting && prompts.length === 1)
     // Restoring may have to create a new main window; wait for its Home.
     await until(() => !tabs.window.isDestroyed() && tabs.window.isVisible() && !tabs.home.isDestroyed() && !tabs.home.isLoading())
@@ -180,6 +231,10 @@ async function main() {
     check('Stay in a pop-out ends the quit and drops the pending install', !app.isQuitting && quitListeners() === baseListeners,
       JSON.stringify({ quitting: app.isQuitting, listeners: quitListeners() - baseListeners }))
     check('Stay in a pop-out shows the main window again, with Home', tabs.window.isVisible() && tabs.home.getURL().endsWith('/home'))
+    check('after Stay the header says Update postponed and offers Update again', await until(async () => {
+      const shown = await header()
+      return shown.note === 'Update postponed' && shown.label === 'Update' && !shown.disabled
+    }, 3000), JSON.stringify(await header()))
     // Informational: how far the tab loop got before the pop-out's Stay arrived.
     console.log(`INFO after pop-out Stay: first tab still open ${!cleanA.isDestroyed()}, tabs left ${allContents.getAllWebContents().filter((wc) => tabs.isTab(wc) && wc !== tabs.home).length}`)
     popout.destroy()
@@ -234,7 +289,23 @@ async function main() {
     // 3. Leave everywhere: exactly one install, after every window closed.
     await type(draft, 'm')
     answers.push(0)
-    check('Restart to update is accepted a third time', updates.restart().ok === true)
+    // Keyboard only: F6 from the page into the header, Tab to Update, Enter.
+    tabs.selectHome()
+    tabs.window.focus()
+    tabs.home.focus()
+    await wait(200)
+    key(tabs.home, 'F6')
+    check('F6 from the page moves focus into the header', await until(async () => tabs.window.webContents.isFocused() && (await header()).focused !== null && (await header()).focused !== '', 2000), JSON.stringify(await header()))
+    let reached = false
+    for (let press = 0; press < 8 && !reached; press++) {
+      key(tabs.window.webContents, 'Tab')
+      await wait(100)
+      reached = (await header()).focused === 'update-button'
+    }
+    check('Tab reaches the Update button in the header', reached, JSON.stringify(await header()))
+    const restartsBefore = published.filter((next) => next.phase === 'restarting').length
+    key(tabs.window.webContents, 'Enter')
+    check('Enter on Update starts the restart', await until(() => published.filter((next) => next.phase === 'restarting').length > restartsBefore, 3000))
     check('Leave lets the restart reach the installer', await until(() => installs.length > 0))
     await wait(500)
     check('the installer ran exactly once', installs.length === 1, JSON.stringify(installs))
