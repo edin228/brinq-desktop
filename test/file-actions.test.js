@@ -118,7 +118,7 @@ test('when no app can open an email file, Open falls back to the Brinq viewer', 
   assert.deepEqual(g.emailOpens, [])
 })
 
-test('Open hands every email file to the OS with no default-app lookup, even when that app is Brinq', async t => {
+test('Open hands every email file to the OS with no default-app lookup', async t => {
   for (const item of EMAIL_CASES) {
     const f = await fixture(t)
     f.fetchWith(emailFetch(item))
@@ -288,6 +288,22 @@ test('each operation logs phase timings, kind, type, size and outcome, never nam
   // A broken logger never changes the result.
   const g = await fixture(t, { log: () => { throw new Error('disk full') } })
   assert.equal((await g.open()).ok, true)
+})
+
+test('only a known file type is logged; any other extension is logged as other, never its text', async t => {
+  const f = await fixture(t)
+  // An extensionless name takes its type from the MIME type (application/pdf).
+  const cases = [['document.client123', 'other'], ['notes', '.pdf'], ['Scan.PDF', '.pdf'], ['call.M4A', '.m4a'], ['policy.zip', 'other']]
+  for (const [name, type] of cases) {
+    f.fetchWith(() => pdf({ 'content-disposition': `attachment; filename="${name}"` }))
+    await f.open()
+    assert.equal(f.logs.at(-1).type, type, name)
+  }
+  // Save As logs the same way for any file type it writes.
+  f.fetchWith(() => pdf({ 'content-disposition': 'attachment; filename="export.acme-42"' }))
+  assert.equal((await f.save()).ok, true)
+  assert.equal(f.logs.at(-1).type, 'other')
+  assert.doesNotMatch(JSON.stringify(f.logs), /client123|acme-42|\.zip/)
 })
 
 test('Open streams complete private bytes and invokes the OS once using server filename authority', async t => {

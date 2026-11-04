@@ -7,7 +7,7 @@ const { SOURCE_KINDS, resolveSource, storageProxyUrl } = require('./file-sources
 const {
   responseFileInfo, ensurePrivateDirectory, markFileAsInternetOrigin,
   requiresInternetOriginProtection, readResponseWithLimit,
-  isEmailFilename, MAX_EMAIL_BYTES,
+  isEmailFilename, isSafeOpenFilename, MAX_EMAIL_BYTES,
 } = require('./attachment-files')
 
 // Preserve the existing email Open envelope. Save As streams without this cap.
@@ -134,7 +134,10 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
       const info = responseFileInfo(response.headers, resolved.filename)
       const serverPhases = serverTiming(response.headers.get('server-timing'))
       if (serverPhases) facts.server = serverPhases
-      facts.type = path.extname(info.filename).toLowerCase().slice(0, 12) || 'none'
+      // Only a known file type is logged: any other extension is part of a
+      // name the user or a client chose (`report.client123`), so it is `other`.
+      const extension = path.extname(info.filename).toLowerCase()
+      facts.type = !extension ? 'none' : isSafeOpenFilename(info.filename) ? extension : 'other'
       const emailFile = isEmailFilename(info.filename)
       // Email files open in the OS default app like any other file; `view`
       // shows them in Brinq's viewer, which parses the whole file in memory.
