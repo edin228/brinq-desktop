@@ -8,6 +8,8 @@ function harness({ focused = false, ...limits } = {}) {
     constructor(options) { this.options = options; this.handlers = {}; this.shown = false }
     on(name, handler) { this.handlers[name] = handler }
     show() { this.shown = true; state.popups.push(this) }
+    // The OS reports display later, as Electron's 'show' event.
+    display() { this.handlers.show?.() }
     close() { this.closed = true }
   }
   state.notify = createNativeNotifier({
@@ -100,9 +102,11 @@ test('a shown popup stays referenced until clicked, dismissed or failed; a timed
   assert.deepEqual(h.notify.sizes(), { seen: 5, live: 0 })
 })
 
-test('beyond the bound the oldest unsettled popup is dismissed, never left without a click handler', () => {
+test('beyond the bound the oldest shown popup is dismissed, never left without a click handler', () => {
   const h = harness({ liveLimit: 2 })
-  for (const uid of ['a', 'b', 'c']) h.notify('Sender', uid, { uid })
+  h.notify('Sender', 'a', { uid: 'a' }); h.popups[0].display()
+  h.notify('Sender', 'b', { uid: 'b' }); h.popups[1].display()
+  h.notify('Sender', 'c', { uid: 'c' }); h.popups[2].display()
   const [a, b, c] = h.popups
   assert.deepEqual([a.closed, b.closed, c.closed], [true, undefined, undefined])
   assert.deepEqual(h.notify.sizes(), { seen: 3, live: 2 })
@@ -112,6 +116,25 @@ test('beyond the bound the oldest unsettled popup is dismissed, never left witho
   assert.deepEqual(h.notify.sizes(), { seen: 3, live: 0 })
   assert.deepEqual(h.clicks, ['b'])
   assert.equal(LIVE_LIMIT, 100)
+})
+
+test('a popup still waiting for the OS to show it is never dismissed by the bound', () => {
+  const h = harness({ liveLimit: 2 })
+  for (const uid of ['a', 'b', 'c']) h.notify('Sender', uid, { uid })
+  // A burst: none shown yet, so none is closed and the set runs over.
+  assert.deepEqual(h.popups.map(p => p.closed), [undefined, undefined, undefined])
+  assert.deepEqual(h.notify.sizes(), { seen: 3, live: 3 })
+  // Once shown, the oldest shown one goes; a still-pending older one stays.
+  h.popups[1].display()
+  assert.deepEqual(h.popups.map(p => p.closed), [undefined, true, undefined])
+  assert.deepEqual(h.notify.sizes(), { seen: 3, live: 2 })
+  h.popups[0].display()
+  h.popups[2].display()
+  assert.deepEqual(h.notify.sizes(), { seen: 3, live: 2 })
+  // A 'show' after the popup settled changes nothing.
+  h.popups[0].handlers.click()
+  h.popups[0].display()
+  assert.deepEqual(h.notify.sizes(), { seen: 3, live: 1 })
 })
 
 test('a copy decided more than a day ago is refused and still counts as seen', () => {

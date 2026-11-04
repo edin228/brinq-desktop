@@ -23,9 +23,12 @@
 // Each shown popup is kept referenced until it is clicked, dismissed or fails,
 // since garbage collection would drop its click handler. A Windows toast that
 // times out of the banner (close reason 'timedOut') is still clickable in the
-// Action Center, so it stays referenced. At most LIVE_LIMIT stay referenced;
-// beyond that the oldest is dismissed (close()) rather than left on screen
-// without a click handler. Windows keeps only the newest 20 per app anyway.
+// Action Center, so it stays referenced. Past LIVE_LIMIT the oldest popup the
+// OS has already shown ('show' event) is dismissed with close() rather than
+// left on screen without a click handler. A popup still waiting to be shown
+// is never dismissed: close() can't cancel a queued display and would detach
+// its handler, so the set may run over the limit until those are shown.
+// Windows keeps only the newest 20 per app anyway.
 const SEEN_LIMIT = 10000
 const LIVE_LIMIT = 100
 const MAX_DELIVERY_AGE_MS = 24 * 60 * 60 * 1000
@@ -41,19 +44,22 @@ function createNativeNotifier({
   seenLimit = SEEN_LIMIT, liveLimit = LIVE_LIMIT, maxDeliveryAgeMs = MAX_DELIVERY_AGE_MS,
 }) {
   const seen = new Set() // uids, oldest first
-  const live = new Set() // shown popups, oldest first
+  const live = new Map() // popup -> whether the OS has shown it yet, oldest first
 
-  function remember(entries, item, limit, evicted = () => {}) {
+  function remember(entries, item, limit) {
     entries.add(item)
-    while (entries.size > limit) {
-      const oldest = entries.values().next().value
-      entries.delete(oldest)
-      evicted(oldest)
-    }
+    while (entries.size > limit) entries.delete(entries.values().next().value)
   }
 
-  function dismiss(popup) {
-    try { popup.close() } catch { /* Already gone. */ }
+  // Dismiss the oldest shown popups beyond the limit; never one still pending.
+  function trimLive() {
+    if (live.size <= liveLimit) return
+    for (const [popup, shown] of live) {
+      if (live.size <= liveLimit) break
+      if (!shown) continue
+      live.delete(popup)
+      try { popup.close() } catch { /* Already gone. */ }
+    }
   }
 
   function notify(title, body, data) {
@@ -71,8 +77,14 @@ function createNativeNotifier({
     popup.on('click', () => { release(); onClick(uid) })
     popup.on('close', (details) => { if (details?.reason !== 'timedOut') release() })
     popup.on('failed', release)
-    remember(live, popup, liveLimit, dismiss)
+    popup.on('show', () => {
+      if (!live.has(popup)) return
+      live.set(popup, true)
+      trimLive()
+    })
+    live.set(popup, false)
     popup.show()
+    trimLive()
     return 'shown'
   }
 
