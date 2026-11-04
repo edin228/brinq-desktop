@@ -5,22 +5,33 @@
 // - none while any Brinq window has focus. The email still counts as seen, so
 //   it never pops up later just because focus moved.
 //
-// Seen uids are kept for RETAIN_MS, matching the server's stale cutoff
-// (EMAIL_NATIVE_NOTIFY_STALE_AFTER_SECONDS = 600 in brinq-mono): past that the
-// server decides no popup for an arrival, and it decides each email at most
-// once (synced_emails.native_notify_decided_at). They live in memory only;
-// Pusher does not replay missed events after a restart.
-const RETAIN_MS = 10 * 60 * 1000
+// The server decides each email at most once and never later than 600 s after
+// it arrives (EMAIL_NATIVE_NOTIFY_STALE_AFTER_SECONDS in brinq-mono), but a
+// stalled page can still hand its copy over much later. Seen uids are kept for
+// RETAIN_MS, far past any delivery delay: about 100 bytes each, so even 10,000
+// emails a day stay near a megabyte. They live in memory only; Pusher does not
+// replay missed events after a restart.
+//
+// Each shown popup is kept until it is clicked, closed or fails, or RETAIN_MS
+// passes: a popup garbage-collected while it sits in the Windows Action Center
+// would lose its click handler.
+const RETAIN_MS = 24 * 60 * 60 * 1000
 const MAX_UID_LENGTH = 512
 
 function createNativeNotifier({ Notification, appFocused, onClick, icon, now = Date.now, retainMs = RETAIN_MS }) {
-  const seen = new Map() // uid -> time it may pop up again
+  const seen = new Map() // uid -> time it is forgotten, in insertion (time) order
+  const live = new Map() // popup -> time its reference is dropped
 
   function forget(time) {
-    for (const [uid, until] of seen) if (until <= time) seen.delete(uid)
+    for (const entries of [seen, live]) {
+      for (const [key, until] of entries) {
+        if (until > time) break
+        entries.delete(key)
+      }
+    }
   }
 
-  return function notify(title, body, data) {
+  function notify(title, body, data) {
     if (typeof title !== 'string' || typeof body !== 'string') return 'invalid'
     const uid = data && typeof data.uid === 'string' && data.uid && data.uid.length <= MAX_UID_LENGTH ? data.uid : null
     const time = now()
@@ -31,10 +42,17 @@ function createNativeNotifier({ Notification, appFocused, onClick, icon, now = D
     }
     if (appFocused()) return 'focused'
     const popup = new Notification({ title, body, icon })
-    popup.on('click', () => onClick(uid))
+    const release = () => live.delete(popup)
+    popup.on('click', () => { release(); onClick(uid) })
+    popup.on('close', release)
+    popup.on('failed', release)
+    live.set(popup, time + retainMs)
     popup.show()
     return 'shown'
   }
+
+  notify.sizes = () => ({ seen: seen.size, live: live.size })
+  return notify
 }
 
 module.exports = { createNativeNotifier, RETAIN_MS }

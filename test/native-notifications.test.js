@@ -54,6 +54,18 @@ test('clicking a popup opens its email', () => {
   assert.deepEqual(h.clicks, ['email-1'])
 })
 
+test('a copy that arrives long after the server decided never pops up again', () => {
+  const h = harness({ focused: true })
+  assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'focused')
+  h.focused = false
+  // Past the server's 600 s cutoff: a stalled page delivering late.
+  h.time += 11 * 60 * 1000
+  assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'duplicate')
+  h.time += 23 * 60 * 60 * 1000
+  assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'duplicate')
+  assert.equal(h.popups.length, 0)
+})
+
 test('a seen email is forgotten only after the retention window', () => {
   const h = harness()
   h.notify('Sender', 'Subject', { uid: 'email-1' })
@@ -61,7 +73,23 @@ test('a seen email is forgotten only after the retention window', () => {
   assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'duplicate')
   h.time += 1
   assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'shown')
-  assert.equal(RETAIN_MS, 600_000)
+  assert.equal(RETAIN_MS, 24 * 60 * 60 * 1000)
+})
+
+test('a shown popup stays referenced until clicked, closed, failed or expired', () => {
+  const h = harness()
+  for (const uid of ['a', 'b', 'c', 'd']) h.notify('Sender', uid, { uid })
+  assert.deepEqual(h.notify.sizes(), { seen: 4, live: 4 })
+  const [a, b, c] = h.popups
+  a.handlers.click()
+  b.handlers.close()
+  c.handlers.failed()
+  assert.deepEqual(h.notify.sizes(), { seen: 4, live: 1 })
+  assert.deepEqual(h.clicks, ['a'])
+  // Whatever is left is dropped with its uid once the window passes.
+  h.time += RETAIN_MS
+  assert.equal(h.notify('Sender', 'e', { uid: 'e' }), 'shown')
+  assert.deepEqual(h.notify.sizes(), { seen: 1, live: 1 })
 })
 
 test('invalid requests never show a popup; a request without a usable uid is not deduplicated', () => {
