@@ -6,9 +6,11 @@ const SAFE_OPEN_EXTENSIONS = new Set([
   '.txt', '.csv',
   '.docx', '.xlsx', '.pptx',
   '.eml', '.msg',
+  // Passive audio, e.g. AMS360 call recordings; opened by the OS media player.
+  '.mp3', '.wav', '.m4a',
 ])
 
-// The email viewer parses the complete file in memory and already enforces this cap.
+// The Brinq email viewer parses the complete file in memory and enforces this cap.
 const MAX_EMAIL_BYTES = 25 * 1024 * 1024
 
 function isEmailFilename(filename) {
@@ -135,6 +137,9 @@ const MIME_EXTENSIONS = {
   'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['.pptx'],
   'message/rfc822': ['.eml'],
   'application/vnd.ms-outlook': ['.msg'],
+  'audio/mpeg': ['.mp3'], 'audio/mp3': ['.mp3'],
+  'audio/wav': ['.wav'], 'audio/x-wav': ['.wav'], 'audio/wave': ['.wav'], 'audio/vnd.wave': ['.wav'],
+  'audio/mp4': ['.m4a'], 'audio/x-m4a': ['.m4a'],
 }
 
 function responseFileInfo(headers, hint) {

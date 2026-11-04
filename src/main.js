@@ -17,11 +17,6 @@ const fs = require('fs')
 const path = require('path')
 const { pathToFileURL } = require('url')
 const { autoUpdater } = require('electron-updater')
-const { simpleParser } = require('mailparser')
-const MsgReader = require('@kenjiuno/msgreader').default
-const { decompressRTF } = require('@kenjiuno/decompressrtf')
-const { deEncapsulateSync } = require('rtf-stream-parser')
-const iconv = require('iconv-lite')
 const config = require('./config')
 const { isMode, modeUrl, visibleBounds, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue } = require('./window-state')
 const { createWindowSecurity } = require('./window-security')
@@ -38,6 +33,7 @@ const {
   MAX_EMAIL_BYTES,
 } = require('./attachment-files')
 const { createFileActions, CAPABILITIES } = require('./file-actions')
+const { parseEmailFile } = require('./email-file')
 const { createUpdateStatus, headerView } = require('./update-status')
 const { createUpdateSchedule } = require('./update-schedule')
 const { sanitizedLogger } = require('./update-log')
@@ -103,6 +99,10 @@ const RECOVERY_URL = pathToFileURL(path.join(__dirname, 'offline.html')).href
 // Update records stay in the local log only, without URLs' queries or feeds.
 const updateLog = sanitizedLogger(require('electron-log'))
 const logUpdate = (event, fields) => updateLog.info(`[update] ${event} ${JSON.stringify(fields)}`)
+// One line per native file operation. file-actions.js emits only fixed fields
+// (kind, extension, size, outcome, phase ms), so the update sanitizer's
+// 300-character cut is not applied.
+const logFile = (fields) => require('electron-log').info(`[file] ${fields.mode} ${JSON.stringify(fields)}`)
 const updates = createUpdateStatus({
   app, updater: autoUpdater, log: logUpdate,
   onCheckEnd: (result) => updateSchedule.record(result),
@@ -133,252 +133,6 @@ const MAX_CONCURRENT_VIEWERS = 10
 const fileViewerStore = new Map()
 let pendingViewerCount = 0
 let viewerCapErrorShown = false
-
-function escapeHtml(text = '') {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
-
-// ---------------------------------------------------------------------------
-// .msg file helpers
-// ---------------------------------------------------------------------------
-function decodeRtfText(value, charset) {
-  const source = Buffer.isBuffer(value) ? value : Buffer.from(value)
-  const encoding =
-    charset && iconv.encodingExists(charset) ? charset : 'windows-1252'
-  return iconv.decode(source, encoding)
-}
-
-function normalizeCid(value = '') {
-  return String(value).trim().replace(/^<|>$/g, '').toLowerCase()
-}
-
-function replaceCidUrls(html, cidMap) {
-  return html.replace(/cid:([^"'\s)]+)/gi, (match, rawCid) => {
-    return cidMap.get(normalizeCid(rawCid)) || match
-  })
-}
-
-function parseMsgFile(buffer) {
-  let reader
-  let data
-
-  try {
-    reader = new MsgReader(buffer)
-    data = reader.getFileData()
-  } catch {
-    throw new Error(
-      'This email file could not be parsed. It may be malformed or use an unsupported format.',
-    )
-  }
-
-  if (!data || data.error) {
-    throw new Error(
-      'This email file could not be parsed. It may be malformed or use an unsupported format.',
-    )
-  }
-
-  if (
-    data.messageClass &&
-    !String(data.messageClass).toLowerCase().startsWith('ipm.note')
-  ) {
-    throw new Error('This .msg file is not an email message.')
-  }
-
-  // --- Body extraction pipeline ---
-  // Priority: HTML string → HTML bytes → de-encapsulated RTF HTML → plain text
-  let bodyHtml = null
-  let bodyText = data.body || ''
-
-  if (data.bodyHtml) {
-    bodyHtml = data.bodyHtml
-  } else if (data.html?.length) {
-    bodyHtml = Buffer.from(data.html).toString('utf-8')
-  }
-
-  if (!bodyHtml && data.compressedRtf?.length) {
-    try {
-      const rtfBytes = decompressRTF(data.compressedRtf)
-      const result = deEncapsulateSync(Buffer.from(rtfBytes), {
-        decode: (value, charset) => decodeRtfText(value, charset),
-      })
-
-      if (result.mode === 'html' && result.text) {
-        bodyHtml =
-          typeof result.text === 'string'
-            ? result.text
-            : Buffer.from(result.text).toString('utf-8')
-      } else if (result.mode === 'text' && result.text && !bodyText) {
-        bodyText =
-          typeof result.text === 'string'
-            ? result.text
-            : decodeRtfText(result.text)
-      }
-    } catch {
-      // RTF may be malformed or may not contain encapsulated HTML/text
-    }
-  }
-
-  // --- Attachments and CID resolution ---
-  const visibleAttachments = []
-  const cidMap = new Map()
-
-  for (const [sourceIndex, att] of (data.attachments || []).entries()) {
-    let attachment
-    try {
-      attachment = reader.getAttachment(att)
-    } catch {
-      continue
-    }
-
-    const contentBuffer = attachment?.content
-      ? Buffer.from(attachment.content)
-      : Buffer.alloc(0)
-    const filename =
-      attachment?.fileName ||
-      att.fileName ||
-      att.fileNameShort ||
-      `attachment-${sourceIndex}`
-    const contentType = att.attachMimeTag || 'application/octet-stream'
-    const normalizedCid = normalizeCid(att.pidContentId)
-
-    if (normalizedCid && contentBuffer.length > 0) {
-      cidMap.set(
-        normalizedCid,
-        `data:${contentType};base64,${contentBuffer.toString('base64')}`,
-      )
-    }
-
-    if (att.attachmentHidden) continue
-
-    const attachmentIndex = visibleAttachments.length
-    visibleAttachments.push({
-      raw: {
-        content: contentBuffer,
-        filename,
-        contentType,
-      },
-      metadata: {
-        index: attachmentIndex,
-        filename: sanitizeDownloadName(filename, attachmentIndex),
-        size: contentBuffer.length,
-        contentType,
-      },
-    })
-  }
-
-  if (bodyHtml && cidMap.size > 0) {
-    bodyHtml = replaceCidUrls(bodyHtml, cidMap)
-  }
-
-  if (!bodyHtml) {
-    bodyHtml = `<pre>${escapeHtml(bodyText)}</pre>`
-  }
-
-  // --- Recipients ---
-  const from = []
-  if (data.senderName || data.senderSmtpAddress || data.senderEmail) {
-    from.push({
-      name: data.senderName || '',
-      address: data.senderSmtpAddress || data.senderEmail || '',
-    })
-  }
-
-  const to = []
-  const cc = []
-  const bcc = []
-  for (const r of data.recipients || []) {
-    const entry = {
-      name: r.name || '',
-      address: r.smtpAddress || r.email || '',
-    }
-    if (r.recipType === 'cc') cc.push(entry)
-    else if (r.recipType === 'bcc') bcc.push(entry)
-    else to.push(entry)
-  }
-
-  const dateStr = data.clientSubmitTime || data.messageDeliveryTime || null
-  let date = null
-  if (dateStr) {
-    const parsedDate = new Date(dateStr)
-    if (!Number.isNaN(parsedDate.getTime())) {
-      date = parsedDate.toISOString()
-    }
-  }
-
-  return {
-    metadata: {
-      subject: data.subject || '(No Subject)',
-      from,
-      to,
-      cc,
-      bcc,
-      date,
-      bodyHtml,
-      text: bodyText,
-      attachments: visibleAttachments.map((entry) => entry.metadata),
-    },
-    rawAttachments: visibleAttachments.map((entry) => entry.raw),
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Email file parsing — routes .eml and .msg
-// ---------------------------------------------------------------------------
-async function parseEmailFile(filePath) {
-  const stats = await fs.promises.stat(filePath)
-  if (!stats.isFile()) throw new Error('Selected path is not a file.')
-  if (stats.size > MAX_EMAIL_BYTES) {
-    throw new Error(
-      `Email file exceeds ${MAX_EMAIL_BYTES / (1024 * 1024)} MiB limit.`,
-    )
-  }
-
-  const buffer = await fs.promises.readFile(filePath)
-  const ext = path.extname(filePath).toLowerCase()
-
-  if (ext === '.msg') {
-    return parseMsgFile(buffer)
-  }
-
-  // .eml parsing
-  let parsed
-  try {
-    parsed = await simpleParser(buffer)
-  } catch {
-    throw new Error(
-      'This email file could not be parsed. It may be malformed or use an unsupported format.',
-    )
-  }
-
-  const attachments = (parsed.attachments || []).map((a, index) => ({
-    index,
-    filename: sanitizeDownloadName(a.filename, index),
-    size: a.size || 0,
-    contentType: a.contentType || 'application/octet-stream',
-  }))
-
-  return {
-    metadata: {
-      subject: parsed.subject || '(No Subject)',
-      from: parsed.from?.value || [],
-      to: parsed.to?.value || [],
-      cc: parsed.cc?.value || [],
-      bcc: parsed.bcc?.value || [],
-      date: parsed.date?.toISOString() || null,
-      bodyHtml:
-        parsed.html ||
-        parsed.textAsHtml ||
-        `<pre>${escapeHtml(parsed.text || '')}</pre>`,
-      text: parsed.text || '',
-      attachments,
-    },
-    rawAttachments: parsed.attachments || [],
-  }
-}
 
 // ---------------------------------------------------------------------------
 // EML File Viewer — IPC validation and URL helpers
@@ -456,7 +210,6 @@ ipcMain.handle(
 )
 
 const BRINQ_TEMP_DIR = profileTempDir(app.getPath('temp'), app.getPath('userData'))
-const viewerTempFiles = new Map() // viewerId -> Set<tempPath>
 
 function ensurePrivateTempDir() {
   return ensurePrivateDirectory(BRINQ_TEMP_DIR)
@@ -467,18 +220,6 @@ function retryUnlink(filePath, attemptsLeft) {
     if (!err || attemptsLeft <= 1) return
     setTimeout(() => retryUnlink(filePath, attemptsLeft - 1), 15000)
   })
-}
-
-function cleanupViewerTempFiles(viewerId) {
-  const files = viewerTempFiles.get(viewerId)
-  if (!files) return
-  viewerTempFiles.delete(viewerId)
-  // Retry up to 4 times over ~1 minute (5s + 15s + 15s + 15s)
-  setTimeout(() => {
-    for (const tempPath of files) {
-      retryUnlink(tempPath, 4)
-    }
-  }, 5000)
 }
 
 function scheduleSyncedAttachmentCleanup(tempPath) {
@@ -523,10 +264,6 @@ ipcMain.handle(
         unsafe: true,
         error: `Cannot open .${ext.slice(1)} files directly. Use "Save As" instead.`,
       }
-    }
-
-    if (isEmailFilename(safeName) && att.content.length > MAX_EMAIL_BYTES) {
-      return { ok: false, unsafe: false, error: `This email file is ${att.content.length.toLocaleString('en-US')} bytes and exceeds the ${MAX_EMAIL_BYTES / (1024 * 1024)} MiB (${MAX_EMAIL_BYTES.toLocaleString('en-US')} byte) Open limit. Use Save As instead.` }
     }
 
     let tempPath
@@ -574,24 +311,32 @@ ipcMain.handle(
         retryUnlink(tempPath, 1)
         return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
       }
-      if (isEmailFilename(safeName)) {
-        const outcome = await openEmailFile(tempPath, { showError: false, stillAuthorized })
-        retryUnlink(tempPath, 1)
-        if (!stillAuthorized()) {
-          outcome.close?.()
-          return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
-        }
-        if (outcome.code === 'viewer-limit') return { ok: false, unsafe: false, error: outcome.error }
-        return outcome.ok ? { ok: true } : { ok: false, unsafe: false, error: 'Brinq could not open this email file. Use Save As instead.' }
-      }
-      if (!viewerTempFiles.has(viewerId)) viewerTempFiles.set(viewerId, new Set())
-      viewerTempFiles.get(viewerId).add(tempPath)
+      // Attached emails open in the user's default mail app like other files:
+      // Windows decides, showing its picker when none is set. The Brinq
+      // viewer shows them only when no app could open them.
       const errorMessage = await shell.openPath(tempPath)
-      if (errorMessage) {
+      if (!errorMessage) {
+        // The other app may still be starting, or keep the file open, after
+        // this viewer closes: keep the copy as long as any native Open's.
+        scheduleSyncedAttachmentCleanup(tempPath)
+        return { ok: true }
+      }
+      if (!isEmailFilename(safeName)) {
         retryUnlink(tempPath, 1)
         return { ok: false, error: 'No application could open this file. Use Save As instead.', unsafe: false }
       }
-      return { ok: true }
+      if (att.content.length > MAX_EMAIL_BYTES) {
+        retryUnlink(tempPath, 1)
+        return { ok: false, unsafe: false, error: `This email file is ${att.content.length.toLocaleString('en-US')} bytes and exceeds the ${MAX_EMAIL_BYTES / (1024 * 1024)} MiB (${MAX_EMAIL_BYTES.toLocaleString('en-US')} byte) Brinq viewer limit. Use Save As instead.` }
+      }
+      const outcome = await openEmailFile(tempPath, { showError: false, stillAuthorized })
+      retryUnlink(tempPath, 1)
+      if (!stillAuthorized()) {
+        outcome.close?.()
+        return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
+      }
+      if (outcome.code === 'viewer-limit') return { ok: false, unsafe: false, error: outcome.error }
+      return outcome.ok ? { ok: true } : { ok: false, unsafe: false, error: 'Brinq could not open this email file. Use Save As instead.' }
     } catch (err) {
       if (tempCreated) retryUnlink(tempPath, 1)
       return {
@@ -617,8 +362,10 @@ const fileActions = createFileActions({
   openPath: (file) => shell.openPath(file),
   openEmailFile: (file, stillAuthorized) => openEmailFile(file, { showError: false, stillAuthorized }),
   scheduleCleanup: scheduleSyncedAttachmentCleanup,
+  log: logFile,
 })
 ipcMain.handle('open-file', (event, source, id) => fileActions.open(event, source, id))
+ipcMain.handle('view-file', (event, source, id) => fileActions.view(event, source, id))
 ipcMain.handle('save-file-as', (event, source, id) => fileActions.save(event, source, id))
 ipcMain.handle('cancel-file-operation', (event, id) => fileActions.cancel(event, id))
 ipcMain.handle('file-capabilities', (event) => validateSender(event) ? CAPABILITIES : null)
@@ -649,10 +396,15 @@ async function openEmailFile(filePath, { showError = true, stillAuthorized = () 
   let viewerId = null
   let registered = false
 
+  // Phase durations for the file-open log line (no content).
+  const timings = {}
   try {
+    const parseStarted = performance.now()
     const result = await parseEmailFile(filePath)
+    timings.parse = Math.round(performance.now() - parseStarted)
     if (!stillAuthorized()) throw new Error('File operation canceled.')
     viewerId = randomUUID()
+    const windowStarted = performance.now()
 
     viewer = new BrowserWindow({
       width: 1100,
@@ -720,15 +472,15 @@ async function openEmailFile(filePath, { showError = true, stillAuthorized = () 
     }
 
     if (!stillAuthorized()) throw new Error('File operation canceled.')
+    timings.window = Math.round(performance.now() - windowStarted)
     loaded = true
     if (ready) viewer.show()
 
     viewer.once('closed', () => {
       fileViewerStore.delete(viewerId)
-      cleanupViewerTempFiles(viewerId)
       maybeQuitAfterFileViewerClose()
     })
-    return { ok: true, close: () => { if (!viewer.isDestroyed()) viewer.destroy() } }
+    return { ok: true, timings, close: () => { if (!viewer.isDestroyed()) viewer.destroy() } }
   } catch (err) {
     if (!registered) pendingViewerCount--
     if (viewerId) fileViewerStore.delete(viewerId)
