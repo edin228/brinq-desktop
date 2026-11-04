@@ -26,6 +26,7 @@
     "rtf-stream-parser": "^3.8.1"
   },
   "devDependencies": {
+    "cfb": "1.2.2",
     "electron": "44.4.5",
     "electron-builder": "^25.0.0"
   }
