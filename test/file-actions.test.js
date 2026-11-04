@@ -118,53 +118,16 @@ test('when no app can open an email file, Open falls back to the Brinq viewer', 
   assert.deepEqual(g.emailOpens, [])
 })
 
-test('Open uses whatever default mail app the user set; Brinq as that app, or no default, shows the Brinq viewer', async t => {
-  const cases = [
-    ['app', 'os', 1, 0], ['unknown', 'os', 1, 0],
-    ['brinq', 'viewer-default', 0, 1], ['none', 'viewer-no-default', 0, 1],
-  ]
-  for (const [kind, handler, osOpens, viewerOpens] of cases) {
-    const asked = []
-    const f = await fixture(t, { defaultApp: async ext => { asked.push(ext); return { kind } } })
-    f.fetchWith(eml)
-    assert.equal((await f.open()).ok, true, kind)
-    assert.deepEqual(asked, ['.eml'])
-    assert.equal(f.opens.length, osOpens, kind)
-    assert.equal(f.emailOpens.length, viewerOpens, kind)
-    assert.equal(f.logs.at(-1).handler, handler)
-    assert.equal(f.logs.at(-1).default_app, kind)
-    assert.equal(Number.isInteger(f.logs.at(-1).ms.default_app), true)
-  }
-  // A failing check keeps the plain OS open; other file types never ask.
-  const broken = await fixture(t, { defaultApp: async () => { throw new Error('reg.exe missing') } })
-  broken.fetchWith(eml)
-  assert.equal((await broken.open()).ok, true)
-  assert.equal(broken.opens.length, 1)
-  const asked = []
-  const pdfOnly = await fixture(t, { defaultApp: async ext => { asked.push(ext); return { kind: 'none' } } })
-  assert.equal((await pdfOnly.open()).ok, true)
-  assert.deepEqual(asked, [])
-  assert.equal(pdfOnly.opens.length, 1)
-})
-
-test('a cancel or navigation while the default app is looked up never launches an app', async t => {
-  for (const trigger of ['cancel', 'navigation']) {
-    let release
-    const waiting = new Promise(resolve => { release = resolve })
-    let entered
-    const asked = new Promise(resolve => { entered = resolve })
-    const f = await fixture(t, { defaultApp: async () => { entered(); await waiting; return { kind: 'app' } } })
-    f.fetchWith(eml)
-    const id = randomUUID()
-    const opening = f.open(SOURCE, id)
-    await asked
-    if (trigger === 'cancel') assert.equal(f.actions.cancel(f.event, id), true)
-    else f.event.sender.emit('did-start-navigation', {}, `${BASE}/other`, false, true)
-    release()
-    assert.equal((await opening).canceled, true, trigger)
-    assert.deepEqual(f.opens, [])
-    assert.deepEqual(f.emailOpens, [])
-    assert.deepEqual(await f.tempFiles(), [])
+test('Open hands every email file to the OS with no default-app lookup, even when that app is Brinq', async t => {
+  for (const item of EMAIL_CASES) {
+    const f = await fixture(t)
+    f.fetchWith(emailFetch(item))
+    assert.equal((await f.open(item.source)).ok, true, item.name)
+    assert.equal(f.opens.length, 1, item.name)
+    assert.deepEqual(f.emailOpens, [], item.name)
+    const line = f.logs.at(-1)
+    assert.equal(line.handler, 'os')
+    assert.equal('default_app' in line || 'default_app' in line.ms, false)
   }
 })
 

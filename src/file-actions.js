@@ -34,8 +34,6 @@ async function cancelBody(response) {
 function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPath, openEmailFile,
   markOrigin = markFileAsInternetOrigin, platform = process.platform,
   scheduleCleanup, log = () => {}, now = () => performance.now(),
-  // Windows: who opens this email type by default (see default-app.js).
-  defaultApp = async () => ({ kind: 'unknown' }),
 }) {
   const active = new Map()
   const origin = new URL(baseUrl).origin
@@ -210,20 +208,10 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
           facts.handler = 'viewer'
           return await viewInBrinq()
         }
-        if (emailFile) {
-          // The user's default mail app, whatever it is. When that is Brinq,
-          // or Windows has none and would only show its picker, show it here.
-          let handler
-          try { handler = await timed('default_app', () => defaultApp(path.extname(info.filename))) } catch { handler = null }
-          facts.default_app = handler?.kind || 'unknown'
-          // The lookup awaited: a cancel, navigation or closed window since
-          // then must not still launch an app.
-          check()
-          if (handler?.kind === 'brinq' || handler?.kind === 'none') {
-            facts.handler = handler.kind === 'brinq' ? 'viewer-default' : 'viewer-no-default'
-            return await viewInBrinq()
-          }
-        }
+        // Email files go to whatever app the user set for them, like any other
+        // file: Windows decides. With Brinq as that app, the file comes back
+        // through the single-instance handoff; with none, Windows shows its
+        // own picker. USER decision DEFAULT-APP (a), 2026-11-04.
         let error
         try { error = await timed('os_open', () => openPath(stagingPath)) } catch { error = true }
         if (error && emailFile) {

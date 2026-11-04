@@ -34,7 +34,6 @@ const {
 } = require('./attachment-files')
 const { createFileActions, CAPABILITIES } = require('./file-actions')
 const { parseEmailFile } = require('./email-file')
-const { createDefaultAppResolver } = require('./default-app')
 const { createUpdateStatus, headerView } = require('./update-status')
 const { createUpdateSchedule } = require('./update-schedule')
 const { sanitizedLogger } = require('./update-log')
@@ -298,19 +297,11 @@ ipcMain.handle(
         retryUnlink(tempPath, 1)
         return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
       }
-      // Attached emails open in the user's default mail app like other files;
-      // the Brinq viewer shows them when that app is Brinq, when Windows has
-      // no default (it would only show its picker), or when no app opens them.
-      const handler = isEmailFilename(safeName)
-        ? await emailDefaultApp(path.extname(safeName)).catch(() => ({ kind: 'unknown' }))
-        : { kind: 'unknown' }
-      if (!stillAuthorized()) {
-        retryUnlink(tempPath, 1)
-        return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
-      }
-      const showHere = handler.kind === 'brinq' || handler.kind === 'none'
-      const errorMessage = showHere ? '' : await shell.openPath(tempPath)
-      if (!showHere && !errorMessage) {
+      // Attached emails open in the user's default mail app like other files:
+      // Windows decides, showing its picker when none is set. The Brinq
+      // viewer shows them only when no app could open them.
+      const errorMessage = await shell.openPath(tempPath)
+      if (!errorMessage) {
         // The other app may still be starting, or keep the file open, after
         // this viewer closes: keep the copy as long as any native Open's.
         scheduleSyncedAttachmentCleanup(tempPath)
@@ -343,11 +334,6 @@ ipcMain.handle(
   },
 )
 
-// Windows: whether a mail type opens in another app, in Brinq, or nowhere.
-const emailDefaultApp = process.platform === 'win32'
-  ? createDefaultAppResolver({ execFile: require('util').promisify(require('child_process').execFile) })
-  : async () => ({ kind: 'unknown' })
-
 // Authenticated remote files share one cancellable streaming owner.
 const fileActions = createFileActions({
   baseUrl: BASE_URL,
@@ -363,7 +349,6 @@ const fileActions = createFileActions({
   openEmailFile: (file, stillAuthorized) => openEmailFile(file, { showError: false, stillAuthorized }),
   scheduleCleanup: scheduleSyncedAttachmentCleanup,
   log: logFile,
-  defaultApp: emailDefaultApp,
 })
 ipcMain.handle('open-file', (event, source, id) => fileActions.open(event, source, id))
 ipcMain.handle('view-file', (event, source, id) => fileActions.view(event, source, id))
