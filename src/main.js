@@ -304,6 +304,10 @@ ipcMain.handle(
       const handler = isEmailFilename(safeName)
         ? await emailDefaultApp(path.extname(safeName)).catch(() => ({ kind: 'unknown' }))
         : { kind: 'unknown' }
+      if (!stillAuthorized()) {
+        retryUnlink(tempPath, 1)
+        return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
+      }
       const showHere = handler.kind === 'brinq' || handler.kind === 'none'
       const errorMessage = showHere ? '' : await shell.openPath(tempPath)
       if (!showHere && !errorMessage) {

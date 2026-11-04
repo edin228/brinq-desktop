@@ -93,6 +93,14 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
         if (value.status === 401) fail('session', 'Your session expired. Sign in and try again.')
         if (value.status === 403) fail('permission', 'You no longer have access to this file. Refresh the page or contact your administrator.')
         if (value.status === 404) fail('not-found', 'This file is no longer available. Refresh the page and try again.')
+        if (value.status === 429) {
+          let body = null
+          if ((value.headers.get('content-type') || '').toLowerCase().includes('application/json')) {
+            try { body = JSON.parse((await readResponseWithLimit(value, MAX_METADATA_BYTES)).toString('utf8')) } catch { body = null }
+          }
+          check()
+          fail('rate-limit', rateLimitMessage(body))
+        }
         // The stored SMS owner enforces the existing 25 MiB upload/download cap.
         if (source.kind === 'sms-attachment' && value.status === 413) fail('provider', 'SMS attachment exceeds the 25 MiB (26,214,400 byte) download limit. Ask the sender for a smaller file or download it in RingCentral.', { limitBytes: 25 * 1024 * 1024 })
         if (source.kind === 'sms-attachment' && value.status === 503) fail('provider', 'The SMS attachment storage is unavailable. Try again later.')
@@ -206,9 +214,11 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
           let handler
           try { handler = await timed('default_app', () => defaultApp(path.extname(info.filename))) } catch { handler = null }
           facts.default_app = handler?.kind || 'unknown'
+          // The lookup awaited: a cancel, navigation or closed window since
+          // then must not still launch an app.
+          check()
           if (handler?.kind === 'brinq' || handler?.kind === 'none') {
             facts.handler = handler.kind === 'brinq' ? 'viewer-default' : 'viewer-no-default'
-            check()
             return await viewInBrinq()
           }
         }
@@ -252,6 +262,20 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
     save: (event, source, id) => perform(event, source, id, 'save'),
     cancel,
   }
+}
+
+// The backend's 429 body names the limit and the retry time, as the web
+// downloader shows it (frontend utils/downloadFile.ts rateLimitMessage).
+const RATE_LIMIT_PREFIX = 'Rate limit exceeded: '
+function rateLimitMessage(body) {
+  const fallback = 'Download limit reached. Try again shortly.'
+  if (!body || typeof body !== 'object') return fallback
+  const limit = typeof body.error === 'string' && body.error.startsWith(RATE_LIMIT_PREFIX)
+    ? body.error.slice(RATE_LIMIT_PREFIX.length).trim().slice(0, 80) : ''
+  const seconds = Number.isInteger(body.retry_after_seconds) && body.retry_after_seconds > 0 ? body.retry_after_seconds : null
+  if (seconds === null) return limit ? `Download limit reached (${limit}). Try again shortly.` : fallback
+  const wait = seconds < 90 ? (seconds === 1 ? '1 second' : `${seconds} seconds`) : `${Math.ceil(seconds / 60)} minutes`
+  return `${limit ? `Download limit reached (${limit}).` : 'Download limit reached.'} Try again in ${wait}.`
 }
 
 function result(code, error, extra = {}) {

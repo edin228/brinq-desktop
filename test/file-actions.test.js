@@ -147,6 +147,38 @@ test('Open uses whatever default mail app the user set; Brinq as that app, or no
   assert.equal(pdfOnly.opens.length, 1)
 })
 
+test('a cancel or navigation while the default app is looked up never launches an app', async t => {
+  for (const trigger of ['cancel', 'navigation']) {
+    let release
+    const waiting = new Promise(resolve => { release = resolve })
+    let entered
+    const asked = new Promise(resolve => { entered = resolve })
+    const f = await fixture(t, { defaultApp: async () => { entered(); await waiting; return { kind: 'app' } } })
+    f.fetchWith(eml)
+    const id = randomUUID()
+    const opening = f.open(SOURCE, id)
+    await asked
+    if (trigger === 'cancel') assert.equal(f.actions.cancel(f.event, id), true)
+    else f.event.sender.emit('did-start-navigation', {}, `${BASE}/other`, false, true)
+    release()
+    assert.equal((await opening).canceled, true, trigger)
+    assert.deepEqual(f.opens, [])
+    assert.deepEqual(f.emailOpens, [])
+    assert.deepEqual(await f.tempFiles(), [])
+  }
+})
+
+test('a rate-limited download explains the limit and when to retry', async t => {
+  const f = await fixture(t)
+  f.fetchWith(() => Response.json({ error: 'Rate limit exceeded: 30 per 1 minute', retry_after_seconds: 37 }, { status: 429 }))
+  const result = await f.open({ kind: 'client-email-attachment', clientId: '42', emailUid: 'email', attachmentId: 'att', filename: 'policy.pdf' })
+  assert.equal(result.code, 'rate-limit')
+  assert.equal(result.error, 'Download limit reached (30 per 1 minute). Try again in 37 seconds.')
+  f.fetchWith(() => new Response('busy', { status: 429 }))
+  assert.equal((await f.open()).error, 'Download limit reached. Try again shortly.')
+  assert.deepEqual(f.opens, [])
+})
+
 test('View in Brinq refuses non-email files without opening anything', async t => {
   const f = await fixture(t)
   const result = await f.view()
