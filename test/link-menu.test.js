@@ -52,6 +52,7 @@ test('no menu for non-links, external links, subframes or pages without app auth
   f.click(app, { linkURL: 'https://example.com/elsewhere' })
   f.click(app, { linkURL: 'javascript:alert(1)' })
   f.click(app, { linkURL: `${BASE}/clients`, frame: { url: `${BASE}/frame` } })
+  f.click(app, { linkURL: `${BASE}/clients`, frame: null })
   f.click(f.page(null), { linkURL: `${BASE}/clients` })
   f.click(f.page('viewer', `${BASE}/email/file-viewer?viewerId=v`), { linkURL: `${BASE}/clients` })
   assert.equal(f.menus.length, 0)

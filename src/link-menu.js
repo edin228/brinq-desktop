@@ -7,8 +7,9 @@ const { shareableUrl } = require('./tabs')
 function createLinkMenu({ security, Menu, clipboard, openTab, canOpenTab = () => true, windowFor }) {
   function show(contents, params) {
     if (!params || typeof params.linkURL !== 'string' || !params.linkURL) return false
-    if (params.frame && params.frame !== contents.mainFrame) return false
-    if (!security.validateSender({ sender: contents, senderFrame: contents.mainFrame })) return false
+    // Electron 44 may report no frame; only a click in the top document counts.
+    if (!params.frame || params.frame !== contents.mainFrame) return false
+    if (!security.validateSender({ sender: contents, senderFrame: params.frame })) return false
     const link = params.linkURL
     const shared = shareableUrl(link, security.isAppUrl)
     if (!shared) return false
