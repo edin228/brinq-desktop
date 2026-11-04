@@ -28,7 +28,11 @@
 // left on screen without a click handler. A popup still waiting to be shown
 // is never dismissed: close() can't cancel a queued display and would detach
 // its handler, so the set may run over the limit until those are shown.
-// Windows keeps only the newest 20 per app anyway.
+// While LIVE_LIMIT popups are still waiting, no new one is created at all:
+// if the OS has silently stopped showing them (Electron's Windows presenter
+// can fail to start without any event), nothing would ever release them.
+// Windows keeps only the newest 20 per app anyway. Nothing is shown when
+// Notification.isSupported() says the OS can't show notifications.
 const SEEN_LIMIT = 10000
 const LIVE_LIMIT = 100
 const MAX_DELIVERY_AGE_MS = 24 * 60 * 60 * 1000
@@ -45,6 +49,8 @@ function createNativeNotifier({
 }) {
   const seen = new Set() // uids, oldest first
   const live = new Map() // popup -> whether the OS has shown it yet, oldest first
+  let pending = 0 // entries of `live` not shown yet
+  const supported = () => typeof Notification.isSupported !== 'function' || Notification.isSupported()
 
   function remember(entries, item, limit) {
     entries.add(item)
@@ -72,23 +78,31 @@ function createNativeNotifier({
     const age = decisionAge(data, now)
     if (age !== null && age > maxDeliveryAgeMs) return 'stale'
     if (appFocused()) return 'focused'
+    if (!supported()) return 'unsupported'
+    if (pending >= liveLimit) return 'backlogged'
     const popup = new Notification({ title, body, icon })
-    const release = () => live.delete(popup)
+    const release = () => {
+      if (live.get(popup) === false) pending -= 1
+      live.delete(popup)
+    }
     popup.on('click', () => { release(); onClick(uid) })
     popup.on('close', (details) => { if (details?.reason !== 'timedOut') release() })
     popup.on('failed', release)
     popup.on('show', () => {
-      if (!live.has(popup)) return
+      if (live.get(popup) !== false) return
       live.set(popup, true)
+      pending -= 1
       trimLive()
     })
     live.set(popup, false)
+    pending += 1
     popup.show()
     trimLive()
     return 'shown'
   }
 
   notify.sizes = () => ({ seen: seen.size, live: live.size })
+  notify.pending = () => pending
   return notify
 }
 

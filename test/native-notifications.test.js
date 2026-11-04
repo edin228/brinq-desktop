@@ -2,10 +2,11 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const { createNativeNotifier, SEEN_LIMIT, LIVE_LIMIT, MAX_DELIVERY_AGE_MS } = require('../src/native-notifications')
 
-function harness({ focused = false, ...limits } = {}) {
-  const state = { focused, time: 1_000_000, popups: [], clicks: [] }
+function harness({ focused = false, supported = true, ...limits } = {}) {
+  const state = { focused, supported, time: 1_000_000, popups: [], clicks: [], created: 0 }
   class FakeNotification {
-    constructor(options) { this.options = options; this.handlers = {}; this.shown = false }
+    static isSupported() { return state.supported }
+    constructor(options) { state.created += 1; this.options = options; this.handlers = {}; this.shown = false }
     on(name, handler) { this.handlers[name] = handler }
     show() { this.shown = true; state.popups.push(this) }
     // The OS reports display later, as Electron's 'show' event.
@@ -118,23 +119,45 @@ test('beyond the bound the oldest shown popup is dismissed, never left without a
   assert.equal(LIVE_LIMIT, 100)
 })
 
-test('a popup still waiting for the OS to show it is never dismissed by the bound', () => {
+test('a popup still waiting for the OS to show it is never dismissed, and waiting ones are bounded', () => {
   const h = harness({ liveLimit: 2 })
-  for (const uid of ['a', 'b', 'c']) h.notify('Sender', uid, { uid })
-  // A burst: none shown yet, so none is closed and the set runs over.
-  assert.deepEqual(h.popups.map(p => p.closed), [undefined, undefined, undefined])
-  assert.deepEqual(h.notify.sizes(), { seen: 3, live: 3 })
-  // Once shown, the oldest shown one goes; a still-pending older one stays.
+  h.notify('Sender', 'a', { uid: 'a' })
+  h.notify('Sender', 'b', { uid: 'b' })
+  // A burst: two waiting fill the bound, so a third is not created at all,
+  // and nothing waiting is closed.
+  assert.equal(h.notify('Sender', 'c', { uid: 'c' }), 'backlogged')
+  assert.equal(h.created, 2)
+  assert.deepEqual(h.popups.map(p => p.closed), [undefined, undefined])
+  assert.equal(h.notify.pending(), 2)
+  // Once one is shown there is room again; the bound then dismisses the oldest
+  // shown popup, never the older one still waiting.
   h.popups[1].display()
-  assert.deepEqual(h.popups.map(p => p.closed), [undefined, true, undefined])
-  assert.deepEqual(h.notify.sizes(), { seen: 3, live: 2 })
-  h.popups[0].display()
+  assert.equal(h.notify('Sender', 'd', { uid: 'd' }), 'shown')
   h.popups[2].display()
-  assert.deepEqual(h.notify.sizes(), { seen: 3, live: 2 })
-  // A 'show' after the popup settled changes nothing.
-  h.popups[0].handlers.click()
+  assert.deepEqual(h.popups.map(p => p.closed), [undefined, true, undefined])
+  assert.deepEqual(h.notify.sizes(), { seen: 4, live: 2 })
+  assert.equal(h.notify.pending(), 1)
+  // A failure releases a waiting popup; a 'show' after settling changes nothing.
+  h.popups[0].handlers.failed()
   h.popups[0].display()
-  assert.deepEqual(h.notify.sizes(), { seen: 3, live: 1 })
+  assert.equal(h.notify.pending(), 0)
+  assert.deepEqual(h.notify.sizes(), { seen: 4, live: 1 })
+})
+
+test('an OS that silently never shows popups cannot make them pile up', () => {
+  const h = harness({ liveLimit: 3 })
+  // No show, failed or close ever arrives (a failed Windows presenter).
+  for (let i = 0; i < 1000; i += 1) h.notify('Sender', String(i), { uid: `email-${i}` })
+  assert.equal(h.created, 3)
+  assert.deepEqual(h.notify.sizes(), { seen: 1000, live: 3 })
+})
+
+test('nothing is shown when the OS cannot show notifications, and the email still counts as seen', () => {
+  const h = harness({ supported: false })
+  assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'unsupported')
+  assert.equal(h.created, 0)
+  h.supported = true
+  assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'duplicate')
 })
 
 test('a copy decided more than a day ago is refused and still counts as seen', () => {
