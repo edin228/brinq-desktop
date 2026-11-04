@@ -8,6 +8,7 @@ const SOURCE_FIELDS = {
   'marketing-attachment': ['projectUid', 'uid'],
   'sms-attachment': ['uid'],
   'synced-email-attachment': ['emailUid', 'attachmentId'],
+  'client-email-attachment': ['clientId', 'emailUid', 'attachmentId'],
 }
 const SOURCE_KINDS = Object.freeze(Object.keys(SOURCE_FIELDS))
 
@@ -43,6 +44,8 @@ function resolveSource(baseUrl, source) {
     case 'marketing-attachment': route = `/api/marketing-projects/${ids.projectUid}/attachments/${ids.uid}/download`; break
     case 'sms-attachment': route = `/api/messaging/sms/attachments/${ids.uid}/download`; break
     case 'synced-email-attachment': route = `/api/email-sync/synced-emails/${ids.emailUid}/attachments/${ids.attachmentId}/download`; break
+    // A client's email read through client visibility, not mailbox ownership.
+    case 'client-email-attachment': route = `/api/email-sync/clients/${ids.clientId}/emails/${ids.emailUid}/attachments/${ids.attachmentId}/download`; break
   }
   return { url: new URL(route, baseUrl).href, storageLink: source.kind === 'brinq-file' || source.kind === 'marketing-attachment', filename: source.filename }
 }

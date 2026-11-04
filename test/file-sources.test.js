@@ -12,6 +12,7 @@ test('source identities select existing canonical Next routes without slash redi
     [{ kind: 'marketing-attachment', projectUid: 'project/&', uid: 'attachment +' }, '/api/marketing-projects/project%2F%26/attachments/attachment%20%2B/download', true],
     [{ kind: 'sms-attachment', uid: 'stored-uid' }, '/api/messaging/sms/attachments/stored-uid/download', false],
     [{ kind: 'synced-email-attachment', emailUid: 'email', attachmentId: 'A/B?C#D' }, '/api/email-sync/synced-emails/email/attachments/A%2FB%3FC%23D/download', false],
+    [{ kind: 'client-email-attachment', clientId: '42', emailUid: 'email', attachmentId: 'A/B?C#D' }, '/api/email-sync/clients/42/emails/email/attachments/A%2FB%3FC%23D/download', false],
   ]
   assert.equal(SOURCE_KINDS.length, cases.length)
   for (const [source, route, storageLink] of cases) {
@@ -22,7 +23,9 @@ test('source identities select existing canonical Next routes without slash redi
 test('unknown kinds, source confusion, traversal and renderer authority are rejected', () => {
   for (const source of [null, [], {}, { kind: 'toString' }, { kind: 'unknown' },
     { kind: 'ams360-document', clientId: 'client', uid: 'stored' },
-    { kind: 'ams360-attachment', clientId: 'client', documentId: 'doc' }]) assert.equal(resolveSource(base, source), null)
+    { kind: 'ams360-attachment', clientId: 'client', documentId: 'doc' },
+    { kind: 'client-email-attachment', emailUid: 'email', attachmentId: 'id' },
+    { kind: 'client-email-attachment', clientId: '../42', emailUid: 'email', attachmentId: 'id' }]) assert.equal(resolveSource(base, source), null)
   for (const uid of ['', ' ', '.', '..', '../path', 'a/../b', '%2e%2e', '%252e%252e', '%2e%2e%2fpath', '\\..\\file', 'https://evil.test', 'file:///tmp/x', 'a\0b', 'a%0Ab', '\ud800']) {
     assert.equal(resolveSource(base, { kind: 'brinq-file', uid }), null, uid)
   }
