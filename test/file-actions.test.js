@@ -118,6 +118,35 @@ test('when no app can open an email file, Open falls back to the Brinq viewer', 
   assert.deepEqual(g.emailOpens, [])
 })
 
+test('Open uses whatever default mail app the user set; Brinq as that app, or no default, shows the Brinq viewer', async t => {
+  const cases = [
+    ['app', 'os', 1, 0], ['unknown', 'os', 1, 0],
+    ['brinq', 'viewer-default', 0, 1], ['none', 'viewer-no-default', 0, 1],
+  ]
+  for (const [kind, handler, osOpens, viewerOpens] of cases) {
+    const asked = []
+    const f = await fixture(t, { defaultApp: async ext => { asked.push(ext); return { kind } } })
+    f.fetchWith(eml)
+    assert.equal((await f.open()).ok, true, kind)
+    assert.deepEqual(asked, ['.eml'])
+    assert.equal(f.opens.length, osOpens, kind)
+    assert.equal(f.emailOpens.length, viewerOpens, kind)
+    assert.equal(f.logs.at(-1).handler, handler)
+    assert.equal(f.logs.at(-1).default_app, kind)
+    assert.equal(Number.isInteger(f.logs.at(-1).ms.default_app), true)
+  }
+  // A failing check keeps the plain OS open; other file types never ask.
+  const broken = await fixture(t, { defaultApp: async () => { throw new Error('reg.exe missing') } })
+  broken.fetchWith(eml)
+  assert.equal((await broken.open()).ok, true)
+  assert.equal(broken.opens.length, 1)
+  const asked = []
+  const pdfOnly = await fixture(t, { defaultApp: async ext => { asked.push(ext); return { kind: 'none' } } })
+  assert.equal((await pdfOnly.open()).ok, true)
+  assert.deepEqual(asked, [])
+  assert.equal(pdfOnly.opens.length, 1)
+})
+
 test('View in Brinq refuses non-email files without opening anything', async t => {
   const f = await fixture(t)
   const result = await f.view()

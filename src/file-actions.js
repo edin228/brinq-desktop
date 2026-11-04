@@ -34,6 +34,8 @@ async function cancelBody(response) {
 function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPath, openEmailFile,
   markOrigin = markFileAsInternetOrigin, platform = process.platform,
   scheduleCleanup, log = () => {}, now = () => performance.now(),
+  // Windows: who opens this email type by default (see default-app.js).
+  defaultApp = async () => ({ kind: 'unknown' }),
 }) {
   const active = new Map()
   const origin = new URL(baseUrl).origin
@@ -196,6 +198,18 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
         if (mode === 'view') {
           facts.handler = 'viewer'
           return await viewInBrinq()
+        }
+        if (emailFile) {
+          // The user's default mail app, whatever it is. When that is Brinq,
+          // or Windows has none and would only show its picker, show it here.
+          let handler
+          try { handler = await timed('default_app', () => defaultApp(path.extname(info.filename))) } catch { handler = null }
+          facts.default_app = handler?.kind || 'unknown'
+          if (handler?.kind === 'brinq' || handler?.kind === 'none') {
+            facts.handler = handler.kind === 'brinq' ? 'viewer-default' : 'viewer-no-default'
+            check()
+            return await viewInBrinq()
+          }
         }
         let error
         try { error = await timed('os_open', () => openPath(stagingPath)) } catch { error = true }

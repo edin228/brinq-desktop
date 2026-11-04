@@ -34,6 +34,7 @@ const {
 } = require('./attachment-files')
 const { createFileActions, CAPABILITIES } = require('./file-actions')
 const { parseEmailFile } = require('./email-file')
+const { createDefaultAppResolver } = require('./default-app')
 const { createUpdateStatus, headerView } = require('./update-status')
 const { createUpdateSchedule } = require('./update-schedule')
 const { sanitizedLogger } = require('./update-log')
@@ -310,10 +311,15 @@ ipcMain.handle(
         retryUnlink(tempPath, 1)
         return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
       }
-      // Attached emails open in the OS default mail app like other files;
-      // the Brinq viewer is the fallback when no app can open them.
-      const errorMessage = await shell.openPath(tempPath)
-      if (!errorMessage) {
+      // Attached emails open in the user's default mail app like other files;
+      // the Brinq viewer shows them when that app is Brinq, when Windows has
+      // no default (it would only show its picker), or when no app opens them.
+      const handler = isEmailFilename(safeName)
+        ? await emailDefaultApp(path.extname(safeName)).catch(() => ({ kind: 'unknown' }))
+        : { kind: 'unknown' }
+      const showHere = handler.kind === 'brinq' || handler.kind === 'none'
+      const errorMessage = showHere ? '' : await shell.openPath(tempPath)
+      if (!showHere && !errorMessage) {
         if (!viewerTempFiles.has(viewerId)) viewerTempFiles.set(viewerId, new Set())
         viewerTempFiles.get(viewerId).add(tempPath)
         return { ok: true }
@@ -324,7 +330,7 @@ ipcMain.handle(
       }
       if (att.content.length > MAX_EMAIL_BYTES) {
         retryUnlink(tempPath, 1)
-        return { ok: false, unsafe: false, error: `This email file is ${att.content.length.toLocaleString('en-US')} bytes and exceeds the ${MAX_EMAIL_BYTES / (1024 * 1024)} MiB (${MAX_EMAIL_BYTES.toLocaleString('en-US')} byte) viewer limit, and no mail app could open it. Use Save As instead.` }
+        return { ok: false, unsafe: false, error: `This email file is ${att.content.length.toLocaleString('en-US')} bytes and exceeds the ${MAX_EMAIL_BYTES / (1024 * 1024)} MiB (${MAX_EMAIL_BYTES.toLocaleString('en-US')} byte) Brinq viewer limit. Use Save As instead.` }
       }
       const outcome = await openEmailFile(tempPath, { showError: false, stillAuthorized })
       retryUnlink(tempPath, 1)
@@ -345,6 +351,11 @@ ipcMain.handle(
   },
 )
 
+// Windows: whether a mail type opens in another app, in Brinq, or nowhere.
+const emailDefaultApp = process.platform === 'win32'
+  ? createDefaultAppResolver({ execFile: require('util').promisify(require('child_process').execFile) })
+  : async () => ({ kind: 'unknown' })
+
 // Authenticated remote files share one cancellable streaming owner.
 const fileActions = createFileActions({
   baseUrl: BASE_URL,
@@ -360,6 +371,7 @@ const fileActions = createFileActions({
   openEmailFile: (file, stillAuthorized) => openEmailFile(file, { showError: false, stillAuthorized }),
   scheduleCleanup: scheduleSyncedAttachmentCleanup,
   log: logFile,
+  defaultApp: emailDefaultApp,
 })
 ipcMain.handle('open-file', (event, source, id) => fileActions.open(event, source, id))
 ipcMain.handle('view-file', (event, source, id) => fileActions.view(event, source, id))
