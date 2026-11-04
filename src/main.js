@@ -85,6 +85,10 @@ const RECOVERY_URL = pathToFileURL(path.join(__dirname, 'offline.html')).href
 // Update records stay in the local log only, without URLs' queries or feeds.
 const updateLog = sanitizedLogger(require('electron-log'))
 const logUpdate = (event, fields) => updateLog.info(`[update] ${event} ${JSON.stringify(fields)}`)
+// One line per native file operation. file-actions.js emits only fixed fields
+// (kind, extension, size, outcome, phase ms), so the update sanitizer's
+// 300-character cut is not applied.
+const logFile = (fields) => require('electron-log').info(`[file] ${fields.mode} ${JSON.stringify(fields)}`)
 const updates = createUpdateStatus({
   app, updater: autoUpdater, log: logUpdate,
   onCheckEnd: (result) => updateSchedule.record(result),
@@ -261,10 +265,6 @@ ipcMain.handle(
       }
     }
 
-    if (isEmailFilename(safeName) && att.content.length > MAX_EMAIL_BYTES) {
-      return { ok: false, unsafe: false, error: `This email file is ${att.content.length.toLocaleString('en-US')} bytes and exceeds the ${MAX_EMAIL_BYTES / (1024 * 1024)} MiB (${MAX_EMAIL_BYTES.toLocaleString('en-US')} byte) Open limit. Use Save As instead.` }
-    }
-
     let tempPath
     let tempCreated = false
     try {
@@ -310,24 +310,30 @@ ipcMain.handle(
         retryUnlink(tempPath, 1)
         return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
       }
-      if (isEmailFilename(safeName)) {
-        const outcome = await openEmailFile(tempPath, { showError: false, stillAuthorized })
-        retryUnlink(tempPath, 1)
-        if (!stillAuthorized()) {
-          outcome.close?.()
-          return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
-        }
-        if (outcome.code === 'viewer-limit') return { ok: false, unsafe: false, error: outcome.error }
-        return outcome.ok ? { ok: true } : { ok: false, unsafe: false, error: 'Brinq could not open this email file. Use Save As instead.' }
-      }
-      if (!viewerTempFiles.has(viewerId)) viewerTempFiles.set(viewerId, new Set())
-      viewerTempFiles.get(viewerId).add(tempPath)
+      // Attached emails open in the OS default mail app like other files;
+      // the Brinq viewer is the fallback when no app can open them.
       const errorMessage = await shell.openPath(tempPath)
-      if (errorMessage) {
+      if (!errorMessage) {
+        if (!viewerTempFiles.has(viewerId)) viewerTempFiles.set(viewerId, new Set())
+        viewerTempFiles.get(viewerId).add(tempPath)
+        return { ok: true }
+      }
+      if (!isEmailFilename(safeName)) {
         retryUnlink(tempPath, 1)
         return { ok: false, error: 'No application could open this file. Use Save As instead.', unsafe: false }
       }
-      return { ok: true }
+      if (att.content.length > MAX_EMAIL_BYTES) {
+        retryUnlink(tempPath, 1)
+        return { ok: false, unsafe: false, error: `This email file is ${att.content.length.toLocaleString('en-US')} bytes and exceeds the ${MAX_EMAIL_BYTES / (1024 * 1024)} MiB (${MAX_EMAIL_BYTES.toLocaleString('en-US')} byte) viewer limit, and no mail app could open it. Use Save As instead.` }
+      }
+      const outcome = await openEmailFile(tempPath, { showError: false, stillAuthorized })
+      retryUnlink(tempPath, 1)
+      if (!stillAuthorized()) {
+        outcome.close?.()
+        return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
+      }
+      if (outcome.code === 'viewer-limit') return { ok: false, unsafe: false, error: outcome.error }
+      return outcome.ok ? { ok: true } : { ok: false, unsafe: false, error: 'Brinq could not open this email file. Use Save As instead.' }
     } catch (err) {
       if (tempCreated) retryUnlink(tempPath, 1)
       return {
@@ -353,8 +359,10 @@ const fileActions = createFileActions({
   openPath: (file) => shell.openPath(file),
   openEmailFile: (file, stillAuthorized) => openEmailFile(file, { showError: false, stillAuthorized }),
   scheduleCleanup: scheduleSyncedAttachmentCleanup,
+  log: logFile,
 })
 ipcMain.handle('open-file', (event, source, id) => fileActions.open(event, source, id))
+ipcMain.handle('view-file', (event, source, id) => fileActions.view(event, source, id))
 ipcMain.handle('save-file-as', (event, source, id) => fileActions.save(event, source, id))
 ipcMain.handle('cancel-file-operation', (event, id) => fileActions.cancel(event, id))
 ipcMain.handle('file-capabilities', (event) => validateSender(event) ? CAPABILITIES : null)
@@ -385,10 +393,15 @@ async function openEmailFile(filePath, { showError = true, stillAuthorized = () 
   let viewerId = null
   let registered = false
 
+  // Phase durations for the file-open log line (no content).
+  const timings = {}
   try {
+    const parseStarted = performance.now()
     const result = await parseEmailFile(filePath)
+    timings.parse = Math.round(performance.now() - parseStarted)
     if (!stillAuthorized()) throw new Error('File operation canceled.')
     viewerId = randomUUID()
+    const windowStarted = performance.now()
 
     viewer = new BrowserWindow({
       width: 1100,
@@ -456,6 +469,7 @@ async function openEmailFile(filePath, { showError = true, stillAuthorized = () 
     }
 
     if (!stillAuthorized()) throw new Error('File operation canceled.')
+    timings.window = Math.round(performance.now() - windowStarted)
     loaded = true
     if (ready) viewer.show()
 
@@ -464,7 +478,7 @@ async function openEmailFile(filePath, { showError = true, stillAuthorized = () 
       cleanupViewerTempFiles(viewerId)
       maybeQuitAfterFileViewerClose()
     })
-    return { ok: true, close: () => { if (!viewer.isDestroyed()) viewer.destroy() } }
+    return { ok: true, timings, close: () => { if (!viewer.isDestroyed()) viewer.destroy() } }
   } catch (err) {
     if (!registered) pendingViewerCount--
     if (viewerId) fileViewerStore.delete(viewerId)

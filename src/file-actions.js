@@ -15,7 +15,8 @@ const MAX_OPEN_BYTES = 50 * 1024 * 1024
 // The existing link owner returns one signed storage URL. 64 KiB gives that
 // small JSON contract ample headroom while bounding malformed server responses.
 const MAX_METADATA_BYTES = 64 * 1024
-const CAPABILITIES = Object.freeze({ version: 1, sourceKinds: SOURCE_KINDS, cancellation: true })
+// viewInBrinq: email files can also be opened in Brinq's own viewer (`view`).
+const CAPABILITIES = Object.freeze({ version: 1, sourceKinds: SOURCE_KINDS, cancellation: true, viewInBrinq: true })
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 class FileFailure extends Error {
@@ -28,9 +29,11 @@ async function cancelBody(response) {
   try { await response?.body?.cancel() } catch { /* Pipeline may already own or close the body. */ }
 }
 
+// `log(fields)` receives one line per operation: phase durations, source kind,
+// file extension, size and outcome code. Never names, identifiers or URLs.
 function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPath, openEmailFile,
   markOrigin = markFileAsInternetOrigin, platform = process.platform,
-  scheduleCleanup,
+  scheduleCleanup, log = () => {}, now = () => performance.now(),
 }) {
   const active = new Map()
   const origin = new URL(baseUrl).origin
@@ -44,6 +47,21 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
   }
 
   async function perform(event, source, operationId, mode) {
+    const started = now()
+    const ms = {}
+    const facts = { mode, kind: typeof source?.kind === 'string' ? source.kind : 'invalid' }
+    const timed = async (phase, work) => {
+      const at = now()
+      try { return await work() } finally { ms[phase] = Math.round((ms[phase] || 0) + now() - at) }
+    }
+    const outcome = await performTimed(event, source, operationId, mode, { ms, facts, timed, started })
+    try {
+      log({ ...facts, outcome: outcome.code, ms: { ...ms, total: Math.round(now() - started) } })
+    } catch { /* Diagnostics never change a file result. */ }
+    return outcome
+  }
+
+  async function performTimed(event, source, operationId, mode, { ms, facts, timed, started }) {
     if (!security.validateSender(event)) return result('permission', 'This window cannot access native files.')
     const resolved = resolveSource(baseUrl, source)
     if (!resolved || !UUID.test(operationId)) return result('invalid', 'Invalid file request. Refresh the page and try again.')
@@ -89,29 +107,37 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
     }
 
     try {
-      await fetchResponse(resolved.url)
+      // Validation and window checks before the first request.
+      ms.prepare = Math.round(now() - started)
+      if (resolved.storageLink) await timed('metadata', () => fetchResponse(resolved.url))
+      else await timed('server', () => fetchResponse(resolved.url))
       if (resolved.storageLink) {
         if (!(response.headers.get('content-type') || '').toLowerCase().includes('application/json')) fail('session', 'The file link is unavailable. Sign in again and retry.')
         const declared = Number(response.headers.get('content-length') || 0)
         if (declared > MAX_METADATA_BYTES) fail('metadata', 'The file link response exceeds the 64 KiB metadata limit. Refresh and try again.', { limitBytes: MAX_METADATA_BYTES, observedBytes: declared })
         let metadata
-        try { metadata = JSON.parse((await readResponseWithLimit(response, MAX_METADATA_BYTES)).toString('utf8')) }
+        try { metadata = JSON.parse((await timed('metadata', () => readResponseWithLimit(response, MAX_METADATA_BYTES))).toString('utf8')) }
         catch (error) { check(); fail('metadata', 'The file link response is invalid or exceeds the 64 KiB metadata limit. Refresh and try again.', { limitBytes: MAX_METADATA_BYTES, ...(error.observedBytes ? { observedBytes: error.observedBytes } : {}) }) }
         const proxyUrl = storageProxyUrl(baseUrl, metadata?.url)
         if (!proxyUrl) fail('metadata', 'The file link is invalid. Refresh the page and try again.')
-        await fetchResponse(proxyUrl)
+        await timed('server', () => fetchResponse(proxyUrl))
       }
       const info = responseFileInfo(response.headers, resolved.filename)
-      const emailOpen = mode === 'open' && isEmailFilename(info.filename)
-      const openLimit = emailOpen ? MAX_EMAIL_BYTES : MAX_OPEN_BYTES
+      facts.type = path.extname(info.filename).toLowerCase().slice(0, 12) || 'none'
+      const emailFile = isEmailFilename(info.filename)
+      // Email files open in the OS default app like any other file; `view`
+      // shows them in Brinq's viewer, which parses the whole file in memory.
+      const local = mode !== 'save'
+      if (mode === 'view' && !emailFile) fail('unsupported', 'Only .eml and .msg email files can be viewed in Brinq. Use Open or Save As.')
+      const openLimit = mode === 'view' ? MAX_EMAIL_BYTES : MAX_OPEN_BYTES
       const activeMime = info.mime === 'text/html' || info.mime === 'application/xhtml+xml' || info.mime === 'application/json' || info.mime.endsWith('+json')
       if (!resolved.storageLink && activeMime && !info.attachment) fail('session', 'The server returned a page instead of a file. Sign in and try again.')
-      if (mode === 'open' && !info.canOpen) fail('unsupported', 'This file type cannot be opened directly. Use Save As to save this file.')
+      if (local && !info.canOpen) fail('unsupported', 'This file type cannot be opened directly. Use Save As to save this file.')
       if (!response.body) fail('network', 'The file response was empty. Try again.')
       const headerLength = response.headers.get('content-length')
       const declared = headerLength === null ? null : Number(headerLength)
       if (declared !== null && (!Number.isSafeInteger(declared) || declared < 0)) fail('network', 'The file size was invalid. Try again.')
-      if (mode === 'open' && declared > openLimit) limit(declared, openLimit)
+      if (local && declared > openLimit) limit(declared, openLimit)
       let target
       if (mode === 'save') {
         const selection = await showSaveDialog(event.sender, { defaultPath: info.filename })
@@ -133,29 +159,32 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
         transform(chunk, _encoding, callback) {
           total += chunk.length
           if (prefix.length < 512) prefix = Buffer.concat([prefix, chunk.subarray(0, 512 - prefix.length)])
-          if (mode === 'open' && total > openLimit) {
+          if (local && total > openLimit) {
             callback(new FileFailure('limit', limitMessage(openLimit, total), { limitBytes: openLimit, observedBytes: total }))
           } else callback(null, chunk)
         },
       })
-      await pipeline(Readable.fromWeb(response.body), measure, handle.createWriteStream(), { signal })
+      await timed('download', () => pipeline(Readable.fromWeb(response.body), measure, handle.createWriteStream(), { signal }))
+      facts.bytes = total
       check()
       // Fetch transparently decompresses encoded responses; their wire length is
       // not the decoded file length. Compare only identity-encoded responses.
       if (!response.headers.get('content-encoding') && declared !== null && total !== declared) fail('network', 'The file download was incomplete. Try again.')
       const text = prefix.toString('utf8').trimStart()
       if (!resolved.storageLink && (!info.attachment || !activeMime) && /^(?:<!doctype\s+html|<html\b|<body\b|\{\s*"(?:error|detail)"\s*:)/i.test(text)) fail('session', 'The server returned an error instead of a file. Sign in and try again.')
-      if (mode === 'open' && /^(?:<!doctype\s+html|<html\b|<body\b|\{\s*"(?:error|detail)"\s*:)/i.test(text)) fail('unsupported', 'The downloaded content cannot be opened directly. Use Save As to save this file.')
+      if (local && /^(?:<!doctype\s+html|<html\b|<body\b|\{\s*"(?:error|detail)"\s*:)/i.test(text)) fail('unsupported', 'The downloaded content cannot be opened directly. Use Save As to save this file.')
       try {
-        const marked = await markOrigin(stagingPath, origin)
+        const marked = await timed('protect', () => markOrigin(stagingPath, origin))
         if (!marked && requiresInternetOriginProtection(info.filename, platform)) fail('protection', 'OS security protection could not be applied. Try Save As on a supported disk.')
       } catch { fail('protection', 'OS security protection could not be applied. Try Save As on a supported disk.') }
       check()
-      if (mode === 'open') {
-        if (emailOpen) {
+      if (local) {
+        const viewInBrinq = async () => {
+          if (total > MAX_EMAIL_BYTES) limit(total, MAX_EMAIL_BYTES)
           let outcome
-          try { outcome = await openEmailFile(stagingPath, () => !signal.aborted && stillAuthorized()) }
+          try { outcome = await timed('viewer', () => openEmailFile(stagingPath, () => !signal.aborted && stillAuthorized())) }
           catch { /* Keep parser details out of the renderer. */ }
+          if (outcome?.timings) Object.assign(ms, outcome.timings)
           if (signal.aborted || !stillAuthorized()) {
             outcome?.close?.()
             canceled()
@@ -164,8 +193,19 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
           if (!outcome?.ok) fail('email-open', 'Brinq could not open this email file. Try again or use Save As to save it.')
           return { ok: true, code: 'ok', canceled: false, unsafe: false }
         }
+        if (mode === 'view') {
+          facts.handler = 'viewer'
+          return await viewInBrinq()
+        }
         let error
-        try { error = await openPath(stagingPath) } catch { error = true }
+        try { error = await timed('os_open', () => openPath(stagingPath)) } catch { error = true }
+        if (error && emailFile) {
+          // No mail app could take it; Brinq can still show it.
+          facts.handler = 'viewer-fallback'
+          check()
+          return await viewInBrinq()
+        }
+        facts.handler = 'os'
         if (error) fail('os-open', 'No application could open this file. Install an application for this file type or use Save As.')
         retained = true
         scheduleCleanup(stagingPath)
@@ -193,6 +233,7 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
   }
   return {
     open: (event, source, id) => perform(event, source, id, 'open'),
+    view: (event, source, id) => perform(event, source, id, 'view'),
     save: (event, source, id) => perform(event, source, id, 'save'),
     cancel,
   }
