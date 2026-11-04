@@ -43,6 +43,7 @@ const { createUpdateSchedule } = require('./update-schedule')
 const { sanitizedLogger } = require('./update-log')
 const { guardWindowUnload } = require('./unload-guard')
 const { createTabWindow } = require('./tab-window')
+const { createLinkMenu } = require('./link-menu')
 const { installBrowserSignIn } = require('./browser-sign-in')
 
 // Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
@@ -80,6 +81,19 @@ let tabWindow = null
 let tray = null
 const navigationQueue = createNavigationQueue()
 let navigatingMain = false
+
+// Right-click on a Brinq link (sidebar navigation included): Open in new tab
+// or Copy link. Pages are checked when the menu is requested, not at creation.
+const linkMenu = createLinkMenu({
+  security: windowSecurity,
+  Menu,
+  clipboard,
+  openTab: (args) => tabWindow?.openTab(args),
+  canOpenTab: () => !!tabWindow,
+  windowFor: (contents) => tabWindow?.windowFor(contents) || BrowserWindow.fromWebContents(contents),
+})
+app.on('web-contents-created', (_event, contents) => linkMenu.attach(contents))
+
 let recoveryWindow = null
 let intendedAppUrl = null
 let recoveryRetry = null
