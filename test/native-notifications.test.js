@@ -1,8 +1,8 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { createNativeNotifier, RETAIN_MS } = require('../src/native-notifications')
+const { createNativeNotifier, SEEN_LIMIT, LIVE_LIMIT, MAX_DELIVERY_AGE_MS } = require('../src/native-notifications')
 
-function harness({ focused = false } = {}) {
+function harness({ focused = false, ...limits } = {}) {
   const state = { focused, time: 1_000_000, popups: [], clicks: [] }
   class FakeNotification {
     constructor(options) { this.options = options; this.handlers = {}; this.shown = false }
@@ -15,6 +15,7 @@ function harness({ focused = false } = {}) {
     onClick: (uid) => state.clicks.push(uid),
     icon: '/icon.png',
     now: () => state.time,
+    ...limits,
   })
   return state
 }
@@ -54,42 +55,67 @@ test('clicking a popup opens its email', () => {
   assert.deepEqual(h.clicks, ['email-1'])
 })
 
-test('a copy that arrives long after the server decided never pops up again', () => {
+const DAY = 24 * 60 * 60 * 1000
+
+test('a copy that arrives days later never pops up, whatever the clock does', () => {
   const h = harness({ focused: true })
   assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'focused')
   h.focused = false
-  // Past the server's 600 s cutoff: a stalled page delivering late.
-  h.time += 11 * 60 * 1000
+  // A stalled page delivering after a weekend.
+  h.time += 3 * DAY
   assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'duplicate')
-  h.time += 23 * 60 * 60 * 1000
+  // A clock corrected backwards changes nothing either.
+  h.time -= 30 * DAY
   assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'duplicate')
   assert.equal(h.popups.length, 0)
 })
 
-test('a seen email is forgotten only after the retention window', () => {
-  const h = harness()
-  h.notify('Sender', 'Subject', { uid: 'email-1' })
-  h.time += RETAIN_MS - 1
-  assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'duplicate')
-  h.time += 1
-  assert.equal(h.notify('Sender', 'Subject', { uid: 'email-1' }), 'shown')
-  assert.equal(RETAIN_MS, 24 * 60 * 60 * 1000)
+test('seen emails are bounded by count, oldest first, and a clock rollback cannot strand them', () => {
+  const h = harness({ seenLimit: 3 })
+  for (const uid of ['a', 'b', 'c']) h.notify('S', uid, { uid })
+  h.time -= 10 * DAY
+  h.notify('S', 'd', { uid: 'd' })
+  assert.deepEqual(h.notify.sizes().seen, 3)
+  // 'a' was the oldest and is forgotten; the newer ones are still duplicates.
+  for (const uid of ['b', 'c', 'd']) assert.equal(h.notify('S', uid, { uid }), 'duplicate')
+  assert.equal(h.notify('S', 'a', { uid: 'a' }), 'shown')
+  assert.equal(SEEN_LIMIT, 10000)
 })
 
-test('a shown popup stays referenced until clicked, closed, failed or expired', () => {
+test('a shown popup stays referenced until clicked, dismissed or failed; a timed-out toast stays clickable', () => {
   const h = harness()
-  for (const uid of ['a', 'b', 'c', 'd']) h.notify('Sender', uid, { uid })
-  assert.deepEqual(h.notify.sizes(), { seen: 4, live: 4 })
-  const [a, b, c] = h.popups
+  for (const uid of ['a', 'b', 'c', 'd', 'e']) h.notify('Sender', uid, { uid })
+  assert.deepEqual(h.notify.sizes(), { seen: 5, live: 5 })
+  const [a, b, c, d, e] = h.popups
   a.handlers.click()
-  b.handlers.close()
+  b.handlers.close({ reason: 'userCanceled' })
   c.handlers.failed()
-  assert.deepEqual(h.notify.sizes(), { seen: 4, live: 1 })
-  assert.deepEqual(h.clicks, ['a'])
-  // Whatever is left is dropped with its uid once the window passes.
-  h.time += RETAIN_MS
-  assert.equal(h.notify('Sender', 'e', { uid: 'e' }), 'shown')
-  assert.deepEqual(h.notify.sizes(), { seen: 1, live: 1 })
+  // Windows: the banner timed out, but the toast waits in the Action Center.
+  d.handlers.close({ reason: 'timedOut' })
+  e.handlers.close()
+  assert.deepEqual(h.notify.sizes(), { seen: 5, live: 1 })
+  d.handlers.click()
+  assert.deepEqual(h.clicks, ['a', 'd'])
+  assert.deepEqual(h.notify.sizes(), { seen: 5, live: 0 })
+})
+
+test('unsettled popups are bounded by count, oldest first', () => {
+  const h = harness({ liveLimit: 2 })
+  for (const uid of ['a', 'b', 'c']) h.notify('Sender', uid, { uid })
+  assert.deepEqual(h.notify.sizes(), { seen: 3, live: 2 })
+  assert.equal(LIVE_LIMIT, 100)
+})
+
+test('a copy decided more than a day ago is refused and still counts as seen', () => {
+  const h = harness()
+  const at = (ms) => new Date(h.time - ms).toISOString()
+  assert.equal(h.notify('S', 'old', { uid: 'old', decidedAt: at(MAX_DELIVERY_AGE_MS + 1) }), 'stale')
+  assert.equal(h.notify('S', 'old', { uid: 'old' }), 'duplicate')
+  assert.equal(h.notify('S', 'recent', { uid: 'recent', decidedAt: at(60 * 1000) }), 'shown')
+  // Clock skew putting the decision in the future, or an unreadable time, is not refused.
+  assert.equal(h.notify('S', 'skew', { uid: 'skew', decidedAt: at(-60 * 1000) }), 'shown')
+  assert.equal(h.notify('S', 'junk', { uid: 'junk', decidedAt: 'yesterday-ish' }), 'shown')
+  assert.equal(h.popups.length, 3)
 })
 
 test('invalid requests never show a popup; a request without a usable uid is not deduplicated', () => {
