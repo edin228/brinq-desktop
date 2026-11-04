@@ -79,3 +79,48 @@ test('external SMTP senders keep their address, and a legacyDN display name is n
   assert.deepEqual(m.to, [{ name: '', address: 'recipient@example.com' }])
   noX500(m)
 })
+
+test('a delegate that shares the mailbox display name never lends its own address', async t => {
+  const support = await parse(t, {
+    sender: { name: 'Support', addressType: 'SMTP', email: 'delegate@example.com', smtp: 'delegate@example.com' },
+    representing: { name: 'Support', addressType: 'EX', email: SENDER_X500 },
+  })
+  assert.deepEqual(support.from, [{ name: 'Support', address: '' }])
+  const unnamedSender = await parse(t, {
+    sender: { addressType: 'SMTP', email: 'delegate@example.com', smtp: 'delegate@example.com' },
+    representing: { name: 'Shared Mailbox', addressType: 'EX', email: SENDER_X500 },
+  })
+  assert.deepEqual(unnamedSender.from, [{ name: 'Shared Mailbox', address: '' }])
+  // The same mailbox (matching addresses) still uses the sender's SMTP address.
+  const self = await parse(t, {
+    sender: { name: 'Test Sender', addressType: 'EX', email: SENDER_X500, smtp: 'sender@example.com' },
+    representing: { name: 'Test Sender', addressType: 'EX', email: SENDER_X500 },
+  })
+  assert.deepEqual(self.from, [{ name: 'Test Sender', address: 'sender@example.com' }])
+})
+
+test('recipients with the same display name never borrow one another\'s header address', async t => {
+  const m = await parse(t, {
+    sender: { name: 'Test Sender', addressType: 'SMTP', email: 'sender@example.com' },
+    headers: 'From: Test Sender <sender@example.com>\r\nTo: John Smith <john.one@example.com>, John Smith <john.two@example.com>, Unique Person <unique@example.com>',
+    recipients: [
+      { name: 'John Smith', addressType: 'EX', email: RECIPIENT_X500 },
+      { name: 'John Smith', addressType: 'EX', email: RECIPIENT_X500 },
+      { name: 'Unique Person', addressType: 'EX', email: RECIPIENT_X500 },
+    ],
+  })
+  assert.deepEqual(m.to, [
+    { name: 'John Smith', address: '' },
+    { name: 'John Smith', address: '' },
+    { name: 'Unique Person', address: 'unique@example.com' },
+  ])
+})
+
+test('a legacyDN that ends in an address-shaped segment is still not an SMTP address', async t => {
+  const m = await parse(t, {
+    sender: { name: 'Test Sender', addressType: 'EX', email: '/o=Org/ou=Group/cn=Recipients/cn=user@example.com' },
+    recipients: [{ name: 'Test Recipient', addressType: 'EX', email: '/o=Org/cn=Recipients/cn=r@example.com' }],
+  })
+  assert.deepEqual(m.from, [{ name: 'Test Sender', address: '' }])
+  assert.deepEqual(m.to, [{ name: 'Test Recipient', address: '' }])
+})

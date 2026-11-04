@@ -51,7 +51,8 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
   async function perform(event, source, operationId, mode) {
     const started = now()
     const ms = {}
-    const facts = { mode, kind: typeof source?.kind === 'string' ? source.kind : 'invalid' }
+    // Only a known kind is logged; anything else could be renderer text.
+    const facts = { mode, kind: SOURCE_KINDS.includes(source?.kind) ? source.kind : 'invalid' }
     const timed = async (phase, work) => {
       const at = now()
       try { return await work() } finally { ms[phase] = Math.round((ms[phase] || 0) + now() - at) }

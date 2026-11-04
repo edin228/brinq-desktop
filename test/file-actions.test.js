@@ -272,6 +272,10 @@ test('each operation logs phase timings, kind, type, size and outcome, never nam
   f.fetchWith(() => new Response('denied', { status: 403 }))
   assert.equal((await f.open()).code, 'permission')
   assert.equal(f.logs.at(-1).outcome, 'permission')
+  // A rejected source never logs renderer-supplied text.
+  assert.equal((await f.open({ kind: 'https://evil.example/?token=secret-123', uid: 'x' })).code, 'invalid')
+  assert.equal(f.logs.at(-1).kind, 'invalid')
+  assert.doesNotMatch(JSON.stringify(f.logs), /evil|secret-123/)
   // A broken logger never changes the result.
   const g = await fixture(t, { log: () => { throw new Error('disk full') } })
   assert.equal((await g.open()).ok, true)

@@ -197,7 +197,6 @@ ipcMain.handle(
 )
 
 const BRINQ_TEMP_DIR = profileTempDir(app.getPath('temp'), app.getPath('userData'))
-const viewerTempFiles = new Map() // viewerId -> Set<tempPath>
 
 function ensurePrivateTempDir() {
   return ensurePrivateDirectory(BRINQ_TEMP_DIR)
@@ -208,18 +207,6 @@ function retryUnlink(filePath, attemptsLeft) {
     if (!err || attemptsLeft <= 1) return
     setTimeout(() => retryUnlink(filePath, attemptsLeft - 1), 15000)
   })
-}
-
-function cleanupViewerTempFiles(viewerId) {
-  const files = viewerTempFiles.get(viewerId)
-  if (!files) return
-  viewerTempFiles.delete(viewerId)
-  // Retry up to 4 times over ~1 minute (5s + 15s + 15s + 15s)
-  setTimeout(() => {
-    for (const tempPath of files) {
-      retryUnlink(tempPath, 4)
-    }
-  }, 5000)
 }
 
 function scheduleSyncedAttachmentCleanup(tempPath) {
@@ -320,8 +307,9 @@ ipcMain.handle(
       const showHere = handler.kind === 'brinq' || handler.kind === 'none'
       const errorMessage = showHere ? '' : await shell.openPath(tempPath)
       if (!showHere && !errorMessage) {
-        if (!viewerTempFiles.has(viewerId)) viewerTempFiles.set(viewerId, new Set())
-        viewerTempFiles.get(viewerId).add(tempPath)
+        // The other app may still be starting, or keep the file open, after
+        // this viewer closes: keep the copy as long as any native Open's.
+        scheduleSyncedAttachmentCleanup(tempPath)
         return { ok: true }
       }
       if (!isEmailFilename(safeName)) {
@@ -487,7 +475,6 @@ async function openEmailFile(filePath, { showError = true, stillAuthorized = () 
 
     viewer.once('closed', () => {
       fileViewerStore.delete(viewerId)
-      cleanupViewerTempFiles(viewerId)
       maybeQuitAfterFileViewerClose()
     })
     return { ok: true, timings, close: () => { if (!viewer.isDestroyed()) viewer.destroy() } }
