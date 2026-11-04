@@ -8,6 +8,7 @@ function harness({ focused = false, ...limits } = {}) {
     constructor(options) { this.options = options; this.handlers = {}; this.shown = false }
     on(name, handler) { this.handlers[name] = handler }
     show() { this.shown = true; state.popups.push(this) }
+    close() { this.closed = true }
   }
   state.notify = createNativeNotifier({
     Notification: FakeNotification,
@@ -99,10 +100,17 @@ test('a shown popup stays referenced until clicked, dismissed or failed; a timed
   assert.deepEqual(h.notify.sizes(), { seen: 5, live: 0 })
 })
 
-test('unsettled popups are bounded by count, oldest first', () => {
+test('beyond the bound the oldest unsettled popup is dismissed, never left without a click handler', () => {
   const h = harness({ liveLimit: 2 })
   for (const uid of ['a', 'b', 'c']) h.notify('Sender', uid, { uid })
+  const [a, b, c] = h.popups
+  assert.deepEqual([a.closed, b.closed, c.closed], [true, undefined, undefined])
   assert.deepEqual(h.notify.sizes(), { seen: 3, live: 2 })
+  // The survivors are still the referenced ones: settling them empties the set.
+  b.handlers.click()
+  c.handlers.close({ reason: 'userCanceled' })
+  assert.deepEqual(h.notify.sizes(), { seen: 3, live: 0 })
+  assert.deepEqual(h.clicks, ['b'])
   assert.equal(LIVE_LIMIT, 100)
 })
 
