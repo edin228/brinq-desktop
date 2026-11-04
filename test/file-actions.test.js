@@ -168,6 +168,20 @@ test('a cancel or navigation while the default app is looked up never launches a
   }
 })
 
+test('the server-reported AMS360 phases join the log line, and nothing else from the header', async t => {
+  const f = await fixture(t)
+  f.fetchWith(() => pdf({
+    'content-disposition': 'attachment; filename="server.pdf"',
+    'server-timing': 'ems_pre;dur=81.2, ems_data;dur=5210.4, encode;dur=8.0, secret;desc="attachment 42";dur=1',
+  }))
+  assert.equal((await f.open()).ok, true)
+  assert.deepEqual(f.logs.at(-1).server, { ems_pre: 81, ems_data: 5210, encode: 8 })
+  f.fetchWith(() => pdf({ 'content-disposition': 'attachment; filename="server.pdf"', 'server-timing': 'cdn-cache;desc=HIT' }))
+  assert.equal((await f.open()).ok, true)
+  assert.equal('server' in f.logs.at(-1), false)
+  assert.doesNotMatch(JSON.stringify(f.logs), /secret|attachment 42|HIT/)
+})
+
 test('a rate-limited download explains the limit and when to retry', async t => {
   const f = await fixture(t)
   f.fetchWith(() => Response.json({ error: 'Rate limit exceeded: 30 per 1 minute', retry_after_seconds: 37 }, { status: 429 }))

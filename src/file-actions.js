@@ -134,6 +134,8 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
         await timed('server', () => fetchResponse(proxyUrl))
       }
       const info = responseFileInfo(response.headers, resolved.filename)
+      const serverPhases = serverTiming(response.headers.get('server-timing'))
+      if (serverPhases) facts.server = serverPhases
       facts.type = path.extname(info.filename).toLowerCase().slice(0, 12) || 'none'
       const emailFile = isEmailFilename(info.filename)
       // Email files open in the OS default app like any other file; `view`
@@ -262,6 +264,19 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
     save: (event, source, id) => perform(event, source, id, 'save'),
     cancel,
   }
+}
+
+// AMS360 file routes report their own phases (backend app/core/server_timing.py).
+// Keep only those fixed names with finite millisecond values.
+const SERVER_PHASES = new Set(['ems_pre', 'ems_data', 'encode'])
+function serverTiming(header) {
+  if (typeof header !== 'string' || header.length > 512) return null
+  const phases = {}
+  for (const part of header.split(',')) {
+    const match = part.trim().match(/^([a-z_]+);dur=(\d{1,9}(?:\.\d+)?)$/)
+    if (match && SERVER_PHASES.has(match[1])) phases[match[1]] = Math.round(Number(match[2]))
+  }
+  return Object.keys(phases).length ? phases : null
 }
 
 // The backend's 429 body names the limit and the retry time, as the web
