@@ -18,7 +18,7 @@ async function fixture(t, overrides = {}) {
   t.after(() => fs.rm(root, { recursive: true, force: true }))
   const tempDir = path.join(root, 'private')
   const target = path.join(root, 'saved.pdf')
-  const requests = [], opens = [], emailOpens = [], marks = [], retained = []
+  const requests = [], opens = [], emailOpens = [], marks = [], retained = [], logs = []
   let fetcher = () => pdf()
   const security = createWindowSecurity({ baseUrl: BASE, preloadPath: '/preload', openExternal() {} })
   function addWindow() {
@@ -45,34 +45,54 @@ async function fixture(t, overrides = {}) {
     openEmailFile: async file => { emailOpens.push([path.basename(file), await fs.readFile(file)]); return { ok: true } },
     markOrigin: async (file, origin) => { marks.push([file, origin]); return false },
     scheduleCleanup: file => retained.push(file),
+    log: fields => logs.push(fields),
     ...overrides,
   })
   async function tempFiles() { try { return await fs.readdir(tempDir) } catch (e) { if (e.code === 'ENOENT') return []; throw e } }
-  return { root, tempDir, target, actions, event, addWindow, requests, opens, emailOpens, marks, retained, tempFiles,
+  return { root, tempDir, target, actions, event, addWindow, requests, opens, emailOpens, marks, retained, logs, tempFiles,
     fetchWith(fn) { fetcher = fn },
     open(source = SOURCE, id = randomUUID()) { return actions.open(event, source, id) },
+    view(source = SOURCE, id = randomUUID()) { return actions.view(event, source, id) },
     save(source = SOURCE, id = randomUUID()) { return actions.save(event, source, id) },
   }
 }
 
-test('EML and MSG from Brinq and AMS open in the email viewer and leave no downloaded copy', async t => {
-  const cases = [
-    { source: { kind: 'brinq-file', uid: 'file', filename: 'received-email.eml' },
-      mime: 'message/rfc822', name: 'received-email.eml', body: 'From: sender@example.com\r\nSubject: Test\r\n\r\nHello' },
-    { source: { kind: 'ams360-activity-attachment', clientId: 'client', activityId: 'activity', ref: 'email-data', refKind: 'data', filename: 'fax.EML' },
-      mime: 'application/octet-stream', name: 'fax.EML', body: 'From: sender@example.com\r\nSubject: Fax\r\n\r\nHello' },
-    { source: { ...SOURCE, filename: 'Outlook message.MSG' },
-      mime: 'application/vnd.ms-outlook', name: 'Outlook message.MSG', body: 'MSG fixture bytes' },
-  ]
-  for (const item of cases) {
+const EMAIL_CASES = [
+  { source: { kind: 'brinq-file', uid: 'file', filename: 'received-email.eml' },
+    mime: 'message/rfc822', name: 'received-email.eml', body: 'From: sender@example.com\r\nSubject: Test\r\n\r\nHello' },
+  { source: { kind: 'ams360-activity-attachment', clientId: 'client', activityId: 'activity', ref: 'email-data', refKind: 'data', filename: 'fax.EML' },
+    mime: 'application/octet-stream', name: 'fax.EML', body: 'From: sender@example.com\r\nSubject: Fax\r\n\r\nHello' },
+  { source: { ...SOURCE, filename: 'Outlook message.MSG' },
+    mime: 'application/vnd.ms-outlook', name: 'Outlook message.MSG', body: 'MSG fixture bytes' },
+]
+function emailFetch(item) {
+  return url => url.includes('/api/files/')
+    ? Response.json({ url: 'https://sfo2.digitaloceanspaces.com/brinq/email?signature=token' })
+    : new Response(item.body, { headers: { 'content-type': item.mime, 'content-disposition': `attachment; filename="${item.name}"` } })
+}
+const eml = () => new Response('From: a@example.com\r\n\r\nHello', { headers: {
+  'content-type': 'message/rfc822', 'content-disposition': 'attachment; filename="mail.eml"',
+} })
+
+test('EML and MSG Open in the OS default app (Outlook) like any other file', async t => {
+  for (const item of EMAIL_CASES) {
     const f = await fixture(t)
-    f.fetchWith(url => url.includes('/api/files/')
-      ? Response.json({ url: 'https://sfo2.digitaloceanspaces.com/brinq/email?signature=token' })
-      : new Response(item.body, { headers: {
-        'content-type': item.mime,
-        'content-disposition': `attachment; filename="${item.name}"`,
-      } }))
+    f.fetchWith(emailFetch(item))
     const result = await f.open(item.source)
+    assert.equal(result.ok, true)
+    assert.equal(f.opens.length, 1)
+    assert.equal(f.opens[0].endsWith(item.name), true)
+    assert.equal((await fs.readFile(f.opens[0])).toString(), item.body)
+    assert.deepEqual(f.emailOpens, [])
+    assert.deepEqual(f.retained, f.opens)
+  }
+})
+
+test('View in Brinq shows EML and MSG in the email viewer and leaves no downloaded copy', async t => {
+  for (const item of EMAIL_CASES) {
+    const f = await fixture(t)
+    f.fetchWith(emailFetch(item))
+    const result = await f.view(item.source)
     assert.equal(result.ok, true)
     assert.equal(f.emailOpens.length, 1)
     assert.equal(f.emailOpens[0][0].endsWith(item.name), true)
@@ -83,21 +103,81 @@ test('EML and MSG from Brinq and AMS open in the email viewer and leave no downl
   }
 })
 
+test('when no app can open an email file, Open falls back to the Brinq viewer', async t => {
+  const f = await fixture(t, { openPath: async () => 'No application is associated' })
+  f.fetchWith(eml)
+  const result = await f.open()
+  assert.equal(result.ok, true)
+  assert.equal(f.emailOpens.length, 1)
+  assert.deepEqual(f.retained, [])
+  assert.deepEqual(await f.tempFiles(), [])
+  assert.equal(f.logs.at(-1).handler, 'viewer-fallback')
+  // Other types still report the missing application.
+  const g = await fixture(t, { openPath: async () => 'No application is associated' })
+  assert.equal((await g.open()).code, 'os-open')
+  assert.deepEqual(g.emailOpens, [])
+})
+
+test('Open hands every email file to the OS with no default-app lookup', async t => {
+  for (const item of EMAIL_CASES) {
+    const f = await fixture(t)
+    f.fetchWith(emailFetch(item))
+    assert.equal((await f.open(item.source)).ok, true, item.name)
+    assert.equal(f.opens.length, 1, item.name)
+    assert.deepEqual(f.emailOpens, [], item.name)
+    const line = f.logs.at(-1)
+    assert.equal(line.handler, 'os')
+    assert.equal('default_app' in line || 'default_app' in line.ms, false)
+  }
+})
+
+test('the server-reported AMS360 phases join the log line, and nothing else from the header', async t => {
+  const f = await fixture(t)
+  f.fetchWith(() => pdf({
+    'content-disposition': 'attachment; filename="server.pdf"',
+    'server-timing': 'ems_pre;dur=81.2, ems_data;dur=5210.4, encode;dur=8.0, secret;desc="attachment 42";dur=1',
+  }))
+  assert.equal((await f.open()).ok, true)
+  assert.deepEqual(f.logs.at(-1).server, { ems_pre: 81, ems_data: 5210, encode: 8 })
+  f.fetchWith(() => pdf({ 'content-disposition': 'attachment; filename="server.pdf"', 'server-timing': 'cdn-cache;desc=HIT' }))
+  assert.equal((await f.open()).ok, true)
+  assert.equal('server' in f.logs.at(-1), false)
+  assert.doesNotMatch(JSON.stringify(f.logs), /secret|attachment 42|HIT/)
+})
+
+test('a rate-limited download explains the limit and when to retry', async t => {
+  const f = await fixture(t)
+  f.fetchWith(() => Response.json({ error: 'Rate limit exceeded: 30 per 1 minute', retry_after_seconds: 37 }, { status: 429 }))
+  const result = await f.open({ kind: 'client-email-attachment', clientId: '42', emailUid: 'email', attachmentId: 'att', filename: 'policy.pdf' })
+  assert.equal(result.code, 'rate-limit')
+  assert.equal(result.error, 'Download limit reached (30 per 1 minute). Try again in 37 seconds.')
+  f.fetchWith(() => new Response('busy', { status: 429 }))
+  assert.equal((await f.open()).error, 'Download limit reached. Try again shortly.')
+  assert.deepEqual(f.opens, [])
+})
+
+test('View in Brinq refuses non-email files without opening anything', async t => {
+  const f = await fixture(t)
+  const result = await f.view()
+  assert.equal(result.code, 'unsupported')
+  assert.match(result.error, /\.eml and \.msg/)
+  assert.deepEqual(f.opens, [])
+  assert.deepEqual(f.emailOpens, [])
+  assert.deepEqual(await f.tempFiles(), [])
+})
+
 test('email viewer failures are reported safely and a later retry succeeds', async t => {
   let attempts = 0
   const f = await fixture(t, { openEmailFile: async () => {
     if (++attempts === 1) throw new Error('private parser detail')
     return { ok: true }
   } })
-  f.fetchWith(() => new Response('From: a@example.com\r\n\r\nHello', { headers: {
-    'content-type': 'message/rfc822',
-    'content-disposition': 'attachment; filename="mail.eml"',
-  } }))
-  const first = await f.open()
+  f.fetchWith(eml)
+  const first = await f.view()
   assert.equal(first.code, 'email-open')
   assert.equal(first.error.includes('private parser detail'), false)
   assert.deepEqual(await f.tempFiles(), [])
-  assert.equal((await f.open()).ok, true)
+  assert.equal((await f.view()).ok, true)
   assert.deepEqual(await f.tempFiles(), [])
   assert.deepEqual(f.opens, [])
 })
@@ -116,12 +196,9 @@ test('cancel or navigation while an email loads closes a viewer created at the h
       await waiting
       return { ok: true, close: () => { closeCount++ } }
     } })
-    f.fetchWith(() => new Response('From: a@example.com\r\n\r\nHello', { headers: {
-      'content-type': 'message/rfc822',
-      'content-disposition': 'attachment; filename="mail.eml"',
-    } }))
+    f.fetchWith(eml)
     const id = randomUUID()
-    const opening = f.open(SOURCE, id)
+    const opening = f.view(SOURCE, id)
     await started
     if (trigger === 'cancel') assert.equal(f.actions.cancel(f.event, id), true)
     else f.event.sender.emit('did-start-navigation', {}, `${BASE}/other`, false, true)
@@ -138,11 +215,8 @@ test('viewer capacity failure explains the limit and recovery', async t => {
     ok: false, code: 'viewer-limit', limit: 10, observed: 10,
     error: 'There are 10 email viewers open or loading (limit 10). Close an email viewer and try again.',
   }) })
-  f.fetchWith(() => new Response('From: a@example.com\r\n\r\nHello', { headers: {
-    'content-type': 'message/rfc822',
-    'content-disposition': 'attachment; filename="mail.eml"',
-  } }))
-  const result = await f.open()
+  f.fetchWith(eml)
+  const result = await f.view()
   assert.equal(result.code, 'viewer-limit')
   assert.equal(result.limit, 10)
   assert.equal(result.observed, 10)
@@ -150,20 +224,86 @@ test('viewer capacity failure explains the limit and recovery', async t => {
   assert.deepEqual(await f.tempFiles(), [])
 })
 
-test('email Open uses the existing 25 MiB viewer cap before downloading', async t => {
-  const f = await fixture(t)
-  f.fetchWith(() => new Response('small', { headers: {
+test('View in Brinq keeps the 25 MiB viewer cap before downloading; Open hands larger mail to the OS', async t => {
+  const large = () => new Response('small', { headers: {
     'content-type': 'application/vnd.ms-outlook',
     'content-disposition': 'attachment; filename="large.msg"',
     'content-length': String(MAX_EMAIL_BYTES + 1),
-  } }))
-  const result = await f.open()
+  } })
+  const f = await fixture(t)
+  f.fetchWith(large)
+  const result = await f.view()
   assert.equal(result.code, 'limit')
   assert.equal(result.limitBytes, MAX_EMAIL_BYTES)
   assert.equal(result.observedBytes, MAX_EMAIL_BYTES + 1)
   assert.match(result.error, /Save As/)
   assert.deepEqual(f.emailOpens, [])
   assert.deepEqual(await f.tempFiles(), [])
+  // Open applies the general 50 MiB Open limit, so the OS mail app gets it.
+  const body = Buffer.alloc(MAX_EMAIL_BYTES + 1, 1)
+  const g = await fixture(t)
+  g.fetchWith(() => new Response(body, { headers: {
+    'content-type': 'application/vnd.ms-outlook',
+    'content-disposition': 'attachment; filename="large.msg"',
+    'content-length': String(body.length),
+  } }))
+  assert.equal((await g.open()).ok, true)
+  assert.equal(g.opens.length, 1)
+  assert.equal((await fs.stat(g.opens[0])).size, body.length)
+  assert.deepEqual(g.emailOpens, [])
+})
+
+test('audio recordings open in the OS media player, including AMS names with generic MIME', async t => {
+  const cases = [
+    ['call.MP3', 'application/octet-stream'], ['voicemail.wav', 'audio/wav'],
+    ['note.m4a', 'audio/mp4'], ['call.mp3', 'audio/mpeg'],
+  ]
+  for (const [name, mime] of cases) {
+    const f = await fixture(t)
+    f.fetchWith(() => new Response('ID3 audio bytes', { headers: { 'content-type': mime, 'content-disposition': `attachment; filename="${name}"` } }))
+    const result = await f.open({ kind: 'ams360-activity-attachment', clientId: 'client', activityId: 'activity', ref: 'ref', refKind: 'attachment', filename: name })
+    assert.equal(result.ok, true, name)
+    assert.equal(f.opens.length, 1)
+  }
+})
+
+test('each operation logs phase timings, kind, type, size and outcome, never names or identifiers', async t => {
+  let clock = 0
+  const f = await fixture(t, { now: () => (clock += 5) })
+  f.fetchWith(() => pdf({ 'content-disposition': 'attachment; filename="private-client-name.pdf"' }))
+  assert.equal((await f.open({ kind: 'ams360-activity-attachment', clientId: 'client-42', activityId: 'activity-secret', ref: 'ref-9', refKind: 'attachment', filename: 'hint.pdf' })).ok, true)
+  const line = f.logs.at(-1)
+  assert.deepEqual(Object.keys(line).sort(), ['bytes', 'handler', 'kind', 'mode', 'ms', 'outcome', 'type'])
+  assert.deepEqual({ ...line, ms: undefined }, { mode: 'open', kind: 'ams360-activity-attachment', type: '.pdf', bytes: PDF.length, handler: 'os', outcome: 'ok', ms: undefined })
+  for (const phase of ['prepare', 'server', 'download', 'protect', 'os_open', 'total']) assert.equal(Number.isInteger(line.ms[phase]), true, phase)
+  assert.doesNotMatch(JSON.stringify(f.logs), /private|client-42|activity-secret|ref-9|hint|localhost/)
+  // Failures and refusals are logged with their result code.
+  f.fetchWith(() => new Response('denied', { status: 403 }))
+  assert.equal((await f.open()).code, 'permission')
+  assert.equal(f.logs.at(-1).outcome, 'permission')
+  // A rejected source never logs renderer-supplied text.
+  assert.equal((await f.open({ kind: 'https://evil.example/?token=secret-123', uid: 'x' })).code, 'invalid')
+  assert.equal(f.logs.at(-1).kind, 'invalid')
+  assert.doesNotMatch(JSON.stringify(f.logs), /evil|secret-123/)
+  // A broken logger never changes the result.
+  const g = await fixture(t, { log: () => { throw new Error('disk full') } })
+  assert.equal((await g.open()).ok, true)
+})
+
+test('only a known file type is logged; any other extension is logged as other, never its text', async t => {
+  const f = await fixture(t)
+  // An extensionless name takes its type from the MIME type (application/pdf).
+  const cases = [['document.client123', 'other'], ['notes', '.pdf'], ['Scan.PDF', '.pdf'], ['call.M4A', '.m4a'], ['policy.zip', 'other']]
+  for (const [name, type] of cases) {
+    f.fetchWith(() => pdf({ 'content-disposition': `attachment; filename="${name}"` }))
+    await f.open()
+    assert.equal(f.logs.at(-1).type, type, name)
+  }
+  // Save As logs the same way for any file type it writes.
+  f.fetchWith(() => pdf({ 'content-disposition': 'attachment; filename="export.acme-42"' }))
+  assert.equal((await f.save()).ok, true)
+  assert.equal(f.logs.at(-1).type, 'other')
+  assert.doesNotMatch(JSON.stringify(f.logs), /client123|acme-42|\.zip/)
 })
 
 test('Open streams complete private bytes and invokes the OS once using server filename authority', async t => {
