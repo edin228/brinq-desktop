@@ -40,6 +40,7 @@ const { sanitizedLogger } = require('./update-log')
 const { guardWindowUnload } = require('./unload-guard')
 const { createTabWindow } = require('./tab-window')
 const { createLinkMenu } = require('./link-menu')
+const { createNativeNotifier } = require('./native-notifications')
 const { installBrowserSignIn } = require('./browser-sign-in')
 
 // Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
@@ -1010,23 +1011,21 @@ const browserSignIn = process.platform === 'win32'
   })
   : null
 
-ipcMain.on('notify', (event, title, body, data) => {
-  if (!validateSender(event)) return
-  if (typeof title !== 'string' || typeof body !== 'string') return
-
-  const notif = new Notification({
-    title,
-    body,
-    icon: path.join(__dirname, '../assets/icon.png'),
-  })
-  notif.on('click', () => {
+const notifyNewEmail = createNativeNotifier({
+  Notification,
+  // Any Brinq window: the main tabs, an email popout or a file viewer.
+  appFocused: () => BrowserWindow.getFocusedWindow() !== null,
+  icon: path.join(__dirname, '../assets/icon.png'),
+  onClick: (uid) => {
     launchedForFileViewerOnly = false
     showMainWindow()
-    if (data?.uid && typeof data.uid === 'string') {
-      queuePayload('navigate-email', data.uid)
-    }
-  })
-  notif.show()
+    if (uid) queuePayload('navigate-email', uid)
+  },
+})
+
+ipcMain.on('notify', (event, title, body, data) => {
+  if (!validateSender(event)) return
+  notifyNewEmail(title, body, data)
 })
 
 ipcMain.handle('update-status', (event) => validateSender(event) ? updates.getState() : null)
