@@ -8,6 +8,7 @@ const SOURCE_FIELDS = {
   'marketing-attachment': ['projectUid', 'uid'],
   'sms-attachment': ['uid'],
   'synced-email-attachment': ['emailUid', 'attachmentId'],
+  'client-email-attachment': ['clientId', 'emailUid', 'attachmentId'],
 }
 const SOURCE_KINDS = Object.freeze(Object.keys(SOURCE_FIELDS))
 
@@ -43,18 +44,43 @@ function resolveSource(baseUrl, source) {
     case 'marketing-attachment': route = `/api/marketing-projects/${ids.projectUid}/attachments/${ids.uid}/download`; break
     case 'sms-attachment': route = `/api/messaging/sms/attachments/${ids.uid}/download`; break
     case 'synced-email-attachment': route = `/api/email-sync/synced-emails/${ids.emailUid}/attachments/${ids.attachmentId}/download`; break
+    // A client's email read through client visibility, not mailbox ownership.
+    case 'client-email-attachment': route = `/api/email-sync/clients/${ids.clientId}/emails/${ids.emailUid}/attachments/${ids.attachmentId}/download`; break
   }
   return { url: new URL(route, baseUrl).href, storageLink: source.kind === 'brinq-file' || source.kind === 'marketing-attachment', filename: source.filename }
 }
 
-function storageProxyUrl(baseUrl, value) {
+// Brinq keeps files in one DigitalOcean Spaces bucket, `brinq` in sfo2, and
+// its presigned links are path-style (sfo2.digitaloceanspaces.com/brinq/…).
+// This mirrors frontend/utils/brinqStorageUrl.ts, which the web
+// /api/download-proxy enforces; keep the two aligned.
+const BRINQ_SPACES_BUCKET = 'brinq'
+const BRINQ_SPACES_HOST = 'sfo2.digitaloceanspaces.com'
+const BUCKET_HOSTS = new Set([
+  `${BRINQ_SPACES_BUCKET}.${BRINQ_SPACES_HOST}`,
+  `${BRINQ_SPACES_BUCKET}.sfo2.cdn.digitaloceanspaces.com`,
+])
+
+// The parsed link when it names an object in Brinq's bucket, else null.
+function brinqStorageUrl(value) {
   if (typeof value !== 'string') return null
   let url
   try { url = new URL(value) } catch { return null }
-  // Keep this list aligned with frontend/pages/api/download-proxy.ts.
-  if (url.protocol !== 'https:' || url.username || url.password || url.port ||
-      ![/\.digitaloceanspaces\.com$/i, /(^|\.)s3([.-][a-z0-9-]+)?\.amazonaws\.com$/i,
-        /^cdn\.brinq\.io$/i].some(pattern => pattern.test(url.hostname))) return null
+  // The parser lowercases the host, drops the default port and resolves dot
+  // segments (encoded ones too), so exact comparisons below are safe.
+  if (url.protocol !== 'https:' || url.username || url.password || url.port) return null
+  if (BUCKET_HOSTS.has(url.hostname)) return url
+  // The path-style host serves every bucket; the first segment is the bucket.
+  // Its key must hold no dot segment even after percent-decoding.
+  if (url.hostname !== BRINQ_SPACES_HOST || !url.pathname.startsWith(`/${BRINQ_SPACES_BUCKET}/`)) return null
+  let key
+  try { key = decodeURIComponent(url.pathname.slice(BRINQ_SPACES_BUCKET.length + 2)) } catch { return null }
+  return key.split('/').some(segment => segment === '.' || segment === '..') ? null : url
+}
+
+function storageProxyUrl(baseUrl, value) {
+  const url = brinqStorageUrl(value)
+  if (!url) return null
   const proxy = new URL('/api/download-proxy', baseUrl)
   proxy.searchParams.set('url', url.href)
   return proxy.href

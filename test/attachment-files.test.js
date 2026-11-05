@@ -50,6 +50,8 @@ test('recognizes only the direct-open extension allowlist', () => {
   assert.equal(isSafeOpenFilename('scan.pdf'), true)
   assert.equal(isSafeOpenFilename('received-email.EML'), true)
   assert.equal(isSafeOpenFilename('Outlook message.MSG'), true)
+  for (const audio of ['call.MP3', 'voicemail.wav', 'note.m4a']) assert.equal(isSafeOpenFilename(audio), true, audio)
+  assert.equal(isSafeOpenFilename('playlist.m3u'), false)
   assert.equal(isSafeOpenFilename('macro.docm'), false)
   assert.equal(isSafeOpenFilename('installer.exe'), false)
   assert.equal(isSafeOpenFilename('archive.zip'), false)

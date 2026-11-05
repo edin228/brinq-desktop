@@ -47,6 +47,9 @@ if (process.isMainFrame && ['http:', 'https:'].includes(location.protocol)) {
 
     openFile: (source, operationId) => ipcRenderer.invoke('open-file', source, operationId),
 
+    // Email files only: show in Brinq's own viewer instead of the OS default app.
+    viewFile: (source, operationId) => ipcRenderer.invoke('view-file', source, operationId),
+
     saveFileAs: (source, operationId) => ipcRenderer.invoke('save-file-as', source, operationId),
 
     cancelFileOperation: (operationId) => ipcRenderer.invoke('cancel-file-operation', operationId),
