@@ -67,7 +67,7 @@ const EMAIL_CASES = [
 ]
 function emailFetch(item) {
   return url => url.includes('/api/files/')
-    ? Response.json({ url: 'https://cdn.brinq.io/email?signature=token' })
+    ? Response.json({ url: 'https://sfo2.digitaloceanspaces.com/brinq/email?signature=token' })
     : new Response(item.body, { headers: { 'content-type': item.mime, 'content-disposition': `attachment; filename="${item.name}"` } })
 }
 const eml = () => new Response('From: a@example.com\r\n\r\nHello', { headers: {
@@ -340,7 +340,7 @@ test('Save As stages beside the chosen target, then replaces it without opening'
 test('fresh Brinq storage links are resolved on each action and fetched only through the local proxy', async t => {
   const f = await fixture(t)
   let link = 0
-  f.fetchWith(url => url.includes('/api/files/') ? Response.json({ url: `https://cdn.brinq.io/document?signature=${++link}` }) : pdf())
+  f.fetchWith(url => url.includes('/api/files/') ? Response.json({ url: `https://sfo2.digitaloceanspaces.com/brinq/document?signature=${++link}` }) : pdf())
   const source = { kind: 'brinq-file', uid: 'file', filename: 'policy.pdf' }
   assert.equal((await f.open(source)).ok, true)
   assert.equal((await f.open(source)).ok, true)
@@ -415,7 +415,7 @@ test('login/error responses are refused while intentional HTML and storage HTML 
   f.fetchWith(() => new Response('<html>saved page</html>', { headers: { 'content-type': 'text/html', 'content-disposition': 'attachment; filename="page.html"' } }))
   assert.equal((await f.open()).code, 'unsupported')
   assert.equal((await f.save()).ok, true)
-  f.fetchWith(url => url.includes('/api/files/') ? Response.json({ url: 'https://cdn.brinq.io/page.html' }) : new Response('<html>storage page</html>', { headers: { 'content-type': 'text/html' } }))
+  f.fetchWith(url => url.includes('/api/files/') ? Response.json({ url: 'https://sfo2.digitaloceanspaces.com/brinq/page.html' }) : new Response('<html>storage page</html>', { headers: { 'content-type': 'text/html' } }))
   const source = { kind: 'brinq-file', uid: 'file', filename: 'page.html' }
   assert.equal((await f.save(source)).ok, true)
   assert.equal((await f.open(source)).code, 'unsupported')
@@ -597,7 +597,7 @@ test('marketing reacquires a fresh project-scoped link after expiry and never us
   const f = await fixture(t)
   let links = 0
   f.fetchWith(url => {
-    if (url === `${BASE}/api/marketing-projects/project-uid/attachments/attachment-uid/download`) return Response.json({ url: `https://cdn.brinq.io/file?signature=${++links}` })
+    if (url === `${BASE}/api/marketing-projects/project-uid/attachments/attachment-uid/download`) return Response.json({ url: `https://sfo2.digitaloceanspaces.com/brinq/file?signature=${++links}` })
     return links === 1 ? new Response('expired signature', { status: 403 }) : pdf()
   })
   assert.equal((await f.open(MARKETING_SOURCE)).code, 'permission')
