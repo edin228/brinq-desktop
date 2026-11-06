@@ -57,6 +57,8 @@ test('navigation invalidates pending native actions even after returning to the 
   assert.equal(f.policy.validateSender(f.event), false)
   f.wc.emit('did-frame-navigate', {}, f.wc.getURL(), 200, 'OK', true)
   assert.equal(f.policy.validateSender(f.event), true)
+  f.wc.emit('did-stop-loading')
+  assert.equal(f.policy.validateSender(f.event), true)
   assert.equal(authorized(), false)
   f.wc.emit('destroyed')
   assert.equal(f.policy.validateSender(f.event), false)
@@ -78,15 +80,6 @@ test('a navigation that never commits gives the page its authority back', () => 
     assert.equal(f.policy.validateSender(f.event), true, target)
     assert.equal(captured(), false, `an action begun before ${target} stays invalid`)
   }
-})
-
-test('a committing navigation still refuses native actions until it commits', () => {
-  const f = fixture()
-  f.wc.emit('did-start-navigation', {}, 'http://localhost:3004/clients/1', false, true)
-  assert.equal(f.policy.validateSender(f.event), false)
-  f.wc.emit('did-frame-navigate', {}, 'http://localhost:3004/clients/1', 200, 'OK', true)
-  f.wc.emit('did-stop-loading')
-  assert.equal(f.policy.validateSender(f.event), true)
 })
 
 test('viewer authority is limited to its exact document and role', () => {

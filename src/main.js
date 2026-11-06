@@ -77,7 +77,6 @@ let mainWindow = null
 let tabWindow = null
 let tray = null
 const navigationQueue = createNavigationQueue()
-let navigatingMain = false
 
 // Right-click on a Brinq link (sidebar navigation included): Open in new tab
 // or Copy link. Pages are checked when the menu is requested, not at creation.
@@ -624,7 +623,7 @@ function isOnLoginPage() {
 
 function drainPendingPayloads() {
   const contents = homeContents()
-  if (!contents || navigatingMain || !isOnEmailsRoute()) return
+  if (!contents || navigationQueue.isNavigating() || !isOnEmailsRoute()) return
   const frame = contents.mainFrame
   if (!windowSecurity.validateSender({ sender: contents, senderFrame: frame }, ['main'])) return
   navigationQueue.drain(frame, (channel, data) => contents.send(channel, data))
@@ -632,7 +631,7 @@ function drainPendingPayloads() {
 
 function routePendingPayloads() {
   const home = homeContents()
-  if (!home || navigatingMain || !navigationQueue.hasPending()) return
+  if (!home || navigationQueue.isNavigating() || !navigationQueue.hasPending()) return
   const target = incomingNavigationUrl(home.getURL(), BASE_URL, config.getMode())
   if (target) home.loadURL(target).catch(() => {})
   else drainPendingPayloads()
@@ -755,20 +754,17 @@ ipcMain.handle('retry-app-load', (event) => {
 function attachHome(contents, target) {
   contents.on('did-start-navigation', (_event, url, inPlace, isMainFrame) => {
     if (isMainFrame && !inPlace) {
-      navigatingMain = true
+      navigationQueue.navigationStarted()
       if (approvedAppUrl(url)) intendedAppUrl = url
-      navigationQueue.reset()
     }
   })
   contents.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame) => {
-    if (isMainFrame) navigatingMain = false
+    if (isMainFrame) navigationQueue.navigationCommitted()
   })
   // A navigation that never commits (a mailto:, tel: or download link) ends
-  // without did-frame-navigate; Home stays on its page, so resume routing.
+  // without did-frame-navigate; Home keeps its page and listeners, so resume.
   contents.on('did-stop-loading', () => {
-    if (!navigatingMain) return
-    navigatingMain = false
-    routePendingPayloads()
+    if (navigationQueue.navigationEnded()) routePendingPayloads()
   })
   contents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
     if (isMainFrame) {
@@ -778,11 +774,11 @@ function attachHome(contents, target) {
   })
   contents.on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
     if (!isMainFrame || code === -3 || url !== intendedAppUrl || !approvedAppUrl(url)) return
-    navigatingMain = false
+    navigationQueue.navigationEnded()
     showRecovery()
   })
   contents.on('render-process-gone', () => {
-    navigatingMain = false
+    navigationQueue.navigationEnded()
     showRecovery()
   })
   contents.on('did-finish-load', () => {
