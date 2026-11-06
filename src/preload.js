@@ -33,6 +33,9 @@ if (process.isMainFrame && ['http:', 'https:'].includes(location.protocol)) {
 
     restartToUpdate: () => ipcRenderer.invoke('restart-to-update'),
 
+    // Quit Brinq, as the tray's Quit does; unsaved pages still ask first.
+    quitApp: () => ipcRenderer.send('quit-app'),
+
     onUpdateStatus: (callback) => {
       const handler = (_, state) => callback(state)
       ipcRenderer.on('update-status', handler)
