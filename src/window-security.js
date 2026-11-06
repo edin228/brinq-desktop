@@ -106,6 +106,13 @@ function createWindowSecurity({ baseUrl, preloadPath, openExternal }) {
     wc.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame) => {
       if (isMainFrame) entry.navigating = false
     })
+    // A navigation that never commits ends here with no did-frame-navigate:
+    // a mailto: or tel: link handed to the OS, a link that turns into a
+    // download, a 204 (measured on Electron 44.4.5). The same document stays,
+    // so it keeps its authority; actions captured before stay invalid through
+    // the generation bump. A pending navigation keeps the page loading, so
+    // this never fires before it commits or ends.
+    wc.on('did-stop-loading', () => { entry.navigating = false })
     // Redirects never launch external applications. Only deliberate navigation does.
     const guard = (event, target, external) => {
       if (allowedDocument(entry, target)) return

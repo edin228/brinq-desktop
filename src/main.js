@@ -759,6 +759,13 @@ function attachHome(contents, target) {
   contents.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame) => {
     if (isMainFrame) navigatingMain = false
   })
+  // A navigation that never commits (a mailto:, tel: or download link) ends
+  // without did-frame-navigate; Home stays on its page, so resume routing.
+  contents.on('did-stop-loading', () => {
+    if (!navigatingMain) return
+    navigatingMain = false
+    routePendingPayloads()
+  })
   contents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
     if (isMainFrame) {
       if (approvedAppUrl(url)) intendedAppUrl = url
