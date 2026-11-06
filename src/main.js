@@ -42,6 +42,7 @@ const { createTabWindow } = require('./tab-window')
 const { createLinkMenu } = require('./link-menu')
 const { createNativeNotifier } = require('./native-notifications')
 const { installBrowserSignIn } = require('./browser-sign-in')
+const { quitApp, installQuitApp } = require('./quit-app')
 
 // Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
 if (process.platform === 'win32') {
@@ -952,10 +953,7 @@ function updateTrayMenu() {
     },
     {
       label: 'Quit',
-      click: () => {
-        app.isQuitting = true
-        app.quit()
-      },
+      click: () => quitApp(app),
     },
   ])
   tray.setContextMenu(menu)
@@ -1031,6 +1029,8 @@ ipcMain.on('notify', (event, title, body, data) => {
 ipcMain.handle('update-status', (event) => validateSender(event) ? updates.getState() : null)
 ipcMain.handle('check-for-updates', (event) => validateSender(event) ? updates.check({ manual: true }) : { ok: false, error: 'Unauthorized sender.' })
 ipcMain.handle('restart-to-update', (event) => validateSender(event) ? updates.restart() : { ok: false, error: 'Unauthorized sender.' })
+
+installQuitApp({ ipcMain, app, security: windowSecurity })
 
 ipcMain.handle('desktop-state', (event) => validateSender(event) ? desktopState() : null)
 ipcMain.handle('change-mode', (event, mode) => {

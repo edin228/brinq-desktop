@@ -76,7 +76,7 @@ function load(protocol = 'http:', isMainFrame = true, page = fakePage(), platfor
 
 test('preload exposes fixed file and legacy methods and strips IPC events', async () => {
   const { api, ipc, calls } = load()
-  assert.deepEqual(Object.keys(api).sort(), ['getUpdateStatus', 'checkForUpdates', 'restartToUpdate', 'onUpdateStatus', 'getDesktopState', 'changeMode', 'getFileCapabilities', 'openFile', 'viewFile', 'saveFileAs', 'cancelFileOperation', 'notify', 'setBadgeCount', 'setMode', 'onNavigateEmail', 'onMailto', 'getFileEmail', 'saveFileAttachment', 'openFileAttachment', 'openEmailAttachment', 'saveEmailAttachment'].sort())
+  assert.deepEqual(Object.keys(api).sort(), ['getUpdateStatus', 'checkForUpdates', 'restartToUpdate', 'quitApp', 'onUpdateStatus', 'getDesktopState', 'changeMode', 'getFileCapabilities', 'openFile', 'viewFile', 'saveFileAs', 'cancelFileOperation', 'notify', 'setBadgeCount', 'setMode', 'onNavigateEmail', 'onMailto', 'getFileEmail', 'saveFileAttachment', 'openFileAttachment', 'openEmailAttachment', 'saveEmailAttachment'].sort())
   api.notify('Title', 'Body', { uid: 'one' }); api.setBadgeCount(2); api.setMode('email')
   await api.getFileEmail('viewer'); await api.saveFileAttachment('viewer', 1); await api.openFileAttachment('viewer', 2)
   await api.openEmailAttachment('email', 'attachment', 'test.pdf'); await api.saveEmailAttachment('email', 'attachment', 'test.pdf')
@@ -138,7 +138,9 @@ test('update bridge returns results and removes status listeners', async () => {
   await api.getUpdateStatus()
   await api.checkForUpdates()
   await api.restartToUpdate()
-  assert.deepEqual(calls, [['update-status'], ['check-for-updates'], ['restart-to-update']])
+  // Quit sends only its fixed channel; page arguments are not forwarded.
+  api.quitApp('ignored')
+  assert.deepEqual(calls, [['update-status'], ['check-for-updates'], ['restart-to-update'], ['quit-app']])
   const received = []
   const off = api.onUpdateStatus((state) => received.push(state))
   ipc.emit('update-status', { sender: 'main' }, { status: 'ready' })
