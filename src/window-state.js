@@ -67,19 +67,30 @@ function incomingNavigationUrl(currentUrl, baseUrl, mode) {
   return modeUrl(baseUrl, mode, true)
 }
 
+// Mail-link and notification payloads for Home's page, held until the
+// current document's listener for that channel is ready.
 function createNavigationQueue() {
   const pending = []
   const ready = new Map()
+  let navigating = false
   return {
     push(channel, data) { pending.push({ channel, data }) },
     hasPending: () => pending.length > 0,
-    reset() { ready.clear() },
+    isNavigating: () => navigating,
+    // A started navigation holds delivery until it ends.
+    navigationStarted() { navigating = true },
+    // A committed one replaced the document; its preload subscribes again.
+    navigationCommitted() { navigating = false; ready.clear() },
+    // One that never commits (a mailto:, tel: or download link) keeps the
+    // document and its listeners. True when a navigation was in progress.
+    navigationEnded() { const was = navigating; navigating = false; return was },
     subscribe(channel, frame, active) {
       if (!['mailto', 'navigate-email'].includes(channel)) return
       if (active) ready.set(channel, frame)
       else if (ready.get(channel) === frame) ready.delete(channel)
     },
     drain(frame, send) {
+      if (navigating) return
       for (let index = 0; index < pending.length;) {
         const payload = pending[index]
         if (ready.get(payload.channel) !== frame) { index++; continue }

@@ -78,7 +78,6 @@ let mainWindow = null
 let tabWindow = null
 let tray = null
 const navigationQueue = createNavigationQueue()
-let navigatingMain = false
 
 // Right-click on a Brinq link (sidebar navigation included): Open in new tab
 // or Copy link. Pages are checked when the menu is requested, not at creation.
@@ -218,10 +217,11 @@ function ensurePrivateTempDir() {
 }
 
 function retryUnlink(filePath, attemptsLeft) {
-  fs.unlink(filePath, (err) => {
+  // Windows refuses to delete a read-only file, such as an email handed to Outlook.
+  fs.chmod(filePath, 0o600, () => fs.unlink(filePath, (err) => {
     if (!err || attemptsLeft <= 1) return
     setTimeout(() => retryUnlink(filePath, attemptsLeft - 1), 15000)
-  })
+  }))
 }
 
 function scheduleSyncedAttachmentCleanup(tempPath) {
@@ -309,6 +309,9 @@ ipcMain.handle(
         console.warn('Could not mark attachment as Internet-originated:', err)
       }
 
+      // A read-only copy, so classic Outlook does not ask to save changes when
+      // the email closes (see file-actions.js); before the authority check.
+      if (isEmailFilename(safeName)) await fs.promises.chmod(tempPath, 0o444).catch(() => {})
       if (!stillAuthorized()) {
         retryUnlink(tempPath, 1)
         return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
@@ -621,7 +624,7 @@ function isOnLoginPage() {
 
 function drainPendingPayloads() {
   const contents = homeContents()
-  if (!contents || navigatingMain || !isOnEmailsRoute()) return
+  if (!contents || navigationQueue.isNavigating() || !isOnEmailsRoute()) return
   const frame = contents.mainFrame
   if (!windowSecurity.validateSender({ sender: contents, senderFrame: frame }, ['main'])) return
   navigationQueue.drain(frame, (channel, data) => contents.send(channel, data))
@@ -629,7 +632,7 @@ function drainPendingPayloads() {
 
 function routePendingPayloads() {
   const home = homeContents()
-  if (!home || navigatingMain || !navigationQueue.hasPending()) return
+  if (!home || navigationQueue.isNavigating() || !navigationQueue.hasPending()) return
   const target = incomingNavigationUrl(home.getURL(), BASE_URL, config.getMode())
   if (target) home.loadURL(target).catch(() => {})
   else drainPendingPayloads()
@@ -752,13 +755,17 @@ ipcMain.handle('retry-app-load', (event) => {
 function attachHome(contents, target) {
   contents.on('did-start-navigation', (_event, url, inPlace, isMainFrame) => {
     if (isMainFrame && !inPlace) {
-      navigatingMain = true
+      navigationQueue.navigationStarted()
       if (approvedAppUrl(url)) intendedAppUrl = url
-      navigationQueue.reset()
     }
   })
   contents.on('did-frame-navigate', (_event, _url, _code, _text, isMainFrame) => {
-    if (isMainFrame) navigatingMain = false
+    if (isMainFrame) navigationQueue.navigationCommitted()
+  })
+  // A navigation that never commits (a mailto:, tel: or download link) ends
+  // without did-frame-navigate; Home keeps its page and listeners, so resume.
+  contents.on('did-stop-loading', () => {
+    if (navigationQueue.navigationEnded()) routePendingPayloads()
   })
   contents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
     if (isMainFrame) {
@@ -768,11 +775,11 @@ function attachHome(contents, target) {
   })
   contents.on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
     if (!isMainFrame || code === -3 || url !== intendedAppUrl || !approvedAppUrl(url)) return
-    navigatingMain = false
+    navigationQueue.navigationEnded()
     showRecovery()
   })
   contents.on('render-process-gone', () => {
-    navigatingMain = false
+    navigationQueue.navigationEnded()
     showRecovery()
   })
   contents.on('did-finish-load', () => {

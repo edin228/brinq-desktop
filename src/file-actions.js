@@ -191,6 +191,12 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
         const marked = await timed('protect', () => markOrigin(stagingPath, origin))
         if (!marked && requiresInternetOriginProtection(info.filename, platform)) fail('protection', 'OS security protection could not be applied. Try Save As on a supported disk.')
       } catch { fail('protection', 'OS security protection could not be applied. Try Save As on a supported disk.') }
+      // Classic Outlook asks "save changes?" when it closes a writable .msg it
+      // opened from disk; a read-only copy opens, forwards and closes without
+      // it (USER check, Windows with classic Outlook, 2026-11-06). Best effort,
+      // and before the last authority check, so a cancel or navigation during
+      // it still stops the open.
+      if (mode === 'open' && emailFile) await fs.promises.chmod(stagingPath, 0o444).catch(() => {})
       check()
       if (local) {
         const viewInBrinq = async () => {
@@ -241,6 +247,8 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
       await cancelBody(response)
       let cleanupFailed = false
       if (stageCreated && !retained) {
+        // Windows refuses to delete a read-only file (an email copy above).
+        await fs.promises.chmod(stagingPath, 0o600).catch(() => {})
         await fs.promises.rm(stagingPath, { force: true }).catch(() => { cleanupFailed = true })
       }
       event.sender.removeListener('destroyed', abort)

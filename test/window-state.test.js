@@ -61,7 +61,8 @@ test('pending actions wait for their channel and current document, survive reloa
   queue.drain(first, send)
   assert.deepEqual(sent, [])
   queue.subscribe('mailto', first, true)
-  queue.reset()
+  queue.navigationStarted()
+  queue.navigationCommitted()
   queue.drain(reloaded, send)
   queue.subscribe('navigate-email', reloaded, true)
   queue.drain(reloaded, send)
@@ -138,4 +139,35 @@ test('destination sees selected Desktop mode during load, with rollback on failu
   resolveNavigation()
   assert.equal((await mailMode).state.mode, 'email')
   assert.equal(homeSelections, 3)
+})
+
+test('a link that never navigates keeps Home listening, and delivers each payload once', () => {
+  // Electron 44.4.5: a mailto:, tel: or download link starts a main-frame
+  // navigation that ends with did-stop-loading and no commit; the page stays.
+  const queue = createNavigationQueue()
+  const page = {}; const sent = []
+  const send = (...args) => sent.push(args)
+  queue.subscribe('mailto', page, true)
+  queue.subscribe('navigate-email', page, true)
+  queue.navigationStarted()
+  queue.push('navigate-email', 'during')
+  queue.drain(page, send)
+  assert.deepEqual(sent, [], 'nothing is delivered while a navigation is pending')
+  assert.equal(queue.navigationEnded(), true)
+  queue.push('mailto', { subject: 'after' })
+  queue.drain(page, send)
+  queue.drain(page, send)
+  assert.deepEqual(sent, [['navigate-email', 'during'], ['mailto', { subject: 'after' }]])
+  assert.equal(queue.navigationEnded(), false, 'no navigation is left in progress')
+  // A committed navigation replaced the page: its listeners must subscribe again.
+  queue.navigationStarted()
+  queue.navigationCommitted()
+  queue.push('mailto', { subject: 'next page' })
+  queue.drain(page, send)
+  assert.equal(sent.length, 2)
+  const next = {}
+  queue.subscribe('mailto', next, true)
+  queue.drain(next, send)
+  assert.deepEqual(sent.at(-1), ['mailto', { subject: 'next page' }])
+  assert.equal(queue.hasPending(), false)
 })

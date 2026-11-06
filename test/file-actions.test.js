@@ -83,9 +83,15 @@ test('EML and MSG Open in the OS default app (Outlook) like any other file', asy
     assert.equal(f.opens.length, 1)
     assert.equal(f.opens[0].endsWith(item.name), true)
     assert.equal((await fs.readFile(f.opens[0])).toString(), item.body)
+    // Read-only, so Outlook has no changes to offer to save on close.
+    assert.equal((await fs.stat(f.opens[0])).mode & 0o222, 0, item.name)
     assert.deepEqual(f.emailOpens, [])
     assert.deepEqual(f.retained, f.opens)
   }
+  // Other files keep their normal permissions for their own apps.
+  const g = await fixture(t)
+  assert.equal((await g.open()).ok, true)
+  assert.notEqual((await fs.stat(g.opens[0])).mode & 0o200, 0)
 })
 
 test('View in Brinq shows EML and MSG in the email viewer and leaves no downloaded copy', async t => {
@@ -492,6 +498,28 @@ test('navigation or window destruction aborts an in-flight request', async t => 
     }))
     assert.equal((await f.open()).canceled, true)
     assert.equal(f.opens.length, 0)
+  }
+})
+
+test('a cancel or navigation while the email copy is made read-only still stops the open', async t => {
+  const chmod = fs.chmod
+  t.after(() => { fs.chmod = chmod })
+  for (const interrupt of ['cancel', 'navigate']) {
+    let f
+    const id = randomUUID()
+    fs.chmod = async (file, mode) => {
+      if (mode === 0o444) {
+        if (interrupt === 'cancel') f.actions.cancel(f.event, id)
+        else f.event.sender.emit('did-start-navigation', {}, `${BASE}/emails`, false, true)
+      }
+      return chmod(file, mode)
+    }
+    f = await fixture(t)
+    f.fetchWith(eml)
+    assert.equal((await f.open(SOURCE, id)).canceled, true, interrupt)
+    assert.equal(f.opens.length, 0, interrupt)
+    assert.deepEqual(f.retained, [], interrupt)
+    assert.deepEqual(await f.tempFiles(), [], interrupt)
   }
 })
 

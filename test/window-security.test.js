@@ -57,9 +57,29 @@ test('navigation invalidates pending native actions even after returning to the 
   assert.equal(f.policy.validateSender(f.event), false)
   f.wc.emit('did-frame-navigate', {}, f.wc.getURL(), 200, 'OK', true)
   assert.equal(f.policy.validateSender(f.event), true)
+  f.wc.emit('did-stop-loading')
+  assert.equal(f.policy.validateSender(f.event), true)
   assert.equal(authorized(), false)
   f.wc.emit('destroyed')
   assert.equal(f.policy.validateSender(f.event), false)
+})
+
+test('a navigation that never commits gives the page its authority back', () => {
+  // Electron 44.4.5 order for each: did-start-navigation, will-navigate, then
+  // did-stop-loading with no did-frame-navigate. mailto: and tel: go to the
+  // OS; the same-origin link turns into a download.
+  for (const target of ['mailto:client@example.com', 'tel:+15555550123', 'http://localhost:3004/api/files/one/download']) {
+    const f = fixture()
+    const captured = f.policy.captureSender(f.event)
+    f.wc.emit('did-start-navigation', {}, target, false, true)
+    assert.equal(f.policy.validateSender(f.event), false, target)
+    let prevented = false
+    f.wc.emit('will-navigate', { url: target, preventDefault: () => { prevented = true } }, target)
+    assert.equal(prevented, !target.startsWith('http:'), target)
+    f.wc.emit('did-stop-loading')
+    assert.equal(f.policy.validateSender(f.event), true, target)
+    assert.equal(captured(), false, `an action begun before ${target} stays invalid`)
+  }
 })
 
 test('viewer authority is limited to its exact document and role', () => {
