@@ -215,6 +215,11 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
         // file: Windows decides. With Brinq as that app, the file comes back
         // through the single-instance handoff; with none, Windows shows its
         // own picker. USER decision DEFAULT-APP (a), 2026-11-04.
+        // UNVERIFIED on Windows (no Outlook test machine): classic Outlook asks
+        // "save changes?" when it closes a writable .msg it opened from disk.
+        // Hand mail apps a read-only copy, as Outlook opens its own attachments;
+        // best effort, so a failure never blocks the open.
+        if (emailFile) await fs.promises.chmod(stagingPath, 0o444).catch(() => {})
         let error
         try { error = await timed('os_open', () => openPath(stagingPath)) } catch { error = true }
         if (error && emailFile) {
@@ -241,6 +246,8 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
       await cancelBody(response)
       let cleanupFailed = false
       if (stageCreated && !retained) {
+        // Windows refuses to delete a read-only file (an email copy above).
+        await fs.promises.chmod(stagingPath, 0o600).catch(() => {})
         await fs.promises.rm(stagingPath, { force: true }).catch(() => { cleanupFailed = true })
       }
       event.sender.removeListener('destroyed', abort)

@@ -83,9 +83,15 @@ test('EML and MSG Open in the OS default app (Outlook) like any other file', asy
     assert.equal(f.opens.length, 1)
     assert.equal(f.opens[0].endsWith(item.name), true)
     assert.equal((await fs.readFile(f.opens[0])).toString(), item.body)
+    // Read-only, so Outlook has no changes to offer to save on close.
+    assert.equal((await fs.stat(f.opens[0])).mode & 0o222, 0, item.name)
     assert.deepEqual(f.emailOpens, [])
     assert.deepEqual(f.retained, f.opens)
   }
+  // Other files keep their normal permissions for their own apps.
+  const g = await fixture(t)
+  assert.equal((await g.open()).ok, true)
+  assert.notEqual((await fs.stat(g.opens[0])).mode & 0o200, 0)
 })
 
 test('View in Brinq shows EML and MSG in the email viewer and leaves no downloaded copy', async t => {

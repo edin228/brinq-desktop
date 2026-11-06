@@ -217,10 +217,11 @@ function ensurePrivateTempDir() {
 }
 
 function retryUnlink(filePath, attemptsLeft) {
-  fs.unlink(filePath, (err) => {
+  // Windows refuses to delete a read-only file, such as an email handed to Outlook.
+  fs.chmod(filePath, 0o600, () => fs.unlink(filePath, (err) => {
     if (!err || attemptsLeft <= 1) return
     setTimeout(() => retryUnlink(filePath, attemptsLeft - 1), 15000)
-  })
+  }))
 }
 
 function scheduleSyncedAttachmentCleanup(tempPath) {
@@ -315,6 +316,9 @@ ipcMain.handle(
       // Attached emails open in the user's default mail app like other files:
       // Windows decides, showing its picker when none is set. The Brinq
       // viewer shows them only when no app could open them.
+      // UNVERIFIED on Windows: a read-only copy so classic Outlook does not
+      // ask to save changes when the email closes (see file-actions.js).
+      if (isEmailFilename(safeName)) await fs.promises.chmod(tempPath, 0o444).catch(() => {})
       const errorMessage = await shell.openPath(tempPath)
       if (!errorMessage) {
         // The other app may still be starting, or keep the file open, after
