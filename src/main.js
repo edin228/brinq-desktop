@@ -308,6 +308,9 @@ ipcMain.handle(
         console.warn('Could not mark attachment as Internet-originated:', err)
       }
 
+      // A read-only copy, so classic Outlook does not ask to save changes when
+      // the email closes (see file-actions.js); before the authority check.
+      if (isEmailFilename(safeName)) await fs.promises.chmod(tempPath, 0o444).catch(() => {})
       if (!stillAuthorized()) {
         retryUnlink(tempPath, 1)
         return { ok: false, unsafe: false, error: 'Window navigated or closed.' }
@@ -315,9 +318,6 @@ ipcMain.handle(
       // Attached emails open in the user's default mail app like other files:
       // Windows decides, showing its picker when none is set. The Brinq
       // viewer shows them only when no app could open them.
-      // UNVERIFIED on Windows: a read-only copy so classic Outlook does not
-      // ask to save changes when the email closes (see file-actions.js).
-      if (isEmailFilename(safeName)) await fs.promises.chmod(tempPath, 0o444).catch(() => {})
       const errorMessage = await shell.openPath(tempPath)
       if (!errorMessage) {
         // The other app may still be starting, or keep the file open, after

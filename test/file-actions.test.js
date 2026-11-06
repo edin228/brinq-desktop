@@ -501,6 +501,28 @@ test('navigation or window destruction aborts an in-flight request', async t => 
   }
 })
 
+test('a cancel or navigation while the email copy is made read-only still stops the open', async t => {
+  const chmod = fs.chmod
+  t.after(() => { fs.chmod = chmod })
+  for (const interrupt of ['cancel', 'navigate']) {
+    let f
+    const id = randomUUID()
+    fs.chmod = async (file, mode) => {
+      if (mode === 0o444) {
+        if (interrupt === 'cancel') f.actions.cancel(f.event, id)
+        else f.event.sender.emit('did-start-navigation', {}, `${BASE}/emails`, false, true)
+      }
+      return chmod(file, mode)
+    }
+    f = await fixture(t)
+    f.fetchWith(eml)
+    assert.equal((await f.open(SOURCE, id)).canceled, true, interrupt)
+    assert.equal(f.opens.length, 0, interrupt)
+    assert.deepEqual(f.retained, [], interrupt)
+    assert.deepEqual(await f.tempFiles(), [], interrupt)
+  }
+})
+
 test('cancellation immediately before native open or save replacement prevents either side effect', async t => {
   for (const mode of ['open', 'save']) {
     let f

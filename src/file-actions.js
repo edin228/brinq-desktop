@@ -191,6 +191,12 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
         const marked = await timed('protect', () => markOrigin(stagingPath, origin))
         if (!marked && requiresInternetOriginProtection(info.filename, platform)) fail('protection', 'OS security protection could not be applied. Try Save As on a supported disk.')
       } catch { fail('protection', 'OS security protection could not be applied. Try Save As on a supported disk.') }
+      // Classic Outlook asks "save changes?" when it closes a writable .msg it
+      // opened from disk; a read-only copy opens, forwards and closes without
+      // it (USER check, Windows with classic Outlook, 2026-11-06). Best effort,
+      // and before the last authority check, so a cancel or navigation during
+      // it still stops the open.
+      if (mode === 'open' && emailFile) await fs.promises.chmod(stagingPath, 0o444).catch(() => {})
       check()
       if (local) {
         const viewInBrinq = async () => {
@@ -215,11 +221,6 @@ function createFileActions({ baseUrl, security, tempDir, showSaveDialog, openPat
         // file: Windows decides. With Brinq as that app, the file comes back
         // through the single-instance handoff; with none, Windows shows its
         // own picker. USER decision DEFAULT-APP (a), 2026-11-04.
-        // UNVERIFIED on Windows (no Outlook test machine): classic Outlook asks
-        // "save changes?" when it closes a writable .msg it opened from disk.
-        // Hand mail apps a read-only copy, as Outlook opens its own attachments;
-        // best effort, so a failure never blocks the open.
-        if (emailFile) await fs.promises.chmod(stagingPath, 0o444).catch(() => {})
         let error
         try { error = await timed('os_open', () => openPath(stagingPath)) } catch { error = true }
         if (error && emailFile) {
