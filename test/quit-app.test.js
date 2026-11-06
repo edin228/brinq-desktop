@@ -1,7 +1,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
-const { installQuitApp, quitApp } = require('../src/quit-app')
+const { installQuitApp } = require('../src/quit-app')
 const { createWindowSecurity } = require('../src/window-security')
 
 const BASE = 'https://brinq.io'
@@ -32,11 +32,12 @@ function fixture() {
   return { app, page, send, handlers }
 }
 
-test('a Brinq page quits through the normal quit, so unsaved-work prompts still run', () => {
+test('a Brinq page quits through app.quit(), the tray Quit path, not app.exit()', () => {
   const f = fixture()
   assert.deepEqual([...f.handlers.keys()], ['quit-app'])
   f.send(f.page(`${BASE}/dashboard`))
-  // app.quit() lets every window's close and unload guard answer; exit would not.
+  // app.quit() runs every window's close and unload guard (tab-window and
+  // unload-guard tests cover those); app.exit() would skip them.
   assert.deepEqual(f.app.quits, [true])
   assert.equal(f.app.exits, 0)
 })
@@ -58,11 +59,4 @@ test('only a validated Brinq app page can quit', () => {
   away.mainFrame.origin = 'https://evil.test'
   f.send(away)
   assert.deepEqual(f.app.quits, [])
-})
-
-test('the tray Quit and the page Quit share one path', () => {
-  const app = { isQuitting: false, quits: [] }
-  app.quit = () => app.quits.push(app.isQuitting)
-  quitApp(app)
-  assert.deepEqual(app.quits, [true])
 })
