@@ -100,7 +100,7 @@ test('destination sees selected Desktop mode during load, with rollback on failu
     isMode: require('../src/window-state').isMode,
     modeUrl,
     BASE_URL: 'https://brinq.io',
-    config: { getMode: () => mode, setMode: (value) => { mode = value } },
+    config: { getMode: () => mode, setMode: (value) => { mode = value }, getStartup: () => ({ choice: 'home', pages: [] }) },
     app: { getVersion: () => '1.2.5' },
     updateTrayMenu: () => { trayModes.push(mode) },
     // Mode changes load Home, the main window's permanent base tab, and show it.
