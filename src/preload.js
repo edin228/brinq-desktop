@@ -36,6 +36,13 @@ if (process.isMainFrame && ['http:', 'https:'].includes(location.protocol)) {
     // Quit Brinq, as the tray's Quit does; unsaved pages still ask first.
     quitApp: () => ipcRenderer.send('quit-app'),
 
+    // Startup tabs: the choice in Settings, and Home's once-per-launch restore.
+    setStartup: (startup) => ipcRenderer.invoke('set-startup', startup),
+
+    openStartupTabs: (request) => ipcRenderer.invoke('open-startup-tabs', request),
+
+    labelStartupTabs: (labels) => ipcRenderer.invoke('label-startup-tabs', labels),
+
     onUpdateStatus: (callback) => {
       const handler = (_, state) => callback(state)
       ipcRenderer.on('update-status', handler)

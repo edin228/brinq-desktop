@@ -76,7 +76,7 @@ function load(protocol = 'http:', isMainFrame = true, page = fakePage(), platfor
 
 test('preload exposes fixed file and legacy methods and strips IPC events', async () => {
   const { api, ipc, calls } = load()
-  assert.deepEqual(Object.keys(api).sort(), ['getUpdateStatus', 'checkForUpdates', 'restartToUpdate', 'quitApp', 'onUpdateStatus', 'getDesktopState', 'changeMode', 'getFileCapabilities', 'openFile', 'viewFile', 'saveFileAs', 'cancelFileOperation', 'notify', 'setBadgeCount', 'setMode', 'onNavigateEmail', 'onMailto', 'getFileEmail', 'saveFileAttachment', 'openFileAttachment', 'openEmailAttachment', 'saveEmailAttachment'].sort())
+  assert.deepEqual(Object.keys(api).sort(), ['getUpdateStatus', 'checkForUpdates', 'restartToUpdate', 'quitApp', 'setStartup', 'openStartupTabs', 'labelStartupTabs', 'onUpdateStatus', 'getDesktopState', 'changeMode', 'getFileCapabilities', 'openFile', 'viewFile', 'saveFileAs', 'cancelFileOperation', 'notify', 'setBadgeCount', 'setMode', 'onNavigateEmail', 'onMailto', 'getFileEmail', 'saveFileAttachment', 'openFileAttachment', 'openEmailAttachment', 'saveEmailAttachment'].sort())
   api.notify('Title', 'Body', { uid: 'one' }); api.setBadgeCount(2); api.setMode('email')
   await api.getFileEmail('viewer'); await api.saveFileAttachment('viewer', 1); await api.openFileAttachment('viewer', 2)
   await api.openEmailAttachment('email', 'attachment', 'test.pdf'); await api.saveEmailAttachment('email', 'attachment', 'test.pdf')
@@ -261,4 +261,16 @@ test('a failed synchronous send never breaks the page, and other documents send 
     other.fire('click', { target: new other.HTMLAnchorElement({ text: 'Acme' }), ctrlKey: true })
     assert.deepEqual(labelSends(calls), [])
   }
+})
+
+test('startup-tab methods forward only their own argument on fixed channels', async () => {
+  const { api, calls } = load()
+  await api.setStartup({ choice: 'last', pages: [] }, 'extra')
+  await api.openStartupTabs({ userId: 'u-1', sections: [] }, 'extra')
+  await api.labelStartupTabs([], 'extra')
+  assert.deepEqual(calls, [
+    ['set-startup', { choice: 'last', pages: [] }],
+    ['open-startup-tabs', { userId: 'u-1', sections: [] }],
+    ['label-startup-tabs', []],
+  ])
 })

@@ -21,7 +21,7 @@ function unloadVeto(webContents) {
   return event.defaultPrevented
 }
 
-function fixture({ packaged = true, dirty = false, leave = false, installFailure = false, asyncInstallFailure = false } = {}) {
+function fixture({ packaged = true, dirty = false, leave = false, installFailure = false, asyncInstallFailure = false, onRestore = () => {}, onAbandon = () => {} } = {}) {
   const app = new EventEmitter()
   app.isPackaged = packaged
   const updater = new EventEmitter()
@@ -71,9 +71,9 @@ function fixture({ packaged = true, dirty = false, leave = false, installFailure
   }
   app.getVersion = () => '1.3.6'
   const owner = createUpdateStatus({
-    app, updater, schedule: (fn) => scheduled.push(fn), onChange: (state) => changes.push(state), restoreWindow: () => { restored++ },
+    app, updater, schedule: (fn) => scheduled.push(fn), onChange: (state) => changes.push(state), restoreWindow: () => { restored++; onRestore() },
     now: () => clock.now + clock.wallShift, monotonic: () => clock.now, setTimer, clearTimer,
-    abandonClose: () => { abandoned++ },
+    abandonClose: () => { abandoned++; onAbandon() },
   })
   const { window, prompts } = guardedWindow(new EventEmitter(), () => owner, leave)
   windows.push(window)
@@ -768,4 +768,73 @@ test('a clock set back does not stretch the rate-limit hold or the manual cooldo
   f.clock.now += 6000
   await f.owner.check({ manual: true })
   assert.equal(calls, 3)
+})
+
+// Startup tabs wired as main.js wires them: the recorder resumes from the
+// updater's restore path. The tab list here is fixed; the recorder only saves.
+function startupRecorder(app) {
+  const { installStartupTabs } = require('../src/startup-tabs')
+  const handlers = new Map()
+  const tabs = [{ url: 'https://brinq.io/clients/1' }, { url: 'https://brinq.io/emails' }]
+  const timers = []
+  const store = { startup: { choice: 'last', pages: [] }, lastSession: null, writes: 0 }
+  const home = { getURL: () => 'https://brinq.io/dashboard' }
+  const recorder = installStartupTabs({
+    ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) }, app,
+    security: { isAppUrl: (url) => url.startsWith('https://brinq.io/'), validateSender: () => true, captureSender: () => () => true },
+    config: {
+      getMode: () => 'full', getStartup: () => store.startup, getLastSession: () => null,
+      setLastSession: (value) => { store.lastSession = value; store.writes++ }, saveStartup() {},
+    },
+    tabWindow: () => ({ home, available: () => true, restoreTabs: () => [], getSessionState: () => ({ tabs: [...tabs] }) }),
+    baseUrl: 'https://brinq.io', desktopState: () => ({}),
+    timers: { setTimeout: (fn) => { timers.push(fn); return fn }, clearTimeout: (fn) => { const i = timers.indexOf(fn); if (i >= 0) timers.splice(i, 1) } },
+  })
+  handlers.get('open-startup-tabs')({ sender: home }, { userId: 'u-1', sections: [{ key: 'renewals', label: 'Renewals', href: '/clients', paths: ['/clients', '/emails'] }] })
+  return { recorder, tabs, store, runTimers: () => { for (const fn of timers.splice(0)) fn() } }
+}
+
+test('an update restart saves startup tabs before windows close; a failed install resumes saving', () => {
+  let startup
+  // restoreWindow recreates the closed main window, with only Home, then resumes.
+  const f = fixture({ installFailure: true, onRestore: () => { startup.tabs.length = 0; startup.recorder.resume() } })
+  startup = startupRecorder(f.app)
+  f.updater.emit('update-downloaded', { version: '2.0.0' })
+  f.owner.restart()
+  f.flush()
+  // Saved once, by the restart's before-quit, which the fake app emits before closing windows.
+  assert.equal(startup.store.writes, 1)
+  assert.deepEqual(startup.store.lastSession.tabs, [{ url: 'https://brinq.io/clients/1' }, { url: 'https://brinq.io/emails' }])
+  assert.equal(f.restored, 1)
+  assert.equal(f.app.isQuitting, false)
+  // The recreated window's first report (only Home) is not saved over the tabs.
+  startup.recorder.onTabsChanged({ tabs: [] })
+  startup.runTimers()
+  assert.equal(startup.store.lastSession.tabs.length, 2)
+  // Quitting again before any real change keeps the tabs saved before the update.
+  f.app.emit('before-quit', { defaultPrevented: false })
+  assert.equal(startup.store.lastSession.tabs.length, 2)
+  assert.equal(startup.store.writes, 1)
+  // Resume after that quit stops; a real change then saves again.
+  f.app.isQuitting = false
+  startup.recorder.resume()
+  startup.tabs.push({ url: 'https://brinq.io/clients/9' })
+  startup.recorder.onTabsChanged({ tabs: [...startup.tabs] })
+  startup.runTimers()
+  assert.deepEqual(startup.store.lastSession.tabs, [{ url: 'https://brinq.io/clients/9' }])
+})
+
+test('Stay during an update restart keeps the saved startup tabs and resumes saving', () => {
+  let startup
+  const f = fixture({ dirty: true, leave: false, onRestore: () => startup.recorder.resume() })
+  startup = startupRecorder(f.app)
+  f.updater.emit('update-downloaded', { version: '2.0.0' })
+  f.owner.restart()
+  f.flush()
+  assert.equal(f.app.isQuitting, false)
+  assert.equal(startup.store.writes, 1)
+  startup.tabs.push({ url: 'https://brinq.io/clients/3' })
+  startup.recorder.onTabsChanged({ tabs: [...startup.tabs] })
+  startup.runTimers()
+  assert.equal(startup.store.lastSession.tabs.length, 3)
 })

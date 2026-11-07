@@ -33,6 +33,8 @@ function createTabWindow({
   // The header's update action: main's small view of the updater, and the
   // two fixed commands the strip may send for it.
   updateView = () => null, onUpdateCommand = () => {},
+  // Startup tabs: receives the tab list (addresses only) after each change.
+  onTabsChanged = () => {},
 }) {
   const appPreferences = () => ({
     preload: preloadPath, contextIsolation: true, nodeIntegration: false,
@@ -97,7 +99,40 @@ function createTabWindow({
       strip.send('tabs:state', snapshot())
       const selected = selectedEntry()
       host.setTitle(selected ? tabLabel(selected.title, selected.url, selected.provisional) : 'Brinq')
+      try { onTabsChanged(sessionState()) } catch {}
     })
+  }
+
+  // The tabs after Home, in strip order, by their last approved address. A
+  // restored tab that was never opened keeps the address it was restored with.
+  function sessionState() {
+    return {
+      tabs: list.ids().filter((id) => id !== HOME_ID && entries.has(id))
+        .map((id) => entries.get(id).url)
+        .filter((url) => typeof url === 'string' && security.isAppUrl(url))
+        .map((url) => ({ url })),
+    }
+  }
+
+  // Quitting closes every tab; it must never load a restored page on the way.
+  const quitBlocked = () => !!quitting || isQuitting()
+
+  // A restored tab loads the first time it is selected, reloaded or retried.
+  function loadPending(entry) {
+    if (!entry.pending || quitBlocked() || entry.closing || entry.contents.isDestroyed()) return false
+    entry.pending = false
+    entry.loading = true
+    showSelected()
+    push()
+    // A failed load reaches the existing failed-tab panel through did-fail-load.
+    entry.contents.loadURL(entry.url).catch(() => {})
+    return true
+  }
+
+  // After a stopped or abandoned quit, a selected restored tab loads as usual.
+  function resumeSelected() {
+    const entry = selectedEntry()
+    if (entry?.pending && alive()) loadPending(entry)
   }
 
   function layout() {
@@ -127,6 +162,7 @@ function createTabWindow({
     const entry = entries.get(id)
     if (!alive() || !entry || !list.select(id)) return false
     showSelected()
+    loadPending(entry)
     // The selected tab owns the header theme; ask for a fresh report.
     if (isTheme(entry.theme)) applyTheme(entry.theme)
     requestTheme(entry)
@@ -198,6 +234,7 @@ function createTabWindow({
   }
 
   function reload(entry, hard) {
+    if (entry.pending) return loadPending(entry)
     if (entry.failed && entry.url) return retry(entry.id)
     if (hard) entry.contents.reloadIgnoringCache()
     else entry.contents.reload()
@@ -291,19 +328,33 @@ function createTabWindow({
     security.register(contents, entry.id === HOME_ID ? 'main' : 'app', undefined, host)
   }
 
-  function addTab({ contents: guest = null, webPreferences, url, afterId, background, id: fixedId, provisional = null }) {
+  function addTab({ contents: guest = null, webPreferences, url, afterId, background, id: fixedId, provisional = null, lazy = false }) {
     const view = guest
       ? new WebContentsView({ webContents: guest })
       // Keep inherited sandbox flags, but never loosen the app preferences.
       : new WebContentsView({ webPreferences: { ...webPreferences, ...appPreferences() } })
     const id = fixedId ?? list.add({ afterId })
     const entry = {
-      id, view, contents: view.webContents, url, title: '', loading: !guest, failed: null,
+      id, view, contents: view.webContents, url, title: '', loading: !guest && !lazy, failed: null,
       theme: null, closing: false, retrying: false, stayedAt: 0,
+      // A restored tab waits, unloaded, until it is first selected.
+      pending: lazy, restored: false,
       // The opening link's name, shown until the page has its own title.
       provisional: provisional?.label ?? null, provisionalUrl: provisional?.url ?? null,
     }
-    attach(entry)
+    try {
+      attach(entry)
+    } catch (error) {
+      // A view that failed to attach must not linger in the strip or the
+      // session list: undo every step attach may have taken.
+      entries.delete(id)
+      byContents.delete(entry.contents)
+      if (id !== HOME_ID) list.remove(id)
+      try { host.contentView.removeChildView(view) } catch {}
+      try { if (!entry.contents.isDestroyed()) entry.contents.close() } catch {}
+      push()
+      throw error
+    }
     if (!background) select(id)
     else push()
     return entry
@@ -385,6 +436,11 @@ function createTabWindow({
   // Chromium runs one unload at a time.
   function requestClose(entry) {
     entry.closing = true
+    // A tab that never loaded has no page and no unsaved work to ask about.
+    if (entry.pending) {
+      if (!entry.contents.isDestroyed()) entry.contents.close()
+      return
+    }
     const wait = entry.stayedAt ? entry.stayedAt + UNLOAD_SETTLE_MS - now() : 0
     const close = () => {
       if (!entry.contents.isDestroyed()) entry.contents.close({ waitForBeforeUnload: true })
@@ -445,6 +501,54 @@ function createTabWindow({
     quitAttempt++
     quitting = null
     for (const entry of entries.values()) entry.settle?.(false)
+    if (!isQuitting()) resumeSelected()
+  }
+
+  // Startup tabs: adds each saved or chosen page after the existing tabs,
+  // unloaded and unselected. Returns the tabs actually added.
+  function restoreTabs(items) {
+    const added = []
+    if (!alive() || quitBlocked() || !Array.isArray(items)) return added
+    for (const item of items) {
+      if (!item || typeof item.url !== 'string' || !security.isAppUrl(item.url)) continue
+      try {
+        const entry = addTab({
+          url: item.url, webPreferences: appPreferences(), afterId: null, background: true, lazy: true,
+          provisional: { label: typeof item.label === 'string' ? item.label : null, url: canonicalUrl(item.url) },
+        })
+        entry.restored = true
+        added.push({ id: entry.id, url: item.url })
+      } catch {
+        // addTab undid the failed tab; keep Home and the tabs already added.
+        break
+      }
+    }
+    return added
+  }
+
+  // Startup tabs: names restored tabs that are still unloaded with titles the
+  // page resolved, or closes those the person can no longer open. A loaded
+  // tab keeps its page's own title.
+  function labelRestored(labels) {
+    const result = { labeled: 0, closed: 0 }
+    if (!alive() || quitBlocked() || !Array.isArray(labels)) return result
+    for (const label of labels) {
+      const target = label && canonicalUrl(label.url)
+      if (!target) continue
+      const entry = [...entries.values()].find((candidate) =>
+        candidate.restored && candidate.pending && !candidate.closing && canonicalUrl(candidate.url) === target)
+      if (!entry) continue
+      if (label.unavailable === true) {
+        if (closeTab(entry.id, { focus: false })) result.closed++
+        continue
+      }
+      const title = typeof label.title === 'string' ? pageTitle(label.title) : ''
+      if (!title) continue
+      entry.provisional = title
+      result.labeled++
+    }
+    push()
+    return result
   }
 
   function reportTheme(contents, value) {
@@ -539,7 +643,10 @@ function createTabWindow({
     // loop finished but must not quit again.
     closeAllForQuit().then((closed) => {
       if (closed && isQuitting()) requestQuit()
-      else onQuitStopped()
+      else {
+        onQuitStopped()
+        if (!isQuitting()) resumeSelected()
+      }
     })
   })
 
@@ -591,6 +698,9 @@ function createTabWindow({
     windowFor: (contents) => (entryFor(contents) && alive() ? host : null),
     isTab: (contents) => !!entryFor(contents),
     hasOpenTabs: () => entries.size > 0,
+    restoreTabs,
+    labelRestored,
+    getSessionState: sessionState,
   }
 }
 
