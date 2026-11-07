@@ -186,6 +186,9 @@ function installStartupTabs({
   let paused = false
   let pending = null
   let lastSaved = null
+  // After a quit that stopped, the saved tabs stay as they were until the
+  // tab list really changes, including through the next quit.
+  let preserving = false
 
   const cancel = () => {
     if (timer !== null) timers.clearTimeout(timer)
@@ -212,6 +215,7 @@ function installStartupTabs({
     const urls = tabAddresses(state.tabs.map((tab) => tab?.url), isAppUrl)
     const key = snapshotKey(urls)
     if (key === lastSaved && pending === null) return
+    preserving = false
     pending = urls
     if (timer !== null) timers.clearTimeout(timer)
     timer = timers.setTimeout(() => {
@@ -231,7 +235,7 @@ function installStartupTabs({
   // The quit's later passes see tabs closing and save nothing.
   app.on('before-quit', (event) => {
     if (event.defaultPrevented || paused) return
-    const urls = launch.eligible && !launch.disarmed ? currentUrls() : null
+    const urls = launch.eligible && !launch.disarmed && !preserving ? currentUrls() : null
     cancel()
     if (urls && config.getMode() === 'full' && config.getStartup().choice === 'last') {
       try {
@@ -250,6 +254,7 @@ function installStartupTabs({
   function resume() {
     if (!paused || app.isQuitting) return
     paused = false
+    preserving = true
     const urls = currentUrls()
     lastSaved = urls ? snapshotKey(urls) : lastSaved
   }

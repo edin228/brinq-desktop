@@ -1063,3 +1063,21 @@ test('copy link on a restored tab gives the address it was restored with', async
   await new Promise((resolve) => setImmediate(resolve))
   assert.deepEqual(f.copied, [`${BASE}/clients/7`])
 })
+
+test('a restored tab that fails to attach is undone; Home and earlier tabs stay', () => {
+  const reports = []
+  const f = fixture({ onTabsChanged: (state) => reports.push(state) })
+  const register = f.security.register
+  let calls = 0
+  f.security.register = (...args) => {
+    if (++calls === 2) throw new Error('attach failed')
+    return register(...args)
+  }
+  const added = f.tabs.restoreTabs([`${BASE}/emails`, `${BASE}/clients/7`, `${BASE}/clients/8`].map((url) => ({ url, label: 'Section' })))
+  f.flush()
+  assert.deepEqual(added.map((tab) => tab.url), [`${BASE}/emails`], 'stops at the failure')
+  assert.deepEqual(tabIds(f), [1, added[0].id], 'no orphan in the strip')
+  assert.deepEqual(f.tabs.getSessionState(), { tabs: [{ url: `${BASE}/emails` }] })
+  assert.equal(f.host.children.length, 2, 'the failed view was removed')
+  assert.deepEqual(reports.at(-1), { tabs: [{ url: `${BASE}/emails` }] })
+})

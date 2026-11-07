@@ -246,6 +246,11 @@ test('after Stay or a stalled update, saving resumes without overwriting the sav
   f.startupTabs.onTabsChanged(f.window.getSessionState())
   f.clock.run()
   assert.equal(f.store.writes.length, 1, 'the surviving list alone is not a change')
+  // A second quit with only the survivors keeps the saved tabs too.
+  f.app.emit('before-quit', { defaultPrevented: false })
+  assert.equal(f.store.writes.length, 1)
+  f.app.isQuitting = false
+  f.startupTabs.resume()
   f.window.tabs.push({ url: `${BASE}/emails` })
   f.startupTabs.onTabsChanged(f.window.getSessionState())
   f.clock.run()

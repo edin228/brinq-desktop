@@ -342,7 +342,19 @@ function createTabWindow({
       // The opening link's name, shown until the page has its own title.
       provisional: provisional?.label ?? null, provisionalUrl: provisional?.url ?? null,
     }
-    attach(entry)
+    try {
+      attach(entry)
+    } catch (error) {
+      // A view that failed to attach must not linger in the strip or the
+      // session list: undo every step attach may have taken.
+      entries.delete(id)
+      byContents.delete(entry.contents)
+      if (id !== HOME_ID) list.remove(id)
+      try { host.contentView.removeChildView(view) } catch {}
+      try { if (!entry.contents.isDestroyed()) entry.contents.close() } catch {}
+      push()
+      throw error
+    }
     if (!background) select(id)
     else push()
     return entry
@@ -499,19 +511,15 @@ function createTabWindow({
     if (!alive() || quitBlocked() || !Array.isArray(items)) return added
     for (const item of items) {
       if (!item || typeof item.url !== 'string' || !security.isAppUrl(item.url)) continue
-      let entry = null
       try {
-        entry = addTab({
+        const entry = addTab({
           url: item.url, webPreferences: appPreferences(), afterId: null, background: true, lazy: true,
           provisional: { label: typeof item.label === 'string' ? item.label : null, url: canonicalUrl(item.url) },
         })
         entry.restored = true
         added.push({ id: entry.id, url: item.url })
       } catch {
-        // Keep Home and the tabs already added; drop a half-made one.
-        if (entry && !entry.contents.isDestroyed()) {
-          try { entry.contents.close() } catch {}
-        }
+        // addTab undid the failed tab; keep Home and the tabs already added.
         break
       }
     }

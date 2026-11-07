@@ -811,6 +811,13 @@ test('an update restart saves startup tabs before windows close; a failed instal
   startup.recorder.onTabsChanged({ tabs: [] })
   startup.runTimers()
   assert.equal(startup.store.lastSession.tabs.length, 2)
+  // Quitting again before any real change keeps the tabs saved before the update.
+  f.app.emit('before-quit', { defaultPrevented: false })
+  assert.equal(startup.store.lastSession.tabs.length, 2)
+  assert.equal(startup.store.writes, 1)
+  // Resume after that quit stops; a real change then saves again.
+  f.app.isQuitting = false
+  startup.recorder.resume()
   startup.tabs.push({ url: 'https://brinq.io/clients/9' })
   startup.recorder.onTabsChanged({ tabs: [...startup.tabs] })
   startup.runTimers()
