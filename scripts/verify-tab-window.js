@@ -98,8 +98,11 @@ const ROUTES = {
 }
 
 async function main() {
+  // Requests per route, so lazy tabs can be shown to fetch nothing.
+  const requests = {}
   const server = http.createServer((request, response) => {
     const route = new URL(request.url, 'http://localhost').pathname
+    requests[route] = (requests[route] || 0) + 1
     if (route === '/broken') { request.socket.destroy(); return }
     const body = ROUTES[route] || page(`brinq | ${route}`, `<p>${route}</p>`)
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
@@ -465,20 +468,46 @@ async function main() {
     const left = await tabs.home.loadURL(`${base}/home`).then(() => 'loaded', (error) => `rejected: ${error.message}`)
     check('Leave lets Home navigate', left === 'loaded' && tabs.home.getURL().endsWith('/home'), `${left} at ${tabs.home.getURL()}`)
 
+    // Startup tabs: restored tabs are real views that fetch nothing until selected.
+    const restored = tabs.restoreTabs(['/restored-a', '/restored-b'].map((route) => ({ url: `${base}${route}`, label: route })))
+    await wait(500)
+    check('restored tabs are added without selecting them', restored.length === 2 && (await stripState()).selected === 'home')
+    check('a restored tab makes no request until selected', !requests['/restored-a'] && !requests['/restored-b'], JSON.stringify(requests))
+    const restoredPages = tabPages().filter((wc) => !wc.getURL())
+    check('a restored tab has a blank document with no native authority',
+      restoredPages.length === 2 && restoredPages.every((wc) => !security.validateSender({ sender: wc, senderFrame: wc.mainFrame })))
+    tabs.select(restored[0].id)
+    const pageA = () => restoredPages.find((wc) => !wc.isDestroyed() && wc.getURL() === `${base}/restored-a`)
+    check('selecting a restored tab loads it once', await until(() => requests['/restored-a'] === 1 && !!pageA()))
+    await wait(300)
+    check('it is not loaded twice', requests['/restored-a'] === 1)
+    const pageB = restoredPages.find((wc) => wc !== pageA())
+    const promptsBeforeClose = prompts.length
+    tabs.closeTab(restored[1].id)
+    check('closing a never-loaded tab destroys it without a prompt',
+      await until(() => pageB.isDestroyed()) && prompts.length === promptsBeforeClose && !requests['/restored-b'])
+    const loadedA = pageA()
+    tabs.closeTab(restored[0].id)
+    await until(() => loadedA.isDestroyed())
+
     // A real app.quit() with a hidden tab holding unsaved work.
     const quitTab = tabs.openTab({ opener: tabs.home, url: `${base}/dirty`, options: { webPreferences: {} }, referrer: { url: '', policy: 'default' }, background: false })
     await until(() => !quitTab.isLoading())
     await click(quitTab, '#draft')
     quitTab.sendInputEvent({ type: 'char', keyCode: 'y' })
     await until(() => quitTab.executeJavaScript('document.getElementById("draft").value === "y"'))
+    // Two restored tabs after the guarded one; quitting must not load them.
+    tabs.restoreTabs(['/restored-c', '/restored-d'].map((route) => ({ url: `${base}${route}`, label: route })))
     tabs.selectHome()
     host.hide()
+    const promptsBeforeQuit = prompts.length
     answers.push(1)
     app.quit()
     const quitStopped = await until(() => quitStops === 1)
     check('Stay stops a real quit', quitStopped && !quitTab.isDestroyed() && !app.isQuitting,
       JSON.stringify({ quitStops, destroyed: quitTab.isDestroyed(), quitting: app.isQuitting, prompts: prompts.length, answers }))
     check('the stopped quit shows the window and the tab with unsaved work', host.isVisible() && tabs.isTab(quitTab))
+    check('Stay prompted once and loaded no restored tab', prompts.length === promptsBeforeQuit + 1 && !requests['/restored-c'] && !requests['/restored-d'])
     let quitState = null
     app.once('will-quit', (event) => {
       // Keep the harness alive to report; record what quitting left behind.
@@ -490,6 +519,7 @@ async function main() {
     check('Leave completes the quit after every tab and Home closed', await until(() => quitState !== null),
       JSON.stringify(quitState))
     check('quit left no pages and closed the window', quitState?.host === true && quitState?.tabs === 0 && quitState?.home === true)
+    check('closing the selected guarded tab during quit loaded neither restored neighbour', !requests['/restored-c'] && !requests['/restored-d'], JSON.stringify(requests))
   } catch (error) {
     check('harness completed', false, error?.stack || String(error))
   }

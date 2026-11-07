@@ -50,7 +50,7 @@ function fakeContents(session, url = '') {
   return wc
 }
 
-function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, onUpdateCommand } = {}) {
+function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, onUpdateCommand, onTabsChanged } = {}) {
   const session = { setPermissionCheckHandler() {}, setPermissionRequestHandler() {} }
   const security = createWindowSecurity({ baseUrl: BASE, preloadPath: '/preload.js', openExternal() {} })
   const queue = []
@@ -142,7 +142,7 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
     isQuitting: () => app.quitting,
     requestQuit: () => { app.quitRequests++ },
     onQuitStopped: () => { app.stopped++; app.quitting = false },
-    updateView, onUpdateCommand,
+    updateView, onUpdateCommand, onTabsChanged,
   })
   const host = windows[0]
   const strip = host.webContents
@@ -932,4 +932,134 @@ test('an abandoned quit settles its stuck close loop, so the next quit asks ever
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(hung.closes.length, 2)
   f.tabs.abandonQuit()
+})
+
+// Startup tabs: restored tabs are added unloaded and load when first selected.
+function restore(f, urls) {
+  const added = f.tabs.restoreTabs(urls.map((url, index) => ({ url, label: `Section ${index + 1}` })))
+  f.flush()
+  // Restored views are the last ones added, in order.
+  const views = f.host.children.slice(-added.length)
+  return { added, contents: views.map((view) => view.webContents) }
+}
+
+test('restored tabs wait unloaded and unselected, then load once when selected', () => {
+  const f = fixture()
+  const { added, contents } = restore(f, [`${BASE}/emails`, `${BASE}/clients/7`])
+  assert.deepEqual(added.map((tab) => tab.url), [`${BASE}/emails`, `${BASE}/clients/7`])
+  assert.deepEqual(contents.map((wc) => wc.loads.length), [0, 0], 'nothing loads at restore')
+  assert.equal(f.state().selectedId, 1, 'Home stays selected')
+  const [email, client] = f.state().tabs.slice(1)
+  assert.deepEqual([email.label, email.loading, client.label, client.loading], ['Section 1', false, 'Section 2', false])
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'select', email.id, { focus: true }), true)
+  f.tabs.stripCommand(f.stripEvent(), 'select', email.id, { focus: true })
+  assert.deepEqual(contents[0].loads.map(([url]) => url), [`${BASE}/emails`], 'selecting loads exactly once')
+  f.flush()
+  assert.equal(f.state().tabs[1].loading, true)
+  // Ctrl+Tab onto the other restored tab loads it too.
+  f.tabs.dispatch('next')
+  assert.deepEqual(contents[1].loads.map(([url]) => url), [`${BASE}/clients/7`])
+})
+
+test('restoring never moves a broker who already left Home, and skips non-app addresses', () => {
+  const f = fixture()
+  const opened = f.open(`${BASE}/clients/1`, { background: false })
+  const selected = f.state().selectedId
+  const added = f.tabs.restoreTabs([{ url: 'https://evil.example/x', label: 'X' }, { url: `${BASE}/emails`, label: 'Email' }])
+  f.flush()
+  assert.deepEqual(added.map((tab) => tab.url), [`${BASE}/emails`])
+  assert.equal(f.state().selectedId, selected)
+  assert.equal(opened.loads.length, 1)
+})
+
+test('a restored tab closes without a prompt, and quitting never loads one', async () => {
+  const f = fixture({ choice: 1 })
+  const loaded = f.open(`${BASE}/clients/1`, { background: false })
+  const { contents } = restore(f, [`${BASE}/emails`, `${BASE}/clients/7`])
+  for (const wc of contents) wc.veto = true
+  // Closing the selected loaded tab moves selection onto a restored tab during quit.
+  f.app.quitting = true
+  assert.equal(await f.tabs.closeAllForQuit(), true)
+  assert.equal(loaded.isDestroyed(), true)
+  assert.deepEqual(contents.map((wc) => wc.loads.length), [0, 0], 'quit loads no restored page')
+  assert.deepEqual(contents.map((wc) => wc.closes), [[undefined], [undefined]], 'closed without waiting for an unload prompt')
+  assert.equal(f.dialogs.length, 0)
+})
+
+test('a restored tab selected while quitting loads once the quit stops or is abandoned', async () => {
+  const f = fixture()
+  const { added, contents } = restore(f, [`${BASE}/emails`, `${BASE}/clients/7`])
+  f.app.quitting = true
+  f.tabs.select(added[0].id)
+  assert.equal(contents[0].loads.length, 0)
+  f.app.quitting = false
+  f.tabs.select(added[0].id)
+  assert.equal(contents[0].loads.length, 1, 'a normal select after Stay loads it')
+
+  // A stuck quit that is abandoned resumes the selected restored tab.
+  const hung = f.open(`${BASE}/clients/9`)
+  hung.close = function (options) { this.closes.push(options) }
+  f.app.quitting = true
+  const stuck = f.tabs.closeAllForQuit()
+  f.tabs.select(added[1].id)
+  assert.equal(contents[1].loads.length, 0)
+  f.app.quitting = false
+  f.tabs.abandonQuit()
+  assert.equal(await stuck, false)
+  assert.equal(contents[1].loads.length, 1)
+})
+
+test('the tab list reports addresses in strip order, including restored tabs, never titles or selection', () => {
+  const reports = []
+  const f = fixture({ onTabsChanged: (state) => reports.push(state) })
+  const opened = f.open(`${BASE}/clients/1`)
+  opened.emit('page-title-updated', {}, 'brinq | Acme Holdings')
+  const { added } = restore(f, [`${BASE}/emails`])
+  f.flush()
+  const expected = { tabs: [{ url: `${BASE}/clients/1` }, { url: `${BASE}/emails` }] }
+  assert.deepEqual(reports.at(-1), expected)
+  assert.deepEqual(f.tabs.getSessionState(), expected, 'the synchronous snapshot matches')
+  f.tabs.stripCommand(f.stripEvent(), 'move', added[0].id, { position: 1 })
+  f.flush()
+  assert.deepEqual(f.tabs.getSessionState().tabs.map((tab) => tab.url), [`${BASE}/emails`, `${BASE}/clients/1`])
+  f.tabs.closeTab(added[0].id)
+  f.flush()
+  assert.deepEqual(reports.at(-1), { tabs: [{ url: `${BASE}/clients/1` }] })
+})
+
+test('labels name only restored tabs that have not loaded; unavailable ones close without a prompt', () => {
+  const f = fixture()
+  const normal = f.open(`${BASE}/clients/2`)
+  const urls = [`${BASE}/clients/7`, `${BASE}/emails/x`, `${BASE}/campaigns/c`]
+  const { added, contents } = restore(f, urls)
+  contents[1].veto = true
+  f.tabs.select(added[2].id)
+  const result = f.tabs.labelRestored([
+    { url: urls[0], title: 'brinq | Acme Holdings' },
+    { url: urls[1], unavailable: true },
+    { url: urls[2], title: 'brinq | Spring renewals' },
+    { url: `${BASE}/clients/2`, title: 'brinq | Not a restored tab' },
+    { url: `${BASE}/clients/8`, title: 'brinq | Unknown' },
+  ])
+  f.flush()
+  assert.deepEqual(result, { labeled: 1, closed: 1 })
+  const labels = Object.fromEntries(f.state().tabs.map((tab) => [tab.id, tab.label]))
+  assert.equal(labels[added[0].id], 'Acme Holdings')
+  assert.equal(added[1].id in labels, false, 'the unavailable tab is gone')
+  assert.deepEqual(contents[1].closes, [undefined])
+  assert.equal(labels[added[2].id], 'Section 3', 'a loaded tab keeps its own naming')
+  assert.equal(normal.loads.length, 1)
+  f.app.quitting = true
+  assert.deepEqual(f.tabs.labelRestored([{ url: urls[0], title: 'brinq | Later' }]), { labeled: 0, closed: 0 })
+})
+
+test('copy link on a restored tab gives the address it was restored with', async () => {
+  const f = fixture()
+  const { added } = restore(f, [`${BASE}/clients/7?standalone=full`])
+  assert.equal(f.tabs.stripCommand(f.stripEvent(), 'menu', added[0].id, { x: 10, y: 10 }), true)
+  const copy = f.menus.at(-1).template.find((item) => item.label === 'Copy link')
+  assert.equal(copy.enabled, true)
+  copy.click()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(f.copied, [`${BASE}/clients/7`])
 })
