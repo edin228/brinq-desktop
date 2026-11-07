@@ -43,6 +43,7 @@ const { createLinkMenu } = require('./link-menu')
 const { createNativeNotifier } = require('./native-notifications')
 const { installBrowserSignIn } = require('./browser-sign-in')
 const { quitApp, installQuitApp } = require('./quit-app')
+const { installStartupTabs } = require('./startup-tabs')
 
 // Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
 if (process.platform === 'win32') {
@@ -107,7 +108,10 @@ const logFile = (fields) => require('electron-log').info(`[file] ${fields.mode} 
 const updates = createUpdateStatus({
   app, updater: autoUpdater, log: logUpdate,
   onCheckEnd: (result) => updateSchedule.record(result),
-  abandonClose: () => tabWindow?.abandonQuit(),
+  abandonClose: () => {
+    tabWindow?.abandonQuit()
+    startupTabs.resume()
+  },
   onChange: (state) => {
     if (tray) updateTrayMenu()
     tabWindow?.refreshUpdate()
@@ -117,6 +121,7 @@ const updates = createUpdateStatus({
   restoreWindow: () => {
     if (!mainWindow || mainWindow.isDestroyed()) createWindow({ initialUrl: intendedAppUrl })
     showMainWindow()
+    startupTabs.resume()
   },
 })
 const updateSchedule = createUpdateSchedule({ check: () => updates.check(), log: logUpdate })
@@ -124,7 +129,7 @@ const updateSchedule = createUpdateSchedule({ check: () => updates.check(), log:
 // A window whose page holds unsaved work asks before closing; Stay also
 // stops a quit or update restart. Tabs ask through the tab window.
 app.on('browser-window-created', (_event, window) => {
-  guardWindowUnload({ window, dialog, onStay: () => updates.cancelQuit() })
+  guardWindowUnload({ window, dialog, onStay: () => { updates.cancelQuit(); startupTabs.resume() } })
 })
 
 // ---------------------------------------------------------------------------
@@ -832,8 +837,11 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
       if (command === 'restart-update') updates.restart()
       else updates.check({ manual: true })
     },
+    // Startup tabs record the tab list (addresses only) for next launch.
+    onTabsChanged: (state) => startupTabs.onTabsChanged(state),
     onQuitStopped: () => {
       updates.cancelQuit()
+      startupTabs.resume()
       // Quitting closed the recovery window; bring it back if Home still
       // cannot load, rather than showing Home's error page.
       if (homeUnavailable) showRecovery()
@@ -967,7 +975,7 @@ function updateTrayMenu() {
 }
 
 function desktopState() {
-  return { mode: config.getMode(), version: app.getVersion() }
+  return { mode: config.getMode(), version: app.getVersion(), startup: config.getStartup() }
 }
 
 let modeChangeInProgress = false
@@ -1038,6 +1046,14 @@ ipcMain.handle('check-for-updates', (event) => validateSender(event) ? updates.c
 ipcMain.handle('restart-to-update', (event) => validateSender(event) ? updates.restart() : { ok: false, error: 'Unauthorized sender.' })
 
 installQuitApp({ ipcMain, app, security: windowSecurity })
+
+// Registered after the updater, so its blocked-installer quit is already
+// prevented when the recorder decides whether this quit saves the tabs.
+const startupTabs = installStartupTabs({
+  ipcMain, app, security: windowSecurity, config, tabWindow: () => tabWindow, baseUrl: BASE_URL,
+  desktopState: () => desktopState(),
+  log: (category) => require('electron-log').warn(`[startup-tabs] ${category}`),
+})
 
 ipcMain.handle('desktop-state', (event) => validateSender(event) ? desktopState() : null)
 ipcMain.handle('change-mode', (event, mode) => {

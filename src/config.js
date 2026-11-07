@@ -1,6 +1,7 @@
 const Store = require('electron-store')
 const { app } = require('electron')
 const { resolveBaseUrl } = require('./window-security')
+const { parseStartup, parseSession } = require('./startup-tabs')
 
 const store = new Store({
   defaults: {
@@ -20,5 +21,12 @@ module.exports = {
   setTheme: (theme) => { if (isTheme(theme)) store.set('theme', theme) },
   getWindowBounds: () => store.get('windowBounds'),
   setWindowBounds: (bounds) => store.set('windowBounds', bounds),
+  // Startup tabs. A corrupt value means Home only, or no saved session.
+  getStartup: () => parseStartup(store.get('startup')),
+  getLastSession: () => parseSession(store.get('lastSession')),
+  // One store write, so a failure keeps the previous choice and session.
+  saveStartup: (startup, { clearSession = false } = {}) =>
+    store.set(clearSession ? { startup, lastSession: null } : { startup }),
+  setLastSession: (session) => store.set('lastSession', session),
   getBaseUrl: () => resolveBaseUrl({ isPackaged: app.isPackaged }),
 }
