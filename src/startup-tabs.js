@@ -235,9 +235,12 @@ function installStartupTabs({
   // The quit's later passes see tabs closing and save nothing.
   app.on('before-quit', (event) => {
     if (event.defaultPrevented || paused) return
-    const urls = launch.eligible && !launch.disarmed && !preserving ? currentUrls() : null
+    const urls = launch.eligible && !launch.disarmed ? currentUrls() : null
     cancel()
-    if (urls && config.getMode() === 'full' && config.getStartup().choice === 'last') {
+    // After a stopped quit, the tabs that survived it are not a change; any
+    // tab opened or closed since is, even before its coalesced report arrives.
+    const unchanged = preserving && urls !== null && snapshotKey(urls) === lastSaved
+    if (urls && !unchanged && config.getMode() === 'full' && config.getStartup().choice === 'last') {
       try {
         config.setLastSession({ userId: launch.owner, tabs: urls.map((url) => ({ url })) })
         lastSaved = snapshotKey(urls)

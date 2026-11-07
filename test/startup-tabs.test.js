@@ -361,3 +361,17 @@ test('labels stop after another person reports or a quit starts', () => {
     assert.equal(f.labels.length, 0)
   }
 })
+
+test('a tab opened after a stopped quit is saved even when the next quit beats its report', () => {
+  const f = fixture({ startup: { choice: 'last', pages: [] } })
+  f.open()
+  f.window.tabs.push({ url: `${BASE}/clients/1` }, { url: `${BASE}/clients/2` })
+  f.quit()
+  f.window.tabs.shift()
+  f.app.isQuitting = false
+  f.startupTabs.resume()
+  // Tab 3 opens; the quit comes before the tab window reports it.
+  f.window.tabs.push({ url: `${BASE}/clients/3` })
+  f.app.emit('before-quit', { defaultPrevented: false })
+  assert.deepEqual(f.store.lastSession.tabs, [{ url: `${BASE}/clients/2` }, { url: `${BASE}/clients/3` }])
+})
