@@ -23,8 +23,16 @@ const {
 // is deleted as soon as it stops being current.
 
 const MAX_NOTE_BYTES = 64 * 1024
+// Brinq's session cookie (frontend server/brinqAuthCookies.ts): `__Host-brinq-session` in
+// production, `brinq-session` or `brinq-session-<namespace>` in development. It is set only by
+// sign-in and cleared only by sign-out.
+const SESSION_COOKIE = /^(?:__Host-)?brinq-session(?:-[\w-]+)?$/
 // Windows device names refuse to be file names, with or without an extension.
-const DEVICE_STEM = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i
+// Windows also reserves the superscript forms COM¹ … LPT³.
+const DEVICE_STEM = /^(?:con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])$/i
+// A never-dragged file whose deletion failed is retried, then left to the startup sweep.
+const REMOVE_RETRIES = 3
+const REMOVE_RETRY_MS = 15000
 const FILENAME_BYTES = 180
 
 class DragFailure extends Error {
@@ -57,7 +65,7 @@ const safeInt = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : 
 function createEmailDrag({
   baseUrl, security, tempDir, scheduleCleanup, icon,
   markOrigin = markFileAsInternetOrigin, platform = process.platform,
-  log = () => {}, files = fs.promises,
+  log = () => {}, files = fs.promises, schedule = setTimeout,
 }) {
   const origin = new URL(baseUrl).origin
   const dragDir = path.join(tempDir, 'drag')
@@ -65,22 +73,38 @@ function createEmailDrag({
   const current = new Map()
   /** senders whose lifecycle listeners are attached (once per sender, never per preparation) */
   const watched = new Set()
+  /** sessions whose cookie changes end their staged emails */
+  const watchedSessions = new WeakSet()
   /** file path -> { cancel, pins, proceed } for files handed to the OS */
   const handedOff = new Map()
-  let nextGeneration = 0
 
   // `icon` is a nativeImage, or a function returning one (loaded lazily after app ready).
   const dragIcon = () => (typeof icon === 'function' ? icon() : icon)
   const iconReady = () => { try { const image = dragIcon(); return !!image && !image.isEmpty() } catch { return false } }
   const note = (fields) => { try { log({ event: 'email-drag', ...fields }) } catch { /* never changes a result */ } }
 
+  // Deletes a staged file that was never handed to the OS. On failure the entry keeps the
+  // directory (a later retire tries again) and a few background retries follow; the answer
+  // says whether it is gone now.
   async function removeStaged(entry) {
     if (!entry.dir || handedOff.has(entry.path)) return true
+    const dir = entry.dir
     try {
-      await files.rm(entry.dir, { recursive: true, force: true })
+      await files.rm(dir, { recursive: true, force: true })
+      entry.dir = entry.path = null
       return true
     } catch {
       note({ outcome: 'cleanup-failed' })
+      const retry = (left) => {
+        const timer = schedule(() => {
+          files.rm(dir, { recursive: true, force: true }).then(
+            () => { if (entry.dir === dir) entry.dir = entry.path = null },
+            () => { if (left > 1) retry(left - 1); else note({ outcome: 'cleanup-abandoned' }) },
+          )
+        }, REMOVE_RETRY_MS)
+        timer?.unref?.()
+      }
+      retry(REMOVE_RETRIES)
       return false
     }
   }
@@ -96,7 +120,22 @@ function createEmailDrag({
     return entry.pending ? entry.pending.then(() => removeStaged(entry)) : removeStaged(entry)
   }
 
+  // A sign-out or a new sign-in in any window of this session ends every staged email in it,
+  // including other windows' (a pop-out keeps its page after a sign-out elsewhere). Files already
+  // handed to the OS keep their retention.
+  function watchSession(session) {
+    if (!session?.cookies?.on || watchedSessions.has(session)) return
+    watchedSessions.add(session)
+    const host = new URL(origin).hostname
+    session.cookies.on('changed', (_event, cookie) => {
+      const domain = String(cookie?.domain || '').replace(/^\./, '')
+      if (!SESSION_COOKIE.test(String(cookie?.name || '')) || (domain && domain !== host)) return
+      for (const sender of [...current.keys()]) if (sender.session === session) void retire(sender)
+    })
+  }
+
   function watch(sender) {
+    watchSession(sender.session)
     if (watched.has(sender)) return
     watched.add(sender)
     const leave = () => { void retire(sender) }
@@ -206,9 +245,8 @@ function createEmailDrag({
       const status = error instanceof DragFailure ? error.status
         : (signal.aborted || entry.retired) ? { state: 'released' } : failed('unavailable')
       entry.state = status.state
-      entry.result = status
+      // A failed deletion keeps the directory on the entry, so a release reports and retries it.
       await removeStaged(entry)
-      entry.dir = entry.path = null
       note({ outcome: status.code || status.state, ms: Date.now() - started })
       return status
     } finally {
@@ -237,7 +275,7 @@ function createEmailDrag({
     void retire(sender)
     watch(sender)
     const entry = {
-      uid, url: source.url, generation: ++nextGeneration, state: 'preparing', frame: event.senderFrame,
+      uid, url: source.url, state: 'preparing', frame: event.senderFrame,
       controller: new AbortController(), stillAuthorized: security.captureSender(event),
       pending: null, dir: null, path: null, retired: false,
     }

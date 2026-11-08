@@ -55,15 +55,18 @@ async function fixture(t, { platform = 'win32', markOrigin, files, icon } = {}) 
   const requests = [], drags = [], logs = [], marks = []
   let fetcher = () => eml()
   const security = createWindowSecurity({ baseUrl: BASE, preloadPath: '/preload', openExternal() {} })
+  // Desktop's windows share one session (cookies included), as Electron's default session does.
+  const session = {
+    cookies: new EventEmitter(),
+    setPermissionCheckHandler() {}, setPermissionRequestHandler() {},
+    fetch: async (url, options) => { requests.push([url, options]); return fetcher(url, options) },
+  }
   function addWindow() {
     const sender = new EventEmitter()
     const frame = { url: `${BASE}/emails`, origin: BASE, parent: null, detached: false }
     Object.assign(sender, {
       mainFrame: frame, getURL: () => frame.url, isDestroyed: () => false, setWindowOpenHandler() {},
-      session: {
-        setPermissionCheckHandler() {}, setPermissionRequestHandler() {},
-        fetch: async (url, options) => { requests.push([url, options]); return fetcher(url, options) },
-      },
+      session,
       startDrag: (item) => {
         drags.push(item)
         // The file must be complete and closed when Windows reads it.
@@ -86,6 +89,7 @@ async function fixture(t, { platform = 'win32', markOrigin, files, icon } = {}) 
       unlinkWith: { chmod: syncChmod, unlink: syncUnlink, schedule: time.schedule },
     }),
     log: fields => logs.push(fields),
+    schedule: time.schedule,
     ...(files ? { files } : {}),
   })
   const event = addWindow()
@@ -97,7 +101,7 @@ async function fixture(t, { platform = 'win32', markOrigin, files, icon } = {}) 
       return out
     } catch (e) { if (e.code === 'ENOENT') return []; throw e }
   }
-  return { root, tempDir, time, requests, drags, logs, marks, drag, event, addWindow, staged, icon: dragIcon,
+  return { root, tempDir, time, requests, drags, logs, marks, drag, event, addWindow, staged, icon: dragIcon, session,
     fetchWith(fn) { fetcher = fn },
     prepare: (uid = UID, ev = event) => drag.prepare(ev, uid),
     start: (uid = UID, ev = event) => drag.start(ev, uid),
@@ -344,11 +348,48 @@ test('a missing staged file or a failing startDrag is reported; a re-prepare rec
   assert.ok(fs.existsSync(file))
 })
 
-test('a cleanup failure on release is reported, not silent', async t => {
-  const files = { ...fsp, rm: async () => { throw Object.assign(new Error('busy'), { code: 'EBUSY' }) } }
-  const f = await fixture(t, { files })
+test('a failed cleanup is reported and retried, including one that fails while staging fails', async t => {
+  let failures = 1
+  const rm = async (...args) => {
+    if (failures > 0) { failures -= 1; throw Object.assign(new Error('busy'), { code: 'EBUSY' }) }
+    return fsp.rm(...args)
+  }
+  const f = await fixture(t, { files: { ...fsp, rm } })
   await f.prepare()
   assert.deepEqual(await f.prepare(null), { state: 'failed', code: 'disk' })
+  assert.equal((await f.staged()).length, 1, 'still there, still owned')
+  await f.time.advance(15000)
+  await tick()
+  assert.deepEqual(await f.staged(), [], 'the retry removed it')
+
+  // Origin marking fails, then its cleanup fails: the release still knows the file.
+  failures = 1
+  const g = await fixture(t, { files: { ...fsp, rm }, markOrigin: async () => false })
+  assert.deepEqual(await g.prepare(), { state: 'failed', code: 'protection' })
+  assert.equal((await g.staged()).length, 1)
+  assert.deepEqual(await g.prepare(null), { state: 'released' }) // the release's own attempt succeeds
+  assert.deepEqual(await g.staged(), [])
+})
+
+test('a sign-out or new sign-in in any window ends every staged email in that session', async t => {
+  const f = await fixture(t)
+  const popout = f.addWindow()
+  await f.prepare(UID)
+  await f.prepare(OTHER, popout)
+  f.start(OTHER, popout) // handed to the OS: keeps its retention
+  const [handed] = f.drags.map(d => d.file)
+
+  f.session.cookies.emit('changed', {}, { name: 'brinq-csrf', domain: 'localhost' }, 'explicit', false)
+  f.session.cookies.emit('changed', {}, { name: '__Host-brinq-session', domain: 'other.example' }, 'explicit', true)
+  assert.deepEqual(f.start(UID), { state: 'started' }, 'unrelated cookies change nothing')
+
+  f.session.cookies.emit('changed', {}, { name: '__Host-brinq-session', domain: 'localhost' }, 'explicit', true)
+  await tick()
+  assert.deepEqual(f.start(OTHER, popout), { state: 'preparing' })
+  assert.ok(fs.existsSync(handed), 'a file already dragged keeps its 24-hour retention')
+  f.session.cookies.emit('changed', {}, { name: 'brinq-session-dev', domain: '.localhost' }, 'overwrite', false)
+  await tick()
+  assert.equal(f.drags.length, 2, 'no drag starts from a staged file of the earlier session')
 })
 
 // ── Retention (DR-1 (A)) ─────────────────────────────────────────────────────
@@ -454,6 +495,7 @@ test('names the file safely for Windows from the server disposition', () => {
   for (const device of ['CON', 'con', 'PRN', 'AUX', 'NUL', 'COM1', 'LPT9', 'CON.txt', 'nul ']) {
     assert.match(name(utf8(`${device}.eml`)), /^_/, device)
   }
+  for (const device of ['COM\u00b9', 'lpt\u00b3']) assert.match(name(utf8(`${device}.eml`)), /^_/, device)
   assert.equal(name(utf8('CONSOLE.eml')), 'CONSOLE.eml')
   const long = name(utf8(`${'日'.repeat(100)}.eml`))
   assert.ok(Buffer.byteLength(long) <= 180)
