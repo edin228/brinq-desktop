@@ -47,14 +47,14 @@ function clock() {
   }
 }
 
-async function fixture(t, { platform = 'win32', markOrigin, files, icon } = {}) {
+async function fixture(t, { platform = 'win32', markOrigin, files, icon, base = BASE } = {}) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'brinq-drag-test-'))
   t.after(() => fsp.rm(root, { recursive: true, force: true }))
   const tempDir = path.join(root, 'profile-temp')
   const time = clock()
   const requests = [], drags = [], logs = [], marks = []
   let fetcher = () => eml()
-  const security = createWindowSecurity({ baseUrl: BASE, preloadPath: '/preload', openExternal() {} })
+  const security = createWindowSecurity({ baseUrl: base, preloadPath: '/preload', openExternal() {} })
   // Desktop's windows share one session (cookies included), as Electron's default session does.
   const session = {
     cookies: new EventEmitter(),
@@ -63,7 +63,7 @@ async function fixture(t, { platform = 'win32', markOrigin, files, icon } = {}) 
   }
   function addWindow() {
     const sender = new EventEmitter()
-    const frame = { url: `${BASE}/emails`, origin: BASE, parent: null, detached: false }
+    const frame = { url: `${base}/emails`, origin: base, parent: null, detached: false }
     Object.assign(sender, {
       mainFrame: frame, getURL: () => frame.url, isDestroyed: () => false, setWindowOpenHandler() {},
       session,
@@ -81,7 +81,7 @@ async function fixture(t, { platform = 'win32', markOrigin, files, icon } = {}) 
   }
   const dragIcon = icon ?? { isEmpty: () => false }
   const drag = createEmailDrag({
-    baseUrl: BASE, security, tempDir, platform, icon: dragIcon,
+    baseUrl: base, security, tempDir, platform, icon: dragIcon,
     markOrigin: markOrigin ?? (async (file, origin) => { marks.push([file, origin]); return true }),
     scheduleCleanup: (file, options) => scheduleTempCleanup(file, {
       ...options, schedule: time.schedule, clear: time.clear,
@@ -372,24 +372,33 @@ test('a failed cleanup is reported and retried, including one that fails while s
 })
 
 test('a sign-out or new sign-in in any window ends every staged email in that session', async t => {
-  const f = await fixture(t)
-  const popout = f.addWindow()
-  await f.prepare(UID)
-  await f.prepare(OTHER, popout)
-  f.start(OTHER, popout) // handed to the OS: keeps its retention
-  const [handed] = f.drags.map(d => d.file)
+  const cases = [
+    // Production: exactly the host-prefixed cookie, whatever the cause.
+    { base: 'https://brinq.example', host: 'brinq.example', session: '__Host-brinq-session', cause: 'explicit',
+      ignored: [['brinq-session-other', 'explicit'], ['brinq-csrf', 'explicit']] },
+    // Development: this host's brinq-session cookies, but another worktree's namespace expiring is no sign-out.
+    { base: BASE, host: 'localhost', session: 'brinq-session-dev', cause: 'explicit',
+      ignored: [['brinq-session-other', 'expired'], ['brinq-session-other', 'evicted'], ['brinq-csrf', 'explicit']] },
+  ]
+  for (const item of cases) {
+    const f = await fixture(t, { base: item.base })
+    const popout = f.addWindow()
+    await f.prepare(UID)
+    await f.prepare(OTHER, popout)
+    f.start(OTHER, popout) // handed to the OS: keeps its retention
+    const [handed] = f.drags.map(d => d.file)
 
-  f.session.cookies.emit('changed', {}, { name: 'brinq-csrf', domain: 'localhost' }, 'explicit', false)
-  f.session.cookies.emit('changed', {}, { name: '__Host-brinq-session', domain: 'other.example' }, 'explicit', true)
-  assert.deepEqual(f.start(UID), { state: 'started' }, 'unrelated cookies change nothing')
+    for (const [name, cause] of item.ignored) f.session.cookies.emit('changed', {}, { name, domain: item.host }, cause, true)
+    f.session.cookies.emit('changed', {}, { name: item.session, domain: 'other.example' }, 'explicit', true)
+    await tick()
+    assert.deepEqual(f.start(UID), { state: 'started' }, `${item.base}: unrelated cookies change nothing`)
 
-  f.session.cookies.emit('changed', {}, { name: '__Host-brinq-session', domain: 'localhost' }, 'explicit', true)
-  await tick()
-  assert.deepEqual(f.start(OTHER, popout), { state: 'preparing' })
-  assert.ok(fs.existsSync(handed), 'a file already dragged keeps its 24-hour retention')
-  f.session.cookies.emit('changed', {}, { name: 'brinq-session-dev', domain: '.localhost' }, 'overwrite', false)
-  await tick()
-  assert.equal(f.drags.length, 2, 'no drag starts from a staged file of the earlier session')
+    f.session.cookies.emit('changed', {}, { name: item.session, domain: `.${item.host}` }, item.cause, true)
+    await tick()
+    assert.deepEqual(f.start(OTHER, popout), { state: 'preparing' }, item.base)
+    assert.ok(fs.existsSync(handed), 'a file already dragged keeps its 24-hour retention')
+    assert.equal(f.drags.length, 2, 'no drag starts from a file staged before the change')
+  }
 })
 
 // ── Retention (DR-1 (A)) ─────────────────────────────────────────────────────

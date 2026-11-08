@@ -23,10 +23,14 @@ const {
 // is deleted as soon as it stops being current.
 
 const MAX_NOTE_BYTES = 64 * 1024
-// Brinq's session cookie (frontend server/brinqAuthCookies.ts): `__Host-brinq-session` in
-// production, `brinq-session` or `brinq-session-<namespace>` in development. It is set only by
-// sign-in and cleared only by sign-out.
-const SESSION_COOKIE = /^(?:__Host-)?brinq-session(?:-[\w-]+)?$/
+// Brinq's session cookie (frontend server/brinqAuthCookies.ts) is set only by sign-in and
+// cleared only by sign-out. Production (https) uses exactly `__Host-brinq-session`, unique to the
+// origin. Development (http) uses `brinq-session` or `brinq-session-<namespace>`, and other local
+// worktrees can leave their namespace's cookie on the same host; those expire on their own, so in
+// development an expiry or eviction is not a sign-out.
+const PRODUCTION_SESSION_COOKIE = '__Host-brinq-session'
+const DEVELOPMENT_SESSION_COOKIE = /^brinq-session(?:-[\w-]+)?$/
+const PASSIVE_CAUSES = new Set(['expired', 'evicted', 'expired-overwrite'])
 // Windows device names refuse to be file names, with or without an extension.
 // Windows also reserves the superscript forms COM¹ … LPT³.
 const DEVICE_STEM = /^(?:con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])$/i
@@ -126,10 +130,15 @@ function createEmailDrag({
   function watchSession(session) {
     if (!session?.cookies?.on || watchedSessions.has(session)) return
     watchedSessions.add(session)
-    const host = new URL(origin).hostname
-    session.cookies.on('changed', (_event, cookie) => {
+    const { hostname: host, protocol } = new URL(origin)
+    const secure = protocol === 'https:'
+    session.cookies.on('changed', (_event, cookie, cause) => {
       const domain = String(cookie?.domain || '').replace(/^\./, '')
-      if (!SESSION_COOKIE.test(String(cookie?.name || '')) || (domain && domain !== host)) return
+      const name = String(cookie?.name || '')
+      const isSession = secure
+        ? name === PRODUCTION_SESSION_COOKIE
+        : DEVELOPMENT_SESSION_COOKIE.test(name) && !PASSIVE_CAUSES.has(cause)
+      if (!isSession || (domain && domain !== host)) return
       for (const sender of [...current.keys()]) if (sender.session === session) void retire(sender)
     })
   }
