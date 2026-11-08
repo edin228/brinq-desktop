@@ -11,6 +11,7 @@ const {
   screen,
   clipboard,
   powerMonitor,
+  nativeImage,
 } = require('electron')
 const { randomUUID } = require('crypto')
 const fs = require('fs')
@@ -33,6 +34,7 @@ const {
   MAX_EMAIL_BYTES,
 } = require('./attachment-files')
 const { createFileActions, CAPABILITIES } = require('./file-actions')
+const { createEmailDrag } = require('./email-drag')
 const { parseEmailFile } = require('./email-file')
 const { createUpdateStatus, headerView } = require('./update-status')
 const { createUpdateSchedule } = require('./update-schedule')
@@ -221,21 +223,8 @@ function ensurePrivateTempDir() {
   return ensurePrivateDirectory(BRINQ_TEMP_DIR)
 }
 
-function retryUnlink(filePath, attemptsLeft) {
-  // Windows refuses to delete a read-only file, such as an email handed to Outlook.
-  fs.chmod(filePath, 0o600, () => fs.unlink(filePath, (err) => {
-    if (!err || attemptsLeft <= 1) return
-    setTimeout(() => retryUnlink(filePath, attemptsLeft - 1), 15000)
-  }))
-}
-
-function scheduleSyncedAttachmentCleanup(tempPath) {
-  const timer = setTimeout(
-    () => retryUnlink(tempPath, 4),
-    24 * 60 * 60 * 1000,
-  )
-  timer.unref()
-}
+// Opened attachments and dragged emails share one retention owner (temp-cleanup.js).
+const { scheduleTempCleanup: scheduleSyncedAttachmentCleanup, retryUnlink } = require('./temp-cleanup')
 
 ipcMain.handle(
   'open-file-attachment',
@@ -379,6 +368,22 @@ ipcMain.handle('view-file', (event, source, id) => fileActions.view(event, sourc
 ipcMain.handle('save-file-as', (event, source, id) => fileActions.save(event, source, id))
 ipcMain.handle('cancel-file-operation', (event, id) => fileActions.cancel(event, id))
 ipcMain.handle('file-capabilities', (event) => validateSender(event) ? CAPABILITIES : null)
+
+// Drag the open email out as an .eml file (Windows). The icon loads once; an
+// empty image keeps the page's grip from ever reporting ready.
+let emailDragIcon = null
+const emailDrag = createEmailDrag({
+  baseUrl: BASE_URL,
+  security: windowSecurity,
+  tempDir: BRINQ_TEMP_DIR,
+  scheduleCleanup: scheduleSyncedAttachmentCleanup,
+  // Loaded on first use (after app ready), then reused.
+  icon: () => (emailDragIcon ??= nativeImage.createFromPath(path.join(__dirname, '../assets/drag-email.png'))),
+  log: (fields) => logFile({ mode: 'drag', ...fields }),
+})
+ipcMain.handle('email-drag-prepare', (event, uid) => emailDrag.prepare(event, uid))
+// startDrag runs synchronously inside this handler, while the renderer's dragstart is still current.
+ipcMain.handle('email-drag-start', (event, uid) => emailDrag.start(event, uid))
 
 // Old frontend versions retain their result fields and fixed email methods.
 for (const [channel, action] of [['open-email-attachment', 'open'], ['save-email-attachment', 'save']]) {

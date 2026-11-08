@@ -112,6 +112,20 @@ test('browser sign-in methods exist only on Windows and only invoke their fixed 
   assert.equal(load('https:', false, fakePage(), 'win32').api, undefined)
 })
 
+test('email drag methods exist only on Windows main frames and invoke their fixed channels', async () => {
+  for (const platform of ['darwin', 'linux']) {
+    const { api } = load('https:', true, fakePage(), platform)
+    assert.equal(api.prepareEmailDrag, undefined, platform)
+    assert.equal(api.startEmailDrag, undefined, platform)
+  }
+  const { api, calls } = load('https:', true, fakePage(), 'win32')
+  await api.prepareEmailDrag('email-uid')
+  await api.prepareEmailDrag(null)
+  await api.startEmailDrag('email-uid', 'C:\\ignored\\path.eml')
+  assert.deepEqual(calls.slice(-3), [['email-drag-prepare', 'email-uid'], ['email-drag-prepare', null], ['email-drag-start', 'email-uid']])
+  assert.equal(load('https:', false, fakePage(), 'win32').api, undefined)
+})
+
 test('inherited print preload, opaque documents and subframes expose no bridge', () => {
   for (const protocol of ['about:', 'blob:', 'file:', 'data:']) assert.equal(load(protocol).api, undefined)
   assert.equal(load('https:', false).api, undefined)
