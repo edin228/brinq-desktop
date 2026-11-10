@@ -95,6 +95,9 @@ if (process.isMainFrame && ['http:', 'https:'].includes(location.protocol)) {
       startBrowserSignIn: () => ipcRenderer.invoke('browser-sign-in-start'),
       cancelBrowserSignIn: () => ipcRenderer.invoke('browser-sign-in-cancel'),
       takeBrowserSignIn: () => ipcRenderer.invoke('browser-sign-in-take'),
+      // Drag the open email out as a file; the page shows its grip when both exist.
+      prepareEmailDrag: (uid) => ipcRenderer.invoke('email-drag-prepare', uid),
+      startEmailDrag: (uid) => ipcRenderer.invoke('email-drag-start', uid),
     } : {}),
   })
 

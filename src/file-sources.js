@@ -50,6 +50,16 @@ function resolveSource(baseUrl, source) {
   return { url: new URL(route, baseUrl).href, storageLink: source.kind === 'brinq-file' || source.kind === 'marketing-attachment', filename: source.filename }
 }
 
+// The open email as an .eml file, for the email drag-out only (email-drag.js).
+// It is not a SOURCE_KINDS entry: the generic open/save/view file actions and
+// their capability list never offer it, so the page cannot turn it into a
+// renderer-chosen download. Reading it needs read access to the email.
+const EMAIL_MESSAGE_KIND = 'email-message'
+function resolveEmailMessage(baseUrl, emailUid) {
+  if (!validIdentifier(emailUid)) return null
+  return { kind: EMAIL_MESSAGE_KIND, url: new URL(`/api/email-sync/emails/${encodeURIComponent(emailUid)}/eml`, baseUrl).href }
+}
+
 // Brinq keeps files in one DigitalOcean Spaces bucket, `brinq` in sfo2, and
 // its presigned links are path-style (sfo2.digitaloceanspaces.com/brinq/…).
 // This mirrors frontend/utils/brinqStorageUrl.ts, which the web
@@ -86,4 +96,4 @@ function storageProxyUrl(baseUrl, value) {
   return proxy.href
 }
 
-module.exports = { SOURCE_KINDS, validIdentifier, resolveSource, storageProxyUrl }
+module.exports = { SOURCE_KINDS, EMAIL_MESSAGE_KIND, validIdentifier, resolveSource, resolveEmailMessage, storageProxyUrl }
