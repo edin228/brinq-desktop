@@ -107,6 +107,9 @@ installQuitGuard({
   app,
   blocked: () => tabWindows.blocksQuit(),
   onRefused: () => {
+    // An update restart refused here (its own check passed a moment
+    // before) is postponed now, not when its watchdog gives up.
+    updates.cancelQuit()
     showMainWindow()
     const owner = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined
     Promise.resolve(owner ? dialog.showMessageBox(owner, OTHER_WINDOWS_NOTICE) : dialog.showMessageBox(OTHER_WINDOWS_NOTICE)).catch(() => {})

@@ -588,7 +588,10 @@ function createTabWindow({
       },
       // Throws if this window can no longer show the tab.
       undo() {
-        if (!alive() || entry.contents.isDestroyed()) throw new Error('The window that had the tab is gone.')
+        if (!alive() || entry.contents.isDestroyed()) {
+          list.remove(id)
+          throw new Error('The window that had the tab is gone.')
+        }
         try {
           attach(entry, { adopted: true })
         } catch (error) {
