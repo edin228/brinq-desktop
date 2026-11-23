@@ -160,7 +160,8 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
   }) : null
   const tabs = registry ? tabWindows.addPrimary({ bounds: { width: 1200, height: 800 }, theme }) : makeWindow()
   const host = windows[0]
-  const strip = host.webContents
+  // The strip is a child view; the window's own page stays empty.
+  const strip = tabs.strip
   strip.mainFrame.url = SHELL
   strip.mainFrame.origin = 'file://'
   flush()
@@ -184,7 +185,7 @@ function tabIds(f) { return f.state().tabs.map((tab) => tab.id) }
 function tabMenuOf(f, tabWindow, id) {
   const before = f.menus.length
   const shown = tabWindow.stripCommand(
-    { sender: tabWindow.window.webContents, senderFrame: tabWindow.window.webContents.mainFrame }, 'menu', id, { x: 10, y: 10 })
+    { sender: tabWindow.strip, senderFrame: tabWindow.strip.mainFrame }, 'menu', id, { x: 10, y: 10 })
   const menu = f.menus.length > before ? f.menus.at(-1) : null
   return { shown, menu, newWindow: menu?.template.find((item) => item.label === 'Open in new window') }
 }
@@ -194,8 +195,18 @@ test('the window hosts a local strip and Home, a registered page below the strip
   assert.equal(f.host.options.titleBarStyle, 'hidden')
   assert.deepEqual(f.host.options.titleBarOverlay, { ...THEME_COLORS.dark, height: 40 })
   assert.equal(f.host.options.backgroundColor, THEME_COLORS.dark.color)
-  assert.equal(f.host.options.webPreferences.preload, '/shell-preload.js')
+  // The strip is a sandboxed child view across the top, below no tab page;
+  // the window's own page stays empty.
+  assert.equal(f.host.options.webPreferences.preload, undefined)
   assert.equal(f.host.options.webPreferences.sandbox, true)
+  assert.deepEqual(f.host.webContents.loads, [])
+  const stripView = f.viewOf(f.strip)
+  assert.equal(f.host.children[0], stripView, 'the strip is the first child view')
+  assert.equal(stripView.webPreferences.preload, '/shell-preload.js')
+  assert.equal(stripView.webPreferences.sandbox, true)
+  assert.equal(stripView.webPreferences.nodeIntegration, false)
+  assert.deepEqual(stripView.bounds, { x: 0, y: 0, width: 1200, height: 40 })
+  assert.equal(stripView.background, THEME_COLORS.dark.color)
   assert.deepEqual(f.strip.loads.map(([url]) => url), [SHELL])
   assert.equal(f.homes.length, 1)
   assert.equal(f.homes[0][0], f.tabs.home)
@@ -645,7 +656,7 @@ test('a link label names the next tab its page opens for that exact URL, once', 
   const f = fixture()
   f.tabs.home.mainFrame.url = `${BASE}/renewals`
   const event = { sender: f.tabs.home, senderFrame: f.tabs.home.mainFrame }
-  const labelOf = (contents) => f.state().tabs.find((tab) => f.viewOf(contents) && tab.id === tabIds(f)[f.host.children.indexOf(f.viewOf(contents))])?.label
+  const labelOf = (contents) => f.state().tabs.find((tab) => f.viewOf(contents) && tab.id === tabIds(f)[f.host.children.filter((view) => view.webContents !== f.strip).indexOf(f.viewOf(contents))])?.label
   const url = `${BASE}/clients/42?view=policies`
   assert.equal(f.tabs.linkLabel(event, { href: url, label: '  Acme\n Holdings ' }), true)
   const tab = f.open(url)
@@ -1104,7 +1115,7 @@ test('a restored tab that fails to attach is undone; Home and earlier tabs stay'
   assert.deepEqual(added.map((tab) => tab.url), [`${BASE}/emails`], 'stops at the failure')
   assert.deepEqual(tabIds(f), [1, added[0].id], 'no orphan in the strip')
   assert.deepEqual(f.tabs.getSessionState(), { tabs: [{ url: `${BASE}/emails` }] })
-  assert.equal(f.host.children.length, 2, 'the failed view was removed')
+  assert.equal(f.host.children.length, 3, 'the failed view was removed (strip, Home, one tab)')
   assert.deepEqual(reports.at(-1), { tabs: [{ url: `${BASE}/emails` }] })
 })
 
@@ -1117,7 +1128,7 @@ const press = (contents, input) => {
   return prevented
 }
 // The strip of any tab window, as the shell page sends from it.
-const stripOf = (tabWindow) => tabWindow.window.webContents
+const stripOf = (tabWindow) => tabWindow.strip
 const eventFrom = (tabWindow) => ({ sender: stripOf(tabWindow), senderFrame: stripOf(tabWindow).mainFrame })
 const stateOf = (tabWindow) => stripOf(tabWindow).sent.filter(([channel]) => channel === 'tabs:state').at(-1)?.[1]
 const valid = (f, contents) => f.security.validateSender({ sender: contents, senderFrame: contents.mainFrame })
@@ -1161,9 +1172,9 @@ test('open in new window moves the live page into a new window with its own stri
   // Same theme and title-bar overlay as the window it came from.
   assert.deepEqual(second.window.options.titleBarOverlay, { ...THEME_COLORS.light, height: 40 })
   assert.equal(second.window.options.webPreferences.sandbox, true)
-  // Shown once its strip paints, or after the fallback.
+  // Shown once its strip has loaded, or after the fallback.
   assert.equal(second.window.visible, false)
-  second.window.emit('ready-to-show')
+  second.strip.emit('did-finish-load')
   assert.equal(second.window.visible, true)
   f.clock.advance(SHOW_FALLBACK_MS)
   // The page's title and loading now reach only its new window.
@@ -1400,4 +1411,23 @@ test('startup tabs see every window\'s tabs, main first; restored labels reach a
   assert.equal(third.tabCount(), 1)
   assert.equal(f.tabWindows.labelRestored([{ url: `${BASE}/clients/77`, title: 'Acme' }]).labeled, 0, 'it loaded on selection')
   assert.equal(f.tabWindows.home, f.tabs.home)
+})
+
+test('the strip covers the window only while the selected tab shows the failure panel', () => {
+  const f = fixture()
+  const tab = f.open(`${BASE}/clients/1`, { background: false })
+  const stripView = f.viewOf(f.strip)
+  assert.deepEqual(stripView.bounds, { x: 0, y: 0, width: 1200, height: 40 })
+  tab.emit('did-fail-load', {}, -106, 'INTERNET_DISCONNECTED', `${BASE}/clients/1`, true)
+  assert.equal(f.viewOf(tab).visible, false)
+  assert.deepEqual(stripView.bounds, { x: 0, y: 0, width: 1200, height: 800 })
+  // Home selected: the strip is a bar again, and Home shows.
+  f.tabs.selectHome()
+  assert.deepEqual(stripView.bounds, { x: 0, y: 0, width: 1200, height: 40 })
+  assert.equal(f.viewOf(f.tabs.home).visible, true)
+  f.tabs.select(tabIds(f)[1])
+  assert.equal(stripView.bounds.height, 800)
+  f.tabs.stripCommand(f.stripEvent(), 'retry', tabIds(f)[1])
+  assert.equal(stripView.bounds.height, 40)
+  assert.equal(f.viewOf(tab).visible, true)
 })

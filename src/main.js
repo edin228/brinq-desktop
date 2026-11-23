@@ -905,8 +905,8 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
   const window = tabWindow.window
   mainWindow = window
 
-  window.once('ready-to-show', () => {
-    if (showOnReady && !recoveryWindow) window.show()
+  tabWindow.onceReady(() => {
+    if (showOnReady && !recoveryWindow && !window.isDestroyed()) window.show()
   })
 
   // Save window bounds on move/resize

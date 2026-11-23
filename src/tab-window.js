@@ -1,8 +1,8 @@
 const { HOME_ID, createTabList, tabKind, pageTitle, tabLabel, linkLabelText, shareableUrl, shortcutAction } = require('./tabs')
 const { confirmLeave } = require('./unload-guard')
 
-// Owns one Brinq window: a local tab strip in the window's own page and one
-// WebContentsView per Brinq tab below it. In the main (primary) window Home
+// Owns one Brinq window: a local tab strip and one WebContentsView per Brinq
+// tab below it, all child views; the window's own page stays empty. In the main (primary) window Home
 // is the permanent base tab; a secondary window holds only tabs moved to it
 // and closes when its last tab goes.
 const STRIP_HEIGHT = 40
@@ -57,12 +57,23 @@ function createTabWindow({
     backgroundColor: THEME_COLORS[theme].color,
     titleBarStyle: 'hidden',
     ...(platform === 'darwin' ? {} : { titleBarOverlay: overlay() }),
+    // This page never loads (see the strip below).
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, webviewTag: false },
+  })
+  // A tab page moved here from another window is drawn beneath anything the
+  // window already shows (measured on Electron 44.4.5: its own page, or any
+  // child view over the same area). So nothing shares the page area: the
+  // strip is a child view across the top, made full height only while the
+  // selected tab shows the failure panel (that tab's view is hidden then).
+  const stripView = new WebContentsView({
     webPreferences: {
       preload: shellPreloadPath, contextIsolation: true, nodeIntegration: false,
       sandbox: true, webviewTag: false,
     },
   })
-  const strip = host.webContents
+  stripView.setBackgroundColor(THEME_COLORS[theme].color)
+  host.contentView.addChildView(stripView)
+  const strip = stripView.webContents
   const list = createTabList({ home: primary })
   const entries = new Map()
   const byContents = new Map()
@@ -143,23 +154,36 @@ function createTabWindow({
     if (entry?.pending && alive()) loadPending(entry)
   }
 
+  function layoutStrip() {
+    if (!alive()) return
+    const [width, height] = host.getContentSize()
+    const panel = !!selectedEntry()?.failed
+    stripView.setBounds({ x: 0, y: 0, width, height: panel ? height : STRIP_HEIGHT })
+  }
+
   function layout() {
     if (!alive()) return
     const [width, height] = host.getContentSize()
     const area = { x: 0, y: STRIP_HEIGHT, width, height: Math.max(0, height - STRIP_HEIGHT) }
     for (const entry of entries.values()) entry.view.setBounds(area)
+    layoutStrip()
   }
 
   function showSelected() {
+    // Hide before the strip grows over a failed tab; show after it shrinks.
     for (const entry of entries.values()) {
-      entry.view.setVisible(entry.id === list.selected() && !entry.failed)
+      if (entry.id !== list.selected() || entry.failed) entry.view.setVisible(false)
     }
+    layoutStrip()
+    const selected = selectedEntry()
+    if (selected && !selected.failed) selected.view.setVisible(true)
   }
 
   function applyTheme(next) {
     if (!isTheme(next) || !alive() || next === theme) return
     theme = next
     host.setBackgroundColor(THEME_COLORS[theme].color)
+    stripView.setBackgroundColor(THEME_COLORS[theme].color)
     if (platform !== 'darwin') host.setTitleBarOverlay(overlay())
     for (const entry of entries.values()) entry.view.setBackgroundColor(THEME_COLORS[theme].color)
     push()
@@ -750,8 +774,10 @@ function createTabWindow({
   strip.on('will-navigate', (event) => event.preventDefault())
   strip.on('will-redirect', (event) => event.preventDefault())
   strip.on('before-input-event', (event, input) => onInput(event, input, strip))
-  // Keep the selected tab's name as the window title.
+  // Keep the selected tab's name as the window title: the strip page's own
+  // title must not replace it, also when it loads after the first tab.
   strip.on('page-title-updated', (event) => event.preventDefault())
+  host.on('page-title-updated', (event) => event.preventDefault())
   const reloadStrip = () => { if (alive()) strip.loadURL(shellUrl).catch(() => {}) }
   strip.on('render-process-gone', () => schedule(reloadStrip))
   strip.on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
@@ -760,6 +786,8 @@ function createTabWindow({
   // Closing the window hides it to the tray and keeps every tab. Quitting
   // closes the tabs first, Home last, then quits again with no tabs left.
   host.on('close', (event) => {
+    // A secondary window with no tabs left just closes.
+    if (!primary && entries.size === 0) return
     if (!isQuitting()) {
       event.preventDefault()
       host.hide()
@@ -791,6 +819,18 @@ function createTabWindow({
     onHome(home.contents, url)
   }
   createHome()
+  // The window shows once its strip has loaded (its own page never does, so
+  // it never reports ready-to-show).
+  const readyCallbacks = []
+  let ready = false
+  const markReady = () => {
+    if (ready) return
+    ready = true
+    for (const callback of readyCallbacks.splice(0)) { try { callback() } catch {} }
+  }
+  strip.once('did-finish-load', markReady)
+  strip.once('did-fail-load', markReady)
+  layoutStrip()
   strip.loadURL(shellUrl).catch(() => {})
 
   function dispose() {
@@ -800,13 +840,19 @@ function createTabWindow({
     for (const entry of entries.values()) {
       if (!entry.contents.isDestroyed()) entry.contents.close()
     }
+    readyCallbacks.length = 0
+    if (!strip.isDestroyed()) strip.close()
     disposed = true
   }
   host.once('closed', dispose)
 
   return {
     window: host,
+    // The strip's page: the only sender of strip commands for this window.
+    strip,
     primary,
+    // Calls back once the strip has loaded (at once if it already has).
+    onceReady(callback) { if (ready) callback(); else readyCallbacks.push(callback) },
     get home() { return home?.contents ?? null },
     available: alive,
     openTab,

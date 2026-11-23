@@ -19,7 +19,7 @@ function createTabWindows({
   const alive = (tabWindow) => !!tabWindow && tabWindow.available()
   const forTab = (contents) => windows.find((tabWindow) => tabWindow.isTab(contents)) || null
   const forStrip = (contents) => windows.find((tabWindow) => !tabWindow.window.isDestroyed() &&
-    tabWindow.window.webContents === contents) || null
+    tabWindow.strip === contents) || null
   const forHost = (window) => windows.find((tabWindow) => tabWindow.window === window) || null
 
   // The tab list for startup tabs: the main window's tabs after Home, then
@@ -86,7 +86,7 @@ function createTabWindows({
     // not keep the window hidden.
     let shown = false
     const showOnce = () => { if (!shown) { shown = true; show() } }
-    target.window.once('ready-to-show', showOnce)
+    target.onceReady(showOnce)
     setTimer(showOnce, SHOW_FALLBACK_MS)
     return true
   }
