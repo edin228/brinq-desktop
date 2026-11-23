@@ -20,7 +20,7 @@ function load(protocol = 'file:', isMainFrame = true, state = { selectedId: 1 })
 
 test('the strip bridge exposes fixed tab commands only', () => {
   const { api, calls } = load()
-  assert.deepEqual(Object.keys(api).sort(), ['close', 'home', 'menu', 'move', 'newTab', 'onFocusRequest', 'onState', 'reload', 'restartUpdate', 'retry', 'retryUpdate', 'select'])
+  assert.deepEqual(Object.keys(api).sort(), ['close', 'dragCancel', 'dragEnd', 'dragStart', 'home', 'menu', 'move', 'newTab', 'onFocusRequest', 'onSlotRequest', 'onState', 'reload', 'restartUpdate', 'retry', 'retryUpdate', 'select', 'slot'])
   api.select(4, true); api.select(5, 'yes'); api.close(4); api.retry(4); api.newTab(); api.home(true); api.reload(); api.move(4, 2); api.menu(4, 120, 18); api.menu(4, 96, 36, true); api.menu(4, 1, 2, 'yes')
   assert.equal(JSON.stringify(calls), JSON.stringify([
     ['tabs:command', 'select', 4, { focus: true }],
@@ -77,4 +77,24 @@ test('a focus request reaches the strip as header or toggle only, without IPC ev
   assert.deepEqual(received, [['header'], ['toggle'], ['header']])
   off()
   assert.equal(ipc.listenerCount('tabs:focus'), 0)
+})
+
+test('a dragged tab reports its id only; a slot answer and request carry no IPC event data', () => {
+  const { api, ipc, calls } = load()
+  api.dragStart(4, { x: 900, y: 600 })
+  api.dragEnd(4, { window: 2 })
+  api.dragCancel(4)
+  api.slot(7, 2, [3, 4, 5])
+  assert.equal(JSON.stringify(calls), JSON.stringify([
+    ['tabs:command', 'drag-start', 4, null],
+    ['tabs:command', 'drag-end', 4, null],
+    ['tabs:command', 'drag-cancel', 4, null],
+    ['tabs:command', 'slot', null, { requestId: 7, index: 2, order: [3, 4, 5] }],
+  ]))
+  const received = []
+  const off = api.onSlotRequest((...args) => received.push(args))
+  ipc.emit('tabs:slot', { sender: 'main' }, { requestId: 7, x: 300 })
+  assert.deepEqual(received, [[{ requestId: 7, x: 300 }]])
+  off()
+  assert.equal(ipc.listenerCount('tabs:slot'), 0)
 })

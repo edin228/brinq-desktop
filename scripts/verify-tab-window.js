@@ -52,11 +52,12 @@ if (argv.includes('--visual-only')) {
 }
 
 // --- Electron verification -------------------------------------------------
-const { app, BrowserWindow, WebContentsView, Menu, clipboard, ipcMain, desktopCapturer, webContents: allContents } = require('electron')
+const { app, BrowserWindow, WebContentsView, Menu, clipboard, ipcMain, desktopCapturer, screen, webContents: allContents } = require('electron')
 const { pathToFileURL } = require('url')
 const { createWindowSecurity } = require('../src/window-security')
 const { createTabWindow } = require('../src/tab-window')
 const { createTabWindows } = require('../src/tab-windows')
+const { boundsAtPoint } = require('../src/window-state')
 const { installQuitGuard } = require('../src/quit-app')
 
 const page = (title, body, script = '') => `<!doctype html><html class="light"><head><meta charset="utf-8"><title>${title}</title>
@@ -167,6 +168,9 @@ async function main() {
     }),
     placement: (source) => ({ ...source, x: source.x + 640, y: source.y + 60, width: 900, height: 700 }),
     isQuitting: () => !!app.isQuitting,
+    // Dropping a dragged tab, as main.js: the real pointer and monitor.
+    cursorPoint: () => screen.getCursorScreenPoint(),
+    placeAt: (source, point) => boundsAtPoint({ size: source, point, workArea: screen.getDisplayNearestPoint(point).workArea }),
   })
   tabs = tabWindows.addPrimary({ bounds: { width: 1200, height: 800, x: 0, y: 0 }, theme: 'light' })
   // As main.js: no quit while another window has tabs (registered first).
@@ -371,6 +375,101 @@ async function main() {
     const child = allContents.getAllWebContents().find((wc) => !wc.isDestroyed() && wc.getURL().endsWith('/clients/9'))
     if (child) { child.close(); await until(() => child.isDestroyed()) }
     check('the main window and Home are untouched', !host.isDestroyed() && !tabs.home.isDestroyed() && tabWindows.all().length === 1)
+  }
+
+  // Step 2: a real X pointer drags a tab out of the main strip into a new
+  // window, then onto the main strip again. Xvfb has no window manager, so
+  // the windows are placed to not overlap where it matters.
+  async function dragOutAndBack() {
+    const xdo = (...args) => require('child_process').execFileSync(process.env.XDOTOOL, args.map(String))
+    const drag = async (from, to, { steps = 16, before = null } = {}) => {
+      xdo('mousemove', from.x, from.y, 'mousedown', '1')
+      for (let step = 1; step <= steps; step++) {
+        xdo('mousemove', Math.round(from.x + (to.x - from.x) * step / steps), Math.round(from.y + (to.y - from.y) * step / steps))
+        await wait(15)
+      }
+      if (before) await before()
+      xdo('mouseup', '1')
+    }
+    // The selected tab's grip in a window's strip, in screen pixels.
+    const grip = async (tabWindow) => {
+      const content = tabWindow.window.getContentBounds()
+      const [x, y] = await tabWindow.strip.executeJavaScript(`(() => { const box = document.querySelector('.tab.selected').getBoundingClientRect(); return [Math.round(box.x + 40), Math.round(box.y + box.height / 2)] })()`)
+      return { x: content.x + x, y: content.y + y }
+    }
+    const lifted = (tabWindow) => tabWindow.strip.executeJavaScript(`!!document.querySelector('.tab.lifted')`)
+    // A neighbour, so the drop back has a tab to land after.
+    const neighbour = tabs.openTab({ opener: tabs.home, url: `${base}/clients/5`, options: { webPreferences: {} }, referrer: { url: '', policy: 'default' }, background: true })
+    await until(() => !neighbour.isLoading() && neighbour.getURL().endsWith('/clients/5'))
+    const page = tabs.openTab({ opener: tabs.home, url: `${base}/stateful`, options: { webPreferences: {} }, referrer: { url: '', policy: 'default' }, background: false })
+    await until(() => !page.isLoading() && page.getURL().endsWith('/stateful'))
+    await click(page, '#text')
+    for (const keyCode of ['o', 'k']) page.sendInputEvent({ type: 'char', keyCode })
+    await until(() => page.executeJavaScript('document.getElementById("text").value === "ok"'))
+    const state = await page.executeJavaScript('window.state')
+    const requested = requests['/stateful']
+    const kept = async () => (await page.executeJavaScript('[window.state, document.getElementById("text").value]')).join() === [state, 'ok'].join() &&
+      requests['/stateful'] === requested
+    await until(async () => (await stripDom(tabs)).selected === 'Stateful')
+    const windowsBefore = tabWindows.all().length
+
+    // Esc while dragging outside: nothing moves.
+    let wasLifted = false
+    await drag(await grip(tabs), { x: 700, y: 500 }, {
+      before: async () => {
+        wasLifted = await lifted(tabs)
+        xdo('key', 'Escape')
+        await wait(150)
+      },
+    })
+    await wait(500)
+    check('a tab dragged out of the strip lifts', wasLifted)
+    check('Esc ends the drag: the tab stays and nothing opens',
+      tabWindows.all().length === windowsBefore && tabs.isTab(page) && !(await lifted(tabs)))
+
+    // Out: let go over the main window's own page.
+    const out = { x: 900, y: 600 }
+    await drag(await grip(tabs), out)
+    check('letting go outside the strip opens the tab in a new window',
+      await until(() => tabWindows.all().length === windowsBefore + 1 && !tabs.isTab(page)))
+    const second = tabWindows.all().at(-1)
+    check('the dragged page moved live: same document, typed text kept, no request', second?.isTab(page) && await kept())
+    await until(() => second.window.isVisible())
+    const placed = second.window.getBounds()
+    check('the new window opens at the pointer, kept on the screen',
+      placed.x <= out.x && out.x < placed.x + placed.width && placed.y <= out.y && out.y < placed.y + placed.height &&
+      placed.x >= 0 && placed.y >= 0 && placed.x + placed.width <= 1600 && placed.y + placed.height <= 1000, JSON.stringify(placed))
+    await wait(600)
+    const magenta = (value) => value[0] > 230 && value[1] < 30 && value[2] > 150
+    // Right of the main window: only the new one is there.
+    const outPixel = await screenPixel(1500, placed.y + 300)
+    check('the new window paints the dragged page', magenta(outPixel), JSON.stringify(outPixel))
+    check('the new strip shows the tab', await until(async () => (await stripDom(second)).selected === 'Stateful'))
+
+    // Back: onto the main strip, just after its first tab.
+    const mainContent = host.getContentBounds()
+    const firstTab = await tabs.strip.executeJavaScript(`(() => { const box = document.querySelector('.tab').getBoundingClientRect(); return [box.x, box.width, box.y + box.height / 2] })()`)
+    const into = { x: Math.round(mainContent.x + firstTab[0] + firstTab[1] * 0.8), y: Math.round(mainContent.y + firstTab[2]) }
+    await drag(await grip(second), into)
+    check('dropping it on the main strip moves it there, and the emptied window closes',
+      await until(() => tabs.isTab(page) && second.window.isDestroyed()),
+      JSON.stringify({ inMain: tabs.isTab(page), closed: second.window.isDestroyed() }))
+    check('it lands where it was let go: after the first tab, selected', await until(async () => {
+      const dom = await stripDom(tabs)
+      return dom.labels[1] === 'Stateful' && dom.selected === 'Stateful'
+    }), JSON.stringify(await stripDom(tabs)))
+    check('the page came back live: same document, typed text kept, no request', await kept())
+    await wait(400)
+    const backPixel = await screenPixel(mainContent.x + 300, mainContent.y + 300)
+    check('the main window paints the page that came back', magenta(backPixel), JSON.stringify(backPixel))
+    check('the page has keyboard focus in the main window', await until(() => page.isFocused(), 2000))
+    // Done: close it (its unsaved text is let go).
+    answers.push(0)
+    tabs.closeTab(tabs.stripState({ sender: tabs.strip, senderFrame: tabs.strip.mainFrame }).selectedId)
+    await until(() => page.isDestroyed())
+    neighbour.close()
+    await until(() => neighbour.isDestroyed())
+    tabs.selectHome()
   }
 
   try {
@@ -652,6 +751,8 @@ async function main() {
     await until(() => loadedA.isDestroyed())
 
     await openInNewWindow()
+    if (process.env.XDOTOOL) await dragOutAndBack()
+    else console.log('SKIP drag out: set XDOTOOL to a real input tool')
 
     // A real app.quit() with a hidden tab holding unsaved work.
     const quitTab = tabs.openTab({ opener: tabs.home, url: `${base}/dirty`, options: { webPreferences: {} }, referrer: { url: '', policy: 'default' }, background: false })

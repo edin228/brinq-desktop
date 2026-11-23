@@ -144,7 +144,13 @@ function render(next) {
   state = next
   // Moving a node blurs it; put keyboard focus back after reordering.
   const focused = document.activeElement
-  if (drag && !next.tabs.some((tab) => tab.id === drag.id)) clearDrag()
+  // A drag is measured against the tabs as they are; any change to them
+  // ends it before they are redrawn.
+  if (drag) {
+    const ids = next.tabs.filter((tab) => !tab.home).map((tab) => tab.id)
+    const shown = shownOrder()
+    if (ids.length !== shown.length || ids.some((id, index) => id !== shown[index])) cancelDrag()
+  }
   root.dataset.theme = next.theme === 'light' ? 'light' : 'dark'
   root.dataset.platform = next.platform || ''
   renderUpdate(next.update)
@@ -240,36 +246,48 @@ function renderUpdate(update) {
 }
 
 // Dragging a tab reorders it: the others slide aside and the tab drops into
-// the gap. A press that barely moves stays an ordinary click.
+// the gap. Dragged out of the strip, the tab lifts; let go there, and main
+// decides where it goes (another window's strip, or a new window), reading
+// the pointer itself. A press that barely moves stays an ordinary click.
 const DRAG_THRESHOLD = 5
 const TAB_GAP = 2
+// The strip's height, and how far below it a drag still reorders.
+const BAND = 40
+const BAND_SLACK = 24
 let drag = null
+
+const inBand = (event) => event.clientX >= 0 && event.clientX < innerWidth &&
+  event.clientY >= 0 && event.clientY < BAND + BAND_SLACK
+// The tab ids as the tray shows them.
+const shownOrder = () => [...tabsElement.querySelectorAll('.tab-select')].map(idOf)
 
 function startDrag(event, id) {
   if (event.button !== 0 || event.target.closest('.tab-close') || drag) return
   const element = tabElements.get(id)
   const order = [...tabsElement.children]
   drag = {
-    id, element, order, pointerId: event.pointerId, startX: event.clientX, moved: false,
+    id, element, order, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY,
+    moved: false, lifted: false,
     from: order.indexOf(element.wrapper), to: order.indexOf(element.wrapper),
     step: element.wrapper.getBoundingClientRect().width + TAB_GAP,
   }
 }
 
-function moveDrag(event) {
-  if (!drag || event.pointerId !== drag.pointerId) return
-  const dx = event.clientX - drag.startX
-  if (!drag.moved && Math.abs(dx) < DRAG_THRESHOLD) return
-  if (!drag.moved) {
-    drag.moved = true
-    tabsElement.classList.add('reordering')
-    drag.element.wrapper.classList.add('dragging')
-    // Capture only once this is a drag: capturing on press would retarget the
-    // click to the wrapper and a plain click would no longer select the tab.
-    // A pointer the browser does not track (synthetic input) goes without it.
-    try { drag.element.wrapper.setPointerCapture(event.pointerId) } catch {}
+// Shows the drag at the pointer: in the strip the tab reorders; outside it
+// the tab is lifted and the others go back to their places.
+function place(event) {
+  const lifted = !inBand(event)
+  if (lifted !== drag.lifted) {
+    drag.lifted = lifted
+    drag.element.wrapper.classList.toggle('lifted', lifted)
+  }
+  if (lifted) {
+    for (const wrapper of drag.order) wrapper.style.transform = ''
+    drag.to = drag.from
+    return
   }
   // Keep the tab inside the tray.
+  const dx = event.clientX - drag.startX
   const minDx = -drag.from * drag.step
   const maxDx = (drag.order.length - 1 - drag.from) * drag.step
   const offset = Math.min(Math.max(dx, minDx), maxDx)
@@ -283,24 +301,63 @@ function moveDrag(event) {
   })
 }
 
+function moveDrag(event) {
+  if (!drag || event.pointerId !== drag.pointerId) return
+  // The button was let go where the strip never heard of it.
+  if (event.buttons === 0) return cancelDrag()
+  const dx = event.clientX - drag.startX
+  const dy = event.clientY - drag.startY
+  if (!drag.moved && Math.abs(dx) < DRAG_THRESHOLD && Math.abs(dy) < DRAG_THRESHOLD) return
+  if (!drag.moved) {
+    drag.moved = true
+    tabsElement.classList.add('reordering')
+    drag.element.wrapper.classList.add('dragging')
+    // Capture only once this is a drag: capturing on press would retarget the
+    // click to the wrapper and a plain click would no longer select the tab.
+    // A pointer the browser does not track (synthetic input) goes without it.
+    try { drag.element.wrapper.setPointerCapture(event.pointerId) } catch {}
+    bridge.dragStart(drag.id)
+  }
+  place(event)
+}
+
 function clearDrag() {
   const current = drag
   drag = null
   for (const wrapper of current.order) wrapper.style.transform = ''
   tabsElement.classList.remove('reordering')
-  current.element.wrapper.classList.remove('dragging')
+  current.element.wrapper.classList.remove('dragging', 'lifted')
   return current
 }
 
-function endDrag(event, cancelled = false) {
-  if (!drag || event.pointerId !== drag.pointerId) return
-  const { element, from, to, moved, id } = clearDrag()
-  if (!moved) return
+// The click that ends a drag only drops the tab; a pointer that never
+// produces a click must not swallow the next one.
+function swallowClick(element) {
   element.justDragged = true
-  // A pointer that never produces a click must not swallow the next one.
   setTimeout(() => { element.justDragged = false })
+}
+
+// Ends a drag without moving anything. Safe to call at any time.
+function cancelDrag() {
+  if (!drag) return
+  const { moved, id, element } = clearDrag()
+  if (!moved) return
+  swallowClick(element)
+  bridge.dragCancel(id)
+}
+
+// Where the button is let go decides, not the last move.
+function endDrag(event) {
+  if (!drag || event.pointerId !== drag.pointerId) return
+  if (drag.moved) place(event)
+  const { element, from, to, moved, id, lifted } = clearDrag()
+  if (!moved) return
+  swallowClick(element)
   // The tab may have closed during the drag; never put back a stale copy.
-  if (cancelled || from === to || tabElements.get(id) !== element || element.wrapper.parentNode !== tabsElement) return
+  if (tabElements.get(id) !== element || element.wrapper.parentNode !== tabsElement) return bridge.dragCancel(id)
+  if (lifted) return bridge.dragEnd(id)
+  bridge.dragCancel(id)
+  if (from === to) return
   // Show the new order at once; main confirms it with the next state.
   const others = [...tabsElement.children].filter((wrapper) => wrapper !== element.wrapper)
   tabsElement.insertBefore(element.wrapper, others[to] || null)
@@ -310,8 +367,35 @@ function endDrag(event, cancelled = false) {
 
 // Listen on the document so a release outside the tray still ends the drag.
 document.addEventListener('pointermove', moveDrag)
-document.addEventListener('pointerup', (event) => endDrag(event))
-document.addEventListener('pointercancel', (event) => endDrag(event, true))
+document.addEventListener('pointerup', endDrag)
+document.addEventListener('pointercancel', (event) => { if (drag && event.pointerId === drag.pointerId) cancelDrag() })
+// Capture lost before the release (a release ends the drag first).
+document.addEventListener('lostpointercapture', (event) => { if (drag && event.pointerId === drag.pointerId) cancelDrag() })
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && drag?.moved) { event.preventDefault(); cancelDrag() }
+}, true)
+window.addEventListener('blur', cancelDrag)
+window.addEventListener('resize', cancelDrag)
+tabsElement.addEventListener('scroll', () => { if (drag?.moved) cancelDrag() })
+
+// As a drop target: a tab dragged from another window is about to be let go
+// at x. Answer where it would go among the tabs shown, or null when x is not
+// over the tabs or the + button (never the window buttons or empty header).
+bridge.onSlotRequest?.((request) => {
+  const requestId = request?.requestId
+  if (!Number.isSafeInteger(requestId)) return
+  const x = request.x
+  const order = shownOrder()
+  const left = tabsElement.getBoundingClientRect().left
+  const right = newTabButton.getBoundingClientRect().right
+  if (drag || !Number.isFinite(x) || x < left || x > right) return bridge.slot(requestId, null, order)
+  let index = 0
+  for (const wrapper of tabsElement.children) {
+    const box = wrapper.getBoundingClientRect()
+    if (x > box.left + box.width / 2) index++
+  }
+  bridge.slot(requestId, index, order)
+})
 
 homeButton.addEventListener('click', () => bridge.home(true))
 homeButton.addEventListener('contextmenu', (event) => openMenu(event, homeButton, 1))

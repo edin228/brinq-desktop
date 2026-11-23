@@ -17,10 +17,17 @@ const SHOW_FALLBACK_MS = 1000
 function createTabWindows({
   create, placement = () => undefined, onTabsChanged = () => {}, onWindowClosed = () => {},
   isQuitting = () => false, canMove = () => true, setTimer = setTimeout,
+  // Drag and drop: the pointer's screen point (DIP), where a window made
+  // by a drop opens (`placeAt(sourceBounds, point)`), and whether a window
+  // can take a dropped tab now (no Save As dialog open on it).
+  cursorPoint = () => null, placeAt = (source) => source, canReceive = () => true,
 }) {
   // In creation order; the primary first while it is open.
   const windows = []
   let primary = null
+  // Most recently focused first: the best guess at which window is in
+  // front, as Electron gives no stacking order.
+  const focusOrder = []
 
   const alive = (tabWindow) => !!tabWindow && tabWindow.available()
   const secondaries = () => windows.filter((tabWindow) => tabWindow !== primary)
@@ -52,12 +59,21 @@ function createTabWindows({
       canMove,
       movesHeld: anyClosing,
       onTabsChanged: changed,
+      onDragEnd: (id) => { dropTab(tabWindow, id).catch(() => {}) },
     })
     windows.push(tabWindow)
+    focusOrder.push(tabWindow)
     if (isPrimary) primary = tabWindow
+    tabWindow.window.on('focus', () => {
+      const index = focusOrder.indexOf(tabWindow)
+      if (index !== -1) focusOrder.splice(index, 1)
+      focusOrder.unshift(tabWindow)
+    })
     tabWindow.window.once('closed', () => {
       const index = windows.indexOf(tabWindow)
       if (index !== -1) windows.splice(index, 1)
+      const focused = focusOrder.indexOf(tabWindow)
+      if (focused !== -1) focusOrder.splice(focused, 1)
       if (primary === tabWindow) primary = null
       changed()
       onWindowClosed(tabWindow)
@@ -69,12 +85,12 @@ function createTabWindows({
   // target, and only then let either window react (select a neighbour,
   // load a restored tab, close an empty window). Returns the tab's id in
   // the target, or null with the tab back where it was, as it was.
-  function moveTab(source, id, target, { merging = false } = {}) {
+  function moveTab(source, id, target, { merging = false, position = null } = {}) {
     const moved = source.detachTab(id, { merging })
     if (!moved) return null
     let movedId
     try {
-      movedId = target.adoptTab(moved, { select: false })
+      movedId = target.adoptTab(moved, { select: false, position })
     } catch {
       restore(moved)
       return null
@@ -97,12 +113,15 @@ function createTabWindows({
   // Moves one tab into a new window. The page keeps its document: nothing
   // reloads. If the new window cannot take it, the tab stays where it was
   // and the new window closes.
-  function moveToNewWindow(source, id) {
+  // `at`: a drop's screen point; the window opens there instead of where
+  // the last one was left.
+  function moveToNewWindow(source, id, { at = null } = {}) {
     if (!alive(source) || isQuitting() || !source.movable(id, { newWindow: true })) return false
     let target = null
     try {
       const open = secondaries().filter(alive).map((tabWindow) => tabWindow.window.getBounds())
-      target = add({ primary: false, bounds: placement(source.window.getBounds(), open), theme: source.theme() })
+      const bounds = at ? placeAt(source.window.getBounds(), at) : placement(source.window.getBounds(), open)
+      target = add({ primary: false, bounds, theme: source.theme() })
     } catch {
       if (target && !target.window.isDestroyed()) target.window.destroy()
       return false
@@ -125,6 +144,58 @@ function createTabWindows({
     // Shown once its strip has loaded; a slow strip does not keep it hidden.
     target.onceReady(show)
     setTimer(show, SHOW_FALLBACK_MS)
+    return true
+  }
+
+  const contains = (area, point) => !!area && point.x >= area.x && point.x < area.x + area.width &&
+    point.y >= area.y && point.y < area.y + area.height
+  // A window that can be seen now: a drop never lands in a hidden one.
+  const shown = (tabWindow) => alive(tabWindow) && tabWindow.window.isVisible() && !tabWindow.window.isMinimized()
+
+  // The tab window whose strip is under `point`, or null. The window in
+  // front at that point is found first (by focus order); only its strip
+  // counts, so a strip covered by another Brinq window never takes a drop.
+  function stripAt(point) {
+    const front = focusOrder.find((tabWindow) => shown(tabWindow) && contains(tabWindow.contentArea(), point))
+    if (!front) return null
+    const area = front.contentArea()
+    return point.y < area.y + front.stripBand ? front : null
+  }
+
+  // Whether `target` can take a dropped tab now.
+  const receives = (target) => shown(target) && !isQuitting() && !anyClosing() && canReceive(target.window)
+
+  // A tab dragged out of its strip was let go. Main reads the pointer: over
+  // another window's strip, the tab joins that window where its strip says;
+  // over its own strip nothing happens; anywhere else it opens in a new
+  // window there (not the only tab of a secondary window: that snaps back).
+  // Every refusal leaves the tab where it was.
+  let dropping = false
+  async function dropTab(source, id) {
+    if (dropping || !alive(source) || isQuitting() || !source.movable(id)) return false
+    const point = cursorPoint()
+    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return false
+    const target = stripAt(point)
+    if (target === source) return false
+    if (!target) return moveToNewWindow(source, id, { at: { x: Math.round(point.x), y: Math.round(point.y) } })
+    if (!receives(target)) return false
+    dropping = true
+    let position
+    try {
+      position = await target.requestSlot(Math.round(point.x - target.contentArea().x))
+    } finally {
+      dropping = false
+    }
+    // Everything is checked again: the answer took a moment.
+    if (position === null || !alive(source) || !source.movable(id) || !receives(target)) return false
+    const movedId = moveTab(source, id, target, { position })
+    if (movedId === null) return false
+    target.select(movedId)
+    if (target.window.isMinimized()) target.window.restore()
+    target.window.show()
+    target.window.focus()
+    target.focusSelected()
+    source.closeIfEmpty()
     return true
   }
 
@@ -159,6 +230,7 @@ function createTabWindows({
     addPrimary: (options) => add({ ...options, primary: true }),
     forTab, forStrip, forHost,
     moveToNewWindow,
+    dropTab,
     giveBack,
     // Brinq quits only from the main window: while a secondary window has
     // tabs, a quit or update restart is refused (main.js says why).

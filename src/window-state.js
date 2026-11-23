@@ -52,6 +52,23 @@ function nextWindowBounds({ saved, source, open = [], workAreas, primaryArea = w
   return at(0)
 }
 
+// Where a window made by dropping a dragged tab opens: the source window's
+// size, placed so the tab sits under the pointer, kept inside the work area
+// of the monitor the pointer is on (`workArea`, nearest that point). The
+// pointer offset is kept only where the work area allows it.
+const GRAB = { x: 120, y: 20 }
+function boundsAtPoint({ size, point, workArea }) {
+  const area = workArea
+  const width = Math.min(Number.isSafeInteger(size?.width) && size.width > 0 ? size.width : DEFAULT_BOUNDS.width, area.width)
+  const height = Math.min(Number.isSafeInteger(size?.height) && size.height > 0 ? size.height : DEFAULT_BOUNDS.height, area.height)
+  const clamp = (value, low, span) => Math.max(low, Math.min(value, low + span))
+  return {
+    width, height,
+    x: clamp(Math.round(point.x) - GRAB.x, area.x, area.width - width),
+    y: clamp(Math.round(point.y) - GRAB.y, area.y, area.height - height),
+  }
+}
+
 const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/
 
 // brinq://sign-in?code=…&state=… is the browser sign-in callback. Anything
@@ -125,4 +142,4 @@ function createNavigationQueue() {
   }
 }
 
-module.exports = { isMode, modeUrl, visibleBounds, nextWindowBounds, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue }
+module.exports = { isMode, modeUrl, visibleBounds, nextWindowBounds, boundsAtPoint, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue }

@@ -19,7 +19,7 @@ const path = require('path')
 const { pathToFileURL } = require('url')
 const { autoUpdater } = require('electron-updater')
 const config = require('./config')
-const { isMode, modeUrl, visibleBounds, nextWindowBounds, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue } = require('./window-state')
+const { isMode, modeUrl, visibleBounds, nextWindowBounds, boundsAtPoint, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue } = require('./window-state')
 const { createWindowSecurity } = require('./window-security')
 const {
   isSafeOpenFilename,
@@ -98,6 +98,12 @@ const tabWindows = createTabWindows({
   isQuitting: () => !!app.isQuitting,
   // A tab with a Save As dialog open stays in its window.
   canMove: (contents) => !saveDialogs.has(contents),
+  // Dropping a dragged tab: main reads the pointer itself. A window made
+  // by a drop opens on the monitor the pointer is on; a window with a Save
+  // As dialog open takes no dropped tab.
+  cursorPoint: () => screen.getCursorScreenPoint(),
+  placeAt: (source, point) => boundsAtPoint({ size: source, point, workArea: screen.getDisplayNearestPoint(point).workArea }),
+  canReceive: (window) => !saveDialogOwners.has(window),
 })
 windowSecurity.setTabHost(tabWindows)
 // Brinq quits only from its main window: while another Brinq window has
@@ -118,6 +124,14 @@ installQuitGuard({
 // Pages with a Save As dialog open; such a tab stays in its window until the
 // dialog closes, since the dialog belongs to that window.
 const saveDialogs = new Map()
+// The windows those dialogs belong to.
+const saveDialogOwners = new Map()
+const countUp = (map, key) => map.set(key, (map.get(key) || 0) + 1)
+const countDown = (map, key) => {
+  const left = (map.get(key) || 0) - 1
+  if (left > 0) map.set(key, left)
+  else map.delete(key)
+}
 
 // Right-click on a Brinq link (sidebar navigation included): Open in new tab
 // or Copy link. Pages are checked when the menu is requested, not at creation.
@@ -395,13 +409,13 @@ const fileActions = createFileActions({
     // A tab page belongs to its tab window, which fromWebContents cannot see.
     const owner = tabWindows.windowFor(contents) || BrowserWindow.fromWebContents(contents)
     if (!owner || owner.isDestroyed()) return { canceled: true }
-    saveDialogs.set(contents, (saveDialogs.get(contents) || 0) + 1)
+    countUp(saveDialogs, contents)
+    countUp(saveDialogOwners, owner)
     try {
       return await dialog.showSaveDialog(owner, options)
     } finally {
-      const left = saveDialogs.get(contents) - 1
-      if (left > 0) saveDialogs.set(contents, left)
-      else saveDialogs.delete(contents)
+      countDown(saveDialogs, contents)
+      countDown(saveDialogOwners, owner)
     }
   },
   openPath: (file) => shell.openPath(file),
@@ -875,7 +889,7 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
     return created
   }
   const buildTabWindow = ({
-    primary, bounds: windowBounds, theme, onNewWindow, onCloseWindow, beforeQuitClose, canMove, movesHeld, onTabsChanged,
+    primary, bounds: windowBounds, theme, onNewWindow, onCloseWindow, beforeQuitClose, canMove, movesHeld, onTabsChanged, onDragEnd,
   }) => createTabWindow({
     electron: { BrowserWindow, WebContentsView, dialog, Menu, clipboard },
     security: windowSecurity,
@@ -892,6 +906,7 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
     beforeQuitClose,
     canMove,
     movesHeld,
+    onDragEnd,
     // + and Ctrl+T open the page Home is showing, in any window.
     newTabUrl: () => {
       const home = homeContents()

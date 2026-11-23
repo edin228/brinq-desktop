@@ -28,6 +28,7 @@ function fakeContents(session, url = '') {
     },
     send(...args) { this.sent.push(args) },
     focus() { this.focused++ },
+    isFocused() { return false },
     reload() { this.reloads++ },
     reloadIgnoringCache() { this.hardReloads++ },
     toggleDevTools() { this.devtools++ },
@@ -92,13 +93,15 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
     isDestroyed() { return this.destroyed }
     isVisible() { return this.visible }
     isFocused() { return !this.blurred }
-    isMinimized() { return false }
-    restore() {}
+    isMinimized() { return !!this.minimized }
+    minimize() { this.minimized = true; this.emit('minimize') }
+    restore() { this.minimized = false }
     show() { this.visible = true }
-    hide() { this.visible = false }
+    hide() { this.visible = false; this.emit('hide') }
     focus() { this.focusedCount = (this.focusedCount || 0) + 1 }
     getContentSize() { return [1200, 800] }
     getBounds() { return this.bounds || { x: 100, y: 100, width: 1200, height: 800 } }
+    getContentBounds() { return this.contentBounds || { x: 100, y: 100, width: 1200, height: 800 } }
     destroy() { if (!this.destroyed) { this.destroyed = true; this.emit('closed') } }
     setTitle(title) { this.titles.push(title) }
     setBackgroundColor(color) { this.background = color }
@@ -156,12 +159,17 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
   })
   // With `registry`, windows are made the way main.js makes them.
   const sessions = []
+  const pointer = { at: null, busy: new Set() }
   const tabWindows = registry ? createTabWindows({
     create: (options) => makeWindow(options),
     placement: (source, open) => ({ ...source, x: source.x + 32, y: source.y + 32, open: open.length }),
     onTabsChanged: (value) => sessions.push(value),
     setTimer: (fn, ms) => clock.timers.push([clock.now + ms, fn]),
     isQuitting: () => app.quitting,
+    // Drops: the test sets the pointer and which windows have a Save As open.
+    cursorPoint: () => pointer.at,
+    placeAt: (source, point) => ({ x: point.x - 120, y: point.y - 20, width: source.width, height: source.height }),
+    canReceive: (window) => !pointer.busy.has(window),
   }) : null
   const tabs = registry ? tabWindows.addPrimary({ bounds: { width: 1200, height: 800 }, theme }) : makeWindow()
   const host = windows[0]
@@ -181,7 +189,7 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
     flush()
     return contents
   }
-  return { tabs, host, strip, security, session, windows, dialogs, homes, themes, flush, state, stripEvent, viewOf, open, fakeContents, queue, clock, app, menus, copied, external, native, makeWindow, BrowserWindow, tabWindows, sessions }
+  return { tabs, host, strip, security, session, windows, dialogs, homes, themes, flush, state, stripEvent, viewOf, open, fakeContents, queue, clock, app, menus, copied, external, native, makeWindow, BrowserWindow, tabWindows, sessions, pointer }
 }
 
 function tabIds(f) { return f.state().tabs.map((tab) => tab.id) }
@@ -1644,4 +1652,218 @@ test('a failed move keeps the tab\'s id and its place among the tabs it opened',
     [`${BASE}/clients/1`, `${BASE}/clients/1/a`, `${BASE}/clients/1/b`])
   assert.equal(valid(f, parent), true)
   assert.equal(f.viewOf(parent).webContents, parent)
+})
+
+// Dragging a tab out of its strip. Main and a secondary window side by side,
+// both shown, strips loaded; main has Home and one tab, the secondary two.
+function dropWindows() {
+  const w = twoWindows()
+  const { f, second } = w
+  f.host.contentBounds = { x: 0, y: 0, width: 1200, height: 800 }
+  second.window.contentBounds = { x: 1300, y: 0, width: 1200, height: 800 }
+  f.host.show()
+  second.window.show()
+  f.strip.emit('did-finish-load')
+  second.strip.emit('did-finish-load')
+  return w
+}
+// A drag of tab `id` in `from`'s strip, let go with the pointer at `at`:
+// a press main saw, the strip's drag start, then its drag end.
+function dragOut(f, from, id, at, { press = true } = {}) {
+  if (press) from.strip.emit('input-event', {}, { type: 'mouseDown', button: 'left' })
+  const started = from.stripCommand(eventFrom(from), 'drag-start', id)
+  f.pointer.at = at
+  const ended = from.stripCommand(eventFrom(from), 'drag-end', id)
+  return { started, ended }
+}
+const slotAsked = (tabWindow) => tabWindow.strip.sent.filter(([channel]) => channel === 'tabs:slot').at(-1)?.[1]
+const answerSlot = (tabWindow, index, order = tabWindow.tabIds(), requestId = slotAsked(tabWindow)?.requestId) =>
+  tabWindow.stripCommand(eventFrom(tabWindow), 'slot', undefined, { requestId, index, order })
+const settled = () => new Promise((resolve) => setImmediate(resolve))
+const labels = (tabWindow) => stateOf(tabWindow).tabs.map(({ label }) => label)
+
+test('a tab dragged onto another window\'s strip joins it where that strip says, live', async () => {
+  const { f, mainTab, second } = dropWindows()
+  const loads = mainTab.loads.length
+  const id = tabIds(f)[1]
+  assert.deepEqual(dragOut(f, f.tabs, id, { x: 1300 + 250, y: 12 }), { started: true, ended: true })
+  // The target strip is asked where, at its own x, before anything moves.
+  assert.equal(slotAsked(second).x, 250)
+  assert.equal(f.tabs.isTab(mainTab), true)
+  assert.equal(answerSlot(second, 1), true)
+  await settled()
+  f.flush()
+  assert.equal(second.isTab(mainTab), true)
+  assert.equal(f.tabs.isTab(mainTab), false)
+  assert.deepEqual(labels(second), ['Email', 'Client', 'Client'])
+  assert.equal(stateOf(second).tabs[1].id, stateOf(second).selectedId, 'selected where it landed')
+  assert.equal(mainTab.loads.length, loads, 'not reloaded')
+  assert.equal(second.window.focusedCount > 0, true)
+  assert.equal(valid(f, mainTab), true)
+  assert.deepEqual(tabIds(f), [1])
+})
+
+test('the only tab of a secondary window can be dropped into the main strip; its window closes', async () => {
+  const { f, a, b, second } = dropWindows()
+  second.closeTab(stateOf(second).tabs[1].id)
+  f.flush()
+  assert.equal(second.tabCount(), 1)
+  dragOut(f, second, stateOf(second).tabs[0].id, { x: 300, y: 20 })
+  answerSlot(f.tabs, 0)
+  await settled()
+  f.flush()
+  assert.equal(f.tabs.isTab(a), true)
+  assert.deepEqual(f.state().tabs.map(({ label }) => label), ['Brinq', 'Email', 'Client'])
+  assert.equal(second.window.isDestroyed(), true)
+  assert.equal(b.isDestroyed(), true)
+})
+
+test('a tab let go away from any strip opens in a new window there; a secondary\'s only tab snaps back', async () => {
+  const { f, mainTab, second } = dropWindows()
+  const id = tabIds(f)[1]
+  // Over the main window's own page: a new window, under the pointer.
+  dragOut(f, f.tabs, id, { x: 600, y: 400 })
+  f.flush()
+  const third = f.tabWindows.all()[2]
+  assert.equal(third.isTab(mainTab), true)
+  assert.deepEqual(third.window.options.x, 480)
+  assert.deepEqual(third.window.options.y, 380)
+  // No slot was asked of anyone.
+  assert.equal(slotAsked(f.tabs), undefined)
+  // Its only tab dropped on the desktop: refused, nothing opens.
+  third.window.contentBounds = { x: 0, y: 900, width: 800, height: 600 }
+  third.window.show()
+  dragOut(f, third, stateOf(third).tabs[0].id, { x: 3000, y: 50 })
+  f.flush()
+  assert.equal(f.tabWindows.all().length, 3)
+  assert.equal(third.isTab(mainTab), true)
+  // Over its own strip: nothing happens either.
+  dragOut(f, second, stateOf(second).tabs[0].id, { x: 1300 + 200, y: 10 })
+  f.flush()
+  assert.equal(slotAsked(second), undefined)
+  assert.equal(second.tabCount(), 2)
+})
+
+test('the window in front takes the drop: a covered strip never does', async () => {
+  const { f, second } = dropWindows()
+  // The secondary window overlaps the main one; its strip lies over main's page.
+  second.window.contentBounds = { x: 100, y: 100, width: 1200, height: 800 }
+  const id = tabIds(f)[1]
+  const point = { x: 300, y: 110 }
+  // Main focused last: its page is in front there, so the tab opens a window.
+  second.window.emit('focus')
+  f.host.emit('focus')
+  dragOut(f, f.tabs, id, point)
+  f.flush()
+  assert.equal(slotAsked(second), undefined)
+  assert.equal(f.tabWindows.all().length, 3)
+  // The secondary window in front: its strip is asked.
+  const third = f.tabWindows.all()[2]
+  third.window.contentBounds = { x: 2000, y: 2000, width: 10, height: 10 }
+  second.window.emit('focus')
+  dragOut(f, third, stateOf(third).tabs[0].id, point)
+  assert.equal(slotAsked(second).x, 200)
+})
+
+test('a drop counts only inside a press main saw, for the strip document and tab it started with', async () => {
+  const { f, mainTab, second } = dropWindows()
+  const id = tabIds(f)[1]
+  const into = { x: 1300 + 250, y: 12 }
+  // No press seen: no drag session, so the release does nothing.
+  assert.deepEqual(dragOut(f, f.tabs, id, into, { press: false }), { started: false, ended: false })
+  // A release with no drag start at all.
+  f.pointer.at = into
+  assert.equal(f.tabs.stripCommand(eventFrom(f.tabs), 'drag-end', id), false)
+  // A press, then a mouse up before the drag started.
+  f.strip.emit('input-event', {}, { type: 'mouseDown' })
+  f.strip.emit('input-event', {}, { type: 'mouseUp' })
+  assert.equal(f.tabs.stripCommand(eventFrom(f.tabs), 'drag-start', id), false)
+  // The strip reloaded during the drag.
+  f.strip.emit('input-event', {}, { type: 'mouseDown' })
+  assert.equal(f.tabs.stripCommand(eventFrom(f.tabs), 'drag-start', id), true)
+  f.strip.emit('did-start-loading')
+  assert.equal(f.tabs.stripCommand(eventFrom(f.tabs), 'drag-end', id), false)
+  // Cancelled, or another strip's sender, or Home.
+  f.strip.emit('input-event', {}, { type: 'mouseDown' })
+  f.tabs.stripCommand(eventFrom(f.tabs), 'drag-start', id)
+  f.tabs.stripCommand(eventFrom(f.tabs), 'drag-cancel', id)
+  assert.equal(f.tabs.stripCommand(eventFrom(f.tabs), 'drag-end', id), false)
+  assert.equal(f.tabs.stripCommand(eventFrom(second), 'drag-start', id), false)
+  f.strip.emit('input-event', {}, { type: 'mouseDown' })
+  assert.equal(f.tabs.stripCommand(eventFrom(f.tabs), 'drag-start', 1), false)
+  // Too long: the session is forgotten.
+  f.strip.emit('input-event', {}, { type: 'mouseDown' })
+  f.tabs.stripCommand(eventFrom(f.tabs), 'drag-start', id)
+  f.clock.advance(60000)
+  assert.equal(f.tabs.stripCommand(eventFrom(f.tabs), 'drag-end', id), false)
+  assert.equal(slotAsked(second), undefined)
+  assert.equal(f.tabs.isTab(mainTab), true)
+})
+
+test('a slot answer counts once, in time, from the target strip it was asked of, against its tab order', async () => {
+  const { f, mainTab, second } = dropWindows()
+  const id = tabIds(f)[1]
+  const into = { x: 1300 + 250, y: 12 }
+  const stays = async () => { await settled(); f.flush(); assert.equal(f.tabs.isTab(mainTab), true) }
+  // Not over its tabs.
+  dragOut(f, f.tabs, id, into)
+  answerSlot(second, null)
+  await stays()
+  // Another request's id, then too late.
+  dragOut(f, f.tabs, id, into)
+  answerSlot(second, 0, second.tabIds(), slotAsked(second).requestId + 1)
+  f.clock.advance(400)
+  answerSlot(second, 0, second.tabIds(), slotAsked(second).requestId)
+  await stays()
+  // Against an order the window no longer has.
+  dragOut(f, f.tabs, id, into)
+  answerSlot(second, 0, [...second.tabIds()].reverse())
+  await stays()
+  // From the main strip instead of the target's.
+  dragOut(f, f.tabs, id, into)
+  const asked = slotAsked(second)
+  assert.equal(f.tabs.stripCommand(eventFrom(f.tabs), 'slot', undefined, { requestId: asked.requestId, index: 0, order: second.tabIds() }), false)
+  // The target strip reloads before it answers.
+  second.strip.emit('did-start-loading')
+  answerSlot(second, 0)
+  await stays()
+  // An index outside its tabs.
+  second.strip.emit('did-finish-load')
+  dragOut(f, f.tabs, id, into)
+  answerSlot(second, 5)
+  await stays()
+  assert.equal(second.tabCount(), 2)
+})
+
+test('while a drop waits for its answer, a quit, a close, a Save As or a hidden target stops it', async () => {
+  const { f, mainTab, a, second } = dropWindows()
+  const id = tabIds(f)[1]
+  const into = { x: 1300 + 250, y: 12 }
+  const attempt = async (during) => {
+    dragOut(f, f.tabs, id, into)
+    during()
+    answerSlot(second, 0)
+    await settled()
+    f.flush()
+    assert.equal(f.tabs.isTab(mainTab), true)
+  }
+  await attempt(() => { f.app.quitting = true })
+  f.app.quitting = false
+  await attempt(() => { a.hang = true; second.closeTab(stateOf(second).tabs[0].id) })
+  a.hang = false
+  a.destroy()
+  f.flush()
+  await attempt(() => f.pointer.busy.add(second.window))
+  f.pointer.busy.clear()
+  await attempt(() => second.window.minimize())
+  // A minimized or hidden window is never asked at all.
+  assert.equal(second.window.isMinimized(), true)
+  const asked = second.strip.sent.filter(([channel]) => channel === 'tabs:slot').length
+  dragOut(f, f.tabs, id, into)
+  assert.equal(second.strip.sent.filter(([channel]) => channel === 'tabs:slot').length, asked)
+  // A Save As on the target: not asked either.
+  second.window.restore()
+  f.pointer.busy.add(second.window)
+  dragOut(f, f.tabs, id, into)
+  assert.equal(second.strip.sent.filter(([channel]) => channel === 'tabs:slot').length, asked)
 })
