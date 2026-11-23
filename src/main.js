@@ -95,6 +95,9 @@ const tabWindows = createTabWindows({
     })
   },
   onTabsChanged: (state) => startupTabs.onTabsChanged(state),
+  isQuitting: () => !!app.isQuitting,
+  // A tab with a Save As dialog open stays in its window.
+  canMove: (contents) => !saveDialogs.has(contents),
 })
 windowSecurity.setTabHost(tabWindows)
 // Pages with a Save As dialog open; such a tab stays in its window until the
@@ -130,7 +133,7 @@ const updates = createUpdateStatus({
   app, updater: autoUpdater, log: logUpdate,
   onCheckEnd: (result) => updateSchedule.record(result),
   abandonClose: () => {
-    for (const each of tabWindows.all()) each.abandonQuit()
+    tabWindows.abandonQuit()
     startupTabs.resume()
   },
   onChange: (state) => {
@@ -854,7 +857,9 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
     }
     return created
   }
-  const buildTabWindow = ({ primary, bounds: windowBounds, theme, onNewWindow, onTabsChanged }) => createTabWindow({
+  const buildTabWindow = ({
+    primary, bounds: windowBounds, theme, onNewWindow, onCloseWindow, beforeQuitClose, canMove, movesHeld, onTabsChanged,
+  }) => createTabWindow({
     electron: { BrowserWindow, WebContentsView, dialog, Menu, clipboard },
     security: windowSecurity,
     bounds: windowBounds,
@@ -866,8 +871,10 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
     theme,
     primary,
     onNewWindow,
-    // A tab with a Save As dialog open stays in its window.
-    canMove: (contents) => !saveDialogs.has(contents),
+    onCloseWindow,
+    beforeQuitClose,
+    canMove,
+    movesHeld,
     // + and Ctrl+T open the page Home is showing, in any window.
     newTabUrl: () => {
       const home = homeContents()

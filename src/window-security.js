@@ -138,6 +138,9 @@ function createWindowSecurity({ baseUrl, preloadPath, openExternal }) {
         return { action: 'deny' }
       }
       const privileged = APP_ROLES.includes(role) && isAppUrl(target)
+      // While Brinq quits, a page cannot open another tab: the quit is
+      // closing them. Refused here, before Electron prepares any page.
+      if (privileged && openAsTab(details) && tabHost?.quitting?.()) return { action: 'deny' }
       if (privileged && tabHost?.available() && openAsTab(details)) {
         // Electron passes the page it created (script opens) or, for native
         // link clicks, the prepared options, including any sandbox flags

@@ -295,3 +295,18 @@ test('only registered app pages can be reassigned, and only to a live window', (
   assert.equal(app.policy.reassign(app.windowAt().webContents, app.windowAt()), false, 'never registered')
   assert.equal(app.policy.validateSender(app.event), true)
 })
+
+test('while Brinq quits, a page cannot open a tab: refused before Electron prepares a page', () => {
+  const f = fixture('app')
+  const host = tabHost()
+  let quitting = true
+  host.quitting = () => quitting
+  f.policy.setTabHost(host)
+  const open = { url: 'http://localhost:3004/clients/42', disposition: 'foreground-tab', referrer: { url: f.wc.getURL(), policy: 'default' }, frameName: '', features: '' }
+  assert.deepEqual(f.wc.popup(open), { action: 'deny' })
+  assert.equal(host.calls.length, 0)
+  // A named pop-out is not a tab: it keeps its own window, as before.
+  assert.equal(f.wc.popup({ ...open, frameName: 'email-1', features: 'width=900' }).action, 'allow')
+  quitting = false
+  assert.equal(f.wc.popup(open).action, 'allow')
+})

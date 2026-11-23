@@ -66,3 +66,21 @@ test('Open in new tab is disabled until the tab window exists, Copy link still w
   copy.click()
   assert.deepEqual(f.copied, [`${BASE}/emails`])
 })
+
+test('a menu left open while its page navigated or closed does nothing', () => {
+  const f = fixture()
+  const contents = f.page('app')
+  f.click(contents, { linkURL: `${BASE}/clients/7` })
+  const [open, copy] = f.menus[0].template
+  // The page moved on to another document before the click.
+  contents.emit('did-start-navigation', {}, `${BASE}/emails`, false, true)
+  contents.emit('did-frame-navigate', {}, `${BASE}/emails`, 200, 'OK', true)
+  open.click()
+  copy.click()
+  assert.deepEqual(f.tabs, [])
+  assert.deepEqual(f.copied, [])
+  // A fresh menu on the new document works.
+  f.click(contents, { linkURL: `${BASE}/clients/7` })
+  f.menus.at(-1).template[0].click()
+  assert.equal(f.tabs.length, 1)
+})

@@ -13,11 +13,14 @@ function createLinkMenu({ security, Menu, clipboard, openTab, canOpenTab = () =>
     const link = params.linkURL
     const shared = shareableUrl(link, security.isAppUrl)
     if (!shared) return false
+    // The page may navigate or close while the menu is open: each action
+    // checks it is still the same document, then finds its current window.
+    const stillThere = security.captureSender({ sender: contents, senderFrame: params.frame })
     const quietly = (action) => () => { try { Promise.resolve(action()).catch(() => {}) } catch {} }
     Menu.buildFromTemplate([
       // Like Ctrl+click and a browser's "Open link in new tab": a background tab.
-      { label: 'Open in new tab', enabled: canOpenTab(), click: quietly(() => openTab({ opener: contents, url: link, background: true })) },
-      { label: 'Copy link', click: quietly(() => clipboard.writeText(shared)) },
+      { label: 'Open in new tab', enabled: canOpenTab(), click: quietly(() => { if (stillThere()) return openTab({ opener: contents, url: link, background: true }) }) },
+      { label: 'Copy link', click: quietly(() => { if (stillThere()) return clipboard.writeText(shared) }) },
     ]).popup({ window: windowFor(contents) || undefined })
     return true
   }

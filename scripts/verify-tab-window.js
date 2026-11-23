@@ -144,12 +144,14 @@ async function main() {
   // Windows are made the way main.js makes them: through tabWindows.
   let tabs = null
   const tabWindows = createTabWindows({
-    create: ({ primary, bounds, theme, onNewWindow, onTabsChanged }) => createTabWindow({
+    // The registry's own options (primary, bounds, theme and the move, close
+    // and quit hooks) go through as main.js passes them.
+    create: ({ theme, ...registryOptions }) => createTabWindow({
+      ...registryOptions,
       electron: { BrowserWindow, WebContentsView, dialog, Menu: recordingMenu, clipboard },
       openExternal: (url) => { opened.push(url) },
       security,
-      bounds,
-      primary, onNewWindow, onTabsChanged,
+
       preloadPath: path.join(ROOT, 'src', 'preload.js'),
       shellPreloadPath: path.join(ROOT, 'src', 'shell-preload.js'),
       shellUrl,
@@ -163,6 +165,7 @@ async function main() {
       onQuitStopped: () => { quitStops++; app.isQuitting = false; tabs.window.show() },
     }),
     placement: (source) => ({ ...source, x: source.x + 640, y: source.y + 60, width: 900, height: 700 }),
+    isQuitting: () => !!app.isQuitting,
   })
   tabs = tabWindows.addPrimary({ bounds: { width: 1200, height: 800, x: 0, y: 0 }, theme: 'light' })
   app.on('before-quit', () => { app.isQuitting = true })
@@ -332,12 +335,37 @@ async function main() {
     await until(() => prompts.length === promptsBefore + 1)
     check('closing the moved tab asks in its new window, and Stay keeps it',
       promptOwners.at(-1) === second.window && !page.isDestroyed(), String(promptOwners.at(-1)?.id))
-    // Closing both tabs closes the window.
+    // Its close button gives both tabs back to the main window, live.
     await wait(300)
+    const promptsBeforeX = prompts.length
+    second.window.close()
+    const gaveBack = await until(() => second.window.isDestroyed() && tabs.isTab(page))
+    check('the close button gives its tabs back to the main window', gaveBack && tabWindows.all().length === 1 && prompts.length === promptsBeforeX,
+      JSON.stringify({ destroyed: second.window.isDestroyed(), inMain: tabs.isTab(page), inSecond: !second.window.isDestroyed() && second.isTab(page),
+        windows: tabWindows.all().length, prompts: prompts.slice(promptsBeforeX), closing: tabWindows.all().map((each) => each.closingIds()) }))
+    check('the page came back unchanged and unreloaded',
+      (await page.executeJavaScript('[window.state, document.getElementById("text").value]')).join() === [state, 'hi'].join() &&
+      requests['/stateful'] === requested)
+    check('the main strip shows them again, the page selected', await until(async () => {
+      const dom = await stripDom(tabs)
+      return dom.labels.includes('Stateful') && dom.labels.includes('/clients/9') && dom.selected === 'Stateful'
+    }))
+    const back = tabs.window.getContentBounds()
+    await wait(400)
+    check('the main window paints the page that came back', (await screenPixel(back.x + 300, back.y + 300))[1] < 30)
+    // Out again, then closing its last tab closes the window.
+    tabs.window.focus()
+    page.focus()
+    for (const type of ['keyDown', 'keyUp']) page.sendInputEvent({ type, keyCode: 'N', modifiers: ['control', 'shift'] })
+    await until(() => tabWindows.all().length === 2)
+    const third = tabWindows.all()[1]
+    await until(() => third.window.isVisible())
     answers.push(0)
-    for (const tab of second.stripState({ sender: stripOf(second), senderFrame: stripOf(second).mainFrame }).tabs) second.closeTab(tab.id)
-    check('closing its last tab closes the window', await until(() => second.window.isDestroyed() && page.isDestroyed()),
-      JSON.stringify({ window: second.window.isDestroyed(), page: page.isDestroyed(), tabs: second.tabCount(), prompts: prompts.slice(promptsBefore) }))
+    third.closeTab(third.tabIds()[0])
+    check('closing its last tab closes the window', await until(() => third.window.isDestroyed() && page.isDestroyed()),
+      JSON.stringify({ window: third.window.isDestroyed(), page: page.isDestroyed(), prompts: prompts.slice(promptsBefore) }))
+    const child = allContents.getAllWebContents().find((wc) => !wc.isDestroyed() && wc.getURL().endsWith('/clients/9'))
+    if (child) { child.close(); await until(() => child.isDestroyed()) }
     check('the main window and Home are untouched', !host.isDestroyed() && !tabs.home.isDestroyed() && tabWindows.all().length === 1)
   }
 
@@ -627,11 +655,22 @@ async function main() {
     await click(quitTab, '#draft')
     quitTab.sendInputEvent({ type: 'char', keyCode: 'y' })
     await until(() => quitTab.executeJavaScript('document.getElementById("draft").value === "y"'))
+    // A second window with unsaved work of its own (set up first: moving the
+    // selected tab out selects its neighbour, which would load a restored one).
+    const elsewhere = tabs.openTab({ opener: tabs.home, url: `${base}/stateful`, options: { webPreferences: {} }, referrer: { url: '', policy: 'default' }, background: false })
+    await until(() => !elsewhere.isLoading() && elsewhere.getURL().endsWith('/stateful'))
+    await click(elsewhere, '#text')
+    elsewhere.sendInputEvent({ type: 'char', keyCode: 'z' })
+    await until(() => elsewhere.executeJavaScript('document.getElementById("text").value === "z"'))
+    tabWindows.moveToNewWindow(tabs, tabs.stripState({ sender: tabs.strip, senderFrame: tabs.strip.mainFrame }).selectedId)
+    const quitSecond = tabWindows.all()[1]
+    await until(() => quitSecond?.window.isVisible())
     // Two restored tabs after the guarded one; quitting must not load them.
     tabs.restoreTabs(['/restored-c', '/restored-d'].map((route) => ({ url: `${base}${route}`, label: route })))
     tabs.selectHome()
     host.hide()
     const promptsBeforeQuit = prompts.length
+    const ownersBeforeQuit = promptOwners.length
     answers.push(1)
     app.quit()
     const quitStopped = await until(() => quitStops === 1)
@@ -639,17 +678,22 @@ async function main() {
       JSON.stringify({ quitStops, destroyed: quitTab.isDestroyed(), quitting: app.isQuitting, prompts: prompts.length, answers }))
     check('the stopped quit shows the window and the tab with unsaved work', host.isVisible() && tabs.isTab(quitTab))
     check('Stay prompted once and loaded no restored tab', prompts.length === promptsBeforeQuit + 1 && !requests['/restored-c'] && !requests['/restored-d'])
+    check('the quit first moved the other window\'s tab into the main window, asking in the main window',
+      quitSecond.window.isDestroyed() && tabs.isTab(elsewhere) && !elsewhere.isDestroyed() &&
+      promptOwners.slice(ownersBeforeQuit).every((owner) => owner === host))
     let quitState = null
     app.once('will-quit', (event) => {
       // Keep the harness alive to report; record what quitting left behind.
       event.preventDefault()
       quitState = { host: host.isDestroyed(), tabs: tabPages().length, home: tabs.home.isDestroyed() }
     })
-    answers.push(0)
+    answers.push(0, 0)
     app.quit()
     check('Leave completes the quit after every tab and Home closed', await until(() => quitState !== null),
       JSON.stringify(quitState))
-    check('quit left no pages and closed the window', quitState?.host === true && quitState?.tabs === 0 && quitState?.home === true)
+    check('quit left no pages and closed the window', quitState?.host === true && quitState?.tabs === 0 && quitState?.home === true &&
+      elsewhere.isDestroyed())
+    check('each page with unsaved work was asked once, one at a time', prompts.length === promptsBeforeQuit + 3, String(prompts.length - promptsBeforeQuit))
     check('closing the selected guarded tab during quit loaded neither restored neighbour', !requests['/restored-c'] && !requests['/restored-d'], JSON.stringify(requests))
   } catch (error) {
     check('harness completed', false, error?.stack || String(error))

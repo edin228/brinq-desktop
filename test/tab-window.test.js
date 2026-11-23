@@ -35,6 +35,8 @@ function fakeContents(session, url = '') {
     setZoomLevel(level) { this.zoom = level },
     close(options) {
       this.closes.push(options)
+      // A page still deciding: no answer until the test gives one.
+      if (this.hang) return
       if (this.veto && options?.waitForBeforeUnload) {
         let leave = false
         this.emit('will-prevent-unload', { preventDefault() { leave = true } })
@@ -90,6 +92,8 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
     isDestroyed() { return this.destroyed }
     isVisible() { return this.visible }
     isFocused() { return !this.blurred }
+    isMinimized() { return false }
+    restore() {}
     show() { this.visible = true }
     hide() { this.visible = false }
     focus() { this.focusedCount = (this.focusedCount || 0) + 1 }
@@ -157,6 +161,7 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
     placement: (source, open) => ({ ...source, x: source.x + 32, y: source.y + 32, open: open.length }),
     onTabsChanged: (value) => sessions.push(value),
     setTimer: (fn, ms) => clock.timers.push([clock.now + ms, fn]),
+    isQuitting: () => app.quitting,
   }) : null
   const tabs = registry ? tabWindows.addPrimary({ bounds: { width: 1200, height: 800 }, theme }) : makeWindow()
   const host = windows[0]
@@ -1430,4 +1435,218 @@ test('the strip covers the window only while the selected tab shows the failure 
   f.tabs.stripCommand(f.stripEvent(), 'retry', tabIds(f)[1])
   assert.equal(stripView.bounds.height, 40)
   assert.equal(f.viewOf(tab).visible, true)
+})
+
+// --- Several windows: one close path (S) ------------------------------------
+
+const tick = () => new Promise((resolve) => setImmediate(resolve))
+const closeEvent = () => {
+  const event = { prevented: false, preventDefault() { event.prevented = true } }
+  return event
+}
+// Main with Home and one tab, and a secondary window holding two tabs.
+function twoWindows(options = {}) {
+  const f = fixture({ registry: true, ...options })
+  const mainTab = f.open(`${BASE}/clients/1`)
+  const a = f.open(`${BASE}/emails?folder=inbox`)
+  const b = f.open(`${BASE}/clients/2`)
+  f.tabWindows.moveToNewWindow(f.tabs, tabIds(f)[2])
+  f.flush()
+  const second = f.tabWindows.all()[1]
+  second.adoptTab(f.tabs.detachTab(tabIds(f)[2]), { select: false })
+  f.flush()
+  return { f, mainTab, a, b, second }
+}
+
+test('a secondary window\'s close button gives its tabs back to the main window, live', () => {
+  const { f, a, b, second } = twoWindows()
+  assert.deepEqual(stateOf(second).tabs.map(({ label }) => label), ['Email', 'Client'])
+  const loads = a.loads.length + b.loads.length
+  f.host.visible = false
+  const event = closeEvent()
+  second.window.emit('close', event)
+  f.flush()
+  assert.equal(event.prevented, true, 'the window waits until its tabs have moved')
+  assert.equal(second.window.isDestroyed(), true)
+  assert.deepEqual(f.tabWindows.all(), [f.tabs])
+  // After the main window's own tabs, in order; the tab that was selected
+  // there is selected here, and the main window comes forward.
+  assert.deepEqual(f.state().tabs.map(({ label }) => label), ['Brinq', 'Client', 'Email', 'Client'])
+  assert.equal(f.tabs.isTab(a) && f.tabs.isTab(b), true)
+  assert.equal(f.state().selectedId, tabIds(f)[2])
+  assert.equal(f.host.visible, true)
+  assert.equal(a.loads.length + b.loads.length, loads, 'nothing reloaded')
+  assert.equal(f.dialogs.length, 0, 'nothing asked')
+  assert.equal(valid(f, a), true)
+})
+
+test('while any page\'s close is unanswered, no tab moves in any window, close button included', () => {
+  const { f, a, b, second } = twoWindows()
+  a.hang = true
+  second.closeTab(stateOf(second).tabs[0].id)
+  assert.equal(f.tabs.movable(tabIds(f)[1]), false)
+  assert.equal(f.tabWindows.moveToNewWindow(f.tabs, tabIds(f)[1]), false)
+  assert.equal(tabMenu(f, tabIds(f)[1]).newWindow.enabled, false)
+  const held = closeEvent()
+  second.window.emit('close', held)
+  f.flush()
+  assert.equal(held.prevented, true)
+  assert.equal(second.isTab(b) && second.isTab(a), true, 'nothing moved')
+  // The page lets go; its window still has the other tab, which the next
+  // close moves back.
+  a.destroy()
+  f.flush()
+  assert.equal(f.tabs.movable(tabIds(f)[1]), true)
+  second.window.emit('close', closeEvent())
+  f.flush()
+  assert.equal(f.tabs.isTab(b), true)
+  assert.equal(second.window.isDestroyed(), true)
+})
+
+test('a quit is not held by a close still being answered in the main window', async () => {
+  const { f, mainTab, a, b, second } = twoWindows({ choice: 0 })
+  mainTab.hang = true
+  f.tabs.closeTab(tabIds(f)[1])
+  f.app.quitting = true
+  f.host.emit('close', closeEvent())
+  await tick()
+  f.flush()
+  assert.equal(f.tabs.isTab(a) && f.tabs.isTab(b), true, 'the secondary tabs moved to main')
+  assert.equal(second.window.isDestroyed(), true)
+  // Today's loop asks the main window's tab again, then goes on.
+  mainTab.destroy()
+  await tick()
+  await tick()
+  f.flush()
+  assert.equal(a.isDestroyed() && b.isDestroyed(), true)
+  assert.equal(f.app.quitRequests, 1)
+})
+
+test('a quit moves every secondary window\'s tabs to the main window, then asks one page at a time there', async () => {
+  const { f, mainTab, a, b, second } = twoWindows({ choice: 0 })
+  a.veto = true
+  b.veto = true
+  f.app.quitting = true
+  // Electron asks every window to close; a secondary window with tabs waits.
+  const secondary = closeEvent()
+  second.window.emit('close', secondary)
+  assert.equal(secondary.prevented, true)
+  assert.equal(second.isTab(a), true, 'its close button path does not run during a quit')
+  const main = closeEvent()
+  f.host.emit('close', main)
+  assert.equal(main.prevented, true)
+  await tick()
+  await tick()
+  f.flush()
+  assert.equal(second.window.isDestroyed(), true, 'emptied, it closed')
+  assert.equal(a.isDestroyed() && b.isDestroyed() && mainTab.isDestroyed() && f.tabs.home.isDestroyed(), true)
+  // Each prompt came in the main window, one per page with unsaved work.
+  assert.deepEqual(f.dialogs.map(([owner]) => owner), [f.host, f.host])
+  assert.equal(f.app.quitRequests, 1)
+})
+
+test('Stay during a quit keeps every tab, now in the main window', async () => {
+  const { f, mainTab, a, b, second } = twoWindows({ choice: 1 })
+  b.veto = true
+  f.app.quitting = true
+  second.window.emit('close', closeEvent())
+  f.host.emit('close', closeEvent())
+  await tick()
+  await tick()
+  f.flush()
+  assert.equal(f.app.stopped, 1)
+  assert.equal(f.app.quitRequests, 0)
+  assert.equal(second.window.isDestroyed(), true)
+  assert.equal(f.tabs.isTab(b) && !b.isDestroyed(), true)
+  assert.equal(f.dialogs.length, 1)
+  assert.equal(f.dialogs[0][0], f.host)
+  // The loop closed the tabs before the guarded one, in strip order.
+  assert.equal(mainTab.isDestroyed() && a.isDestroyed(), true)
+  assert.equal(f.tabs.home.isDestroyed(), false)
+})
+
+test('a quit waits for a close already being answered in a secondary window; Stay there stops it', async () => {
+  const { f, a, b, second } = twoWindows()
+  a.hang = true
+  second.closeTab(stateOf(second).tabs[0].id)
+  f.app.quitting = true
+  second.window.emit('close', closeEvent())
+  f.host.emit('close', closeEvent())
+  await tick()
+  assert.equal(second.isTab(b), true, 'nothing moved yet')
+  assert.equal(a.closes.length, 1, 'the page is not asked again')
+  // The page answers Stay (its own prompt, already shown).
+  a.emit('will-prevent-unload', { preventDefault() {} })
+  await tick()
+  await tick()
+  assert.equal(f.app.stopped, 1)
+  assert.equal(f.app.quitRequests, 0)
+  assert.equal(second.isTab(a) && second.isTab(b), true, 'the stopped quit moved nothing')
+  assert.equal(f.tabs.home.isDestroyed(), false)
+
+  // Next time the page lets go: the quit goes on.
+  const g = twoWindows()
+  g.a.hang = true
+  g.second.closeTab(stateOf(g.second).tabs[0].id)
+  g.f.app.quitting = true
+  g.f.host.emit('close', closeEvent())
+  await tick()
+  g.a.destroy()
+  await tick()
+  await tick()
+  g.f.flush()
+  assert.equal(g.b.isDestroyed(), true)
+  assert.equal(g.f.app.quitRequests, 1)
+})
+
+test('an abandoned quit lets go of a close it was waiting for in a secondary window', async () => {
+  const { f, a, second } = twoWindows()
+  a.hang = true
+  second.closeTab(stateOf(second).tabs[0].id)
+  f.app.quitting = true
+  f.host.emit('close', closeEvent())
+  await tick()
+  f.tabWindows.abandonQuit()
+  await tick()
+  await tick()
+  assert.equal(f.app.stopped, 1)
+  assert.equal(second.isTab(a), true)
+  // The unanswered page still cannot move: a late answer would follow it.
+  assert.equal(f.tabWindows.moveToNewWindow(f.tabs, tabIds(f)[1]), false)
+  a.destroy()
+  f.flush()
+  assert.equal(f.tabWindows.moveToNewWindow(f.tabs, tabIds(f)[1]), true)
+})
+
+test('during a quit no tab moves and no new window opens', () => {
+  const { f } = moveFixture()
+  f.app.quitting = true
+  assert.equal(f.tabs.movable(tabIds(f)[1]), false)
+  assert.equal(f.tabWindows.moveToNewWindow(f.tabs, tabIds(f)[1]), false)
+  assert.equal(f.tabWindows.quitting(), true)
+  assert.equal(f.tabWindows.all().length, 1)
+})
+
+test('a move that fails leaves the source exactly as it was: no neighbour loads', () => {
+  const f = fixture({ registry: true })
+  const live = f.open(`${BASE}/clients/1`)
+  const [restored] = f.tabs.restoreTabs([{ url: `${BASE}/clients/2` }])
+  f.flush()
+  // The live tab is selected, the restored one after it waits unloaded.
+  f.tabs.select(tabIds(f)[1])
+  f.flush()
+  const restoredPage = [...f.host.children].map((view) => view.webContents).find((wc) => !wc.loads.length && wc !== f.strip)
+  const registry = createTabWindows({
+    create: (options) => {
+      const made = f.makeWindow(options)
+      made.adoptTab = () => { throw new Error('boom') }
+      return made
+    },
+  })
+  assert.equal(registry.moveToNewWindow(f.tabs, tabIds(f)[1]), false)
+  f.flush()
+  assert.equal(restoredPage.loads.length, 0, 'the restored neighbour was never selected')
+  assert.equal(f.tabs.isTab(live), true)
+  assert.equal(f.state().selectedId, tabIds(f)[1])
+  assert.ok(restored)
 })
