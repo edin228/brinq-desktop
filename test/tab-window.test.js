@@ -3,6 +3,7 @@ const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
 const { createTabWindow, THEME_COLORS } = require('../src/tab-window')
 const { createWindowSecurity } = require('../src/window-security')
+const { createTabWindows, SHOW_FALLBACK_MS } = require('../src/tab-windows')
 
 const BASE = 'http://localhost:3004'
 const SHELL = 'file:///app/src/shell/shell.html'
@@ -34,6 +35,8 @@ function fakeContents(session, url = '') {
     setZoomLevel(level) { this.zoom = level },
     close(options) {
       this.closes.push(options)
+      // A page still deciding: no answer until the test gives one.
+      if (this.hang) return
       if (this.veto && options?.waitForBeforeUnload) {
         let leave = false
         this.emit('will-prevent-unload', { preventDefault() { leave = true } })
@@ -50,7 +53,7 @@ function fakeContents(session, url = '') {
   return wc
 }
 
-function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, onUpdateCommand, onTabsChanged } = {}) {
+function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, onUpdateCommand, onTabsChanged, registry = false } = {}) {
   const session = { setPermissionCheckHandler() {}, setPermissionRequestHandler() {} }
   const security = createWindowSecurity({ baseUrl: BASE, preloadPath: '/preload.js', openExternal() {} })
   const queue = []
@@ -89,10 +92,14 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
     isDestroyed() { return this.destroyed }
     isVisible() { return this.visible }
     isFocused() { return !this.blurred }
+    isMinimized() { return false }
+    restore() {}
     show() { this.visible = true }
     hide() { this.visible = false }
     focus() { this.focusedCount = (this.focusedCount || 0) + 1 }
     getContentSize() { return [1200, 800] }
+    getBounds() { return this.bounds || { x: 100, y: 100, width: 1200, height: 800 } }
+    destroy() { if (!this.destroyed) { this.destroyed = true; this.emit('closed') } }
     setTitle(title) { this.titles.push(title) }
     setBackgroundColor(color) { this.background = color }
     setTitleBarOverlay(options) { this.overlays.push(options) }
@@ -124,13 +131,15 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
     return native.fail ? Promise.reject(new Error('unavailable')) : Promise.resolve()
   }
   const clipboard = { writeText: (text) => { copied.push(text); return settle() } }
-  const tabs = createTabWindow({
+  // Every window shares the fakes; `extra` makes a secondary window.
+  const makeWindow = (extra = {}) => createTabWindow({
     electron: { BrowserWindow, WebContentsView, dialog, Menu, clipboard },
     security, bounds: { width: 1200, height: 800 }, icon: '/icon.ico',
     preloadPath: '/preload.js', shellPreloadPath: '/shell-preload.js', shellUrl: SHELL,
     openExternal: (url) => { external.push(url); return settle() },
     theme, platform,
-    newTabUrl: (home) => home.getURL() || `${BASE}/dashboard?standalone=full`,
+    // main.js always asks Home's page, whichever window the + was in.
+    newTabUrl: (home) => home?.getURL() || `${BASE}/dashboard?standalone=full`,
     onTheme: (value) => themes.push(value),
     onHome: (contents, url) => {
       homes.push([contents, url])
@@ -143,9 +152,21 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
     requestQuit: () => { app.quitRequests++ },
     onQuitStopped: () => { app.stopped++; app.quitting = false },
     updateView, onUpdateCommand, onTabsChanged,
+    ...extra,
   })
+  // With `registry`, windows are made the way main.js makes them.
+  const sessions = []
+  const tabWindows = registry ? createTabWindows({
+    create: (options) => makeWindow(options),
+    placement: (source, open) => ({ ...source, x: source.x + 32, y: source.y + 32, open: open.length }),
+    onTabsChanged: (value) => sessions.push(value),
+    setTimer: (fn, ms) => clock.timers.push([clock.now + ms, fn]),
+    isQuitting: () => app.quitting,
+  }) : null
+  const tabs = registry ? tabWindows.addPrimary({ bounds: { width: 1200, height: 800 }, theme }) : makeWindow()
   const host = windows[0]
-  const strip = host.webContents
+  // The strip is a child view; the window's own page stays empty.
+  const strip = tabs.strip
   strip.mainFrame.url = SHELL
   strip.mainFrame.origin = 'file://'
   flush()
@@ -160,18 +181,37 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
     flush()
     return contents
   }
-  return { tabs, host, strip, security, session, windows, dialogs, homes, themes, flush, state, stripEvent, viewOf, open, fakeContents, queue, clock, app, menus, copied, external, native }
+  return { tabs, host, strip, security, session, windows, dialogs, homes, themes, flush, state, stripEvent, viewOf, open, fakeContents, queue, clock, app, menus, copied, external, native, makeWindow, BrowserWindow, tabWindows, sessions }
 }
 
 function tabIds(f) { return f.state().tabs.map((tab) => tab.id) }
+
+// The tab menu of any tab window, as its own strip opens it.
+function tabMenuOf(f, tabWindow, id) {
+  const before = f.menus.length
+  const shown = tabWindow.stripCommand(
+    { sender: tabWindow.strip, senderFrame: tabWindow.strip.mainFrame }, 'menu', id, { x: 10, y: 10 })
+  const menu = f.menus.length > before ? f.menus.at(-1) : null
+  return { shown, menu, newWindow: menu?.template.find((item) => item.label === 'Open in new window') }
+}
 
 test('the window hosts a local strip and Home, a registered page below the strip', () => {
   const f = fixture({ theme: 'dark' })
   assert.equal(f.host.options.titleBarStyle, 'hidden')
   assert.deepEqual(f.host.options.titleBarOverlay, { ...THEME_COLORS.dark, height: 40 })
   assert.equal(f.host.options.backgroundColor, THEME_COLORS.dark.color)
-  assert.equal(f.host.options.webPreferences.preload, '/shell-preload.js')
+  // The strip is a sandboxed child view across the top, below no tab page;
+  // the window's own page stays empty.
+  assert.equal(f.host.options.webPreferences.preload, undefined)
   assert.equal(f.host.options.webPreferences.sandbox, true)
+  assert.deepEqual(f.host.webContents.loads, [])
+  const stripView = f.viewOf(f.strip)
+  assert.equal(f.host.children[0], stripView, 'the strip is the first child view')
+  assert.equal(stripView.webPreferences.preload, '/shell-preload.js')
+  assert.equal(stripView.webPreferences.sandbox, true)
+  assert.equal(stripView.webPreferences.nodeIntegration, false)
+  assert.deepEqual(stripView.bounds, { x: 0, y: 0, width: 1200, height: 40 })
+  assert.equal(stripView.background, THEME_COLORS.dark.color)
   assert.deepEqual(f.strip.loads.map(([url]) => url), [SHELL])
   assert.equal(f.homes.length, 1)
   assert.equal(f.homes[0][0], f.tabs.home)
@@ -621,7 +661,7 @@ test('a link label names the next tab its page opens for that exact URL, once', 
   const f = fixture()
   f.tabs.home.mainFrame.url = `${BASE}/renewals`
   const event = { sender: f.tabs.home, senderFrame: f.tabs.home.mainFrame }
-  const labelOf = (contents) => f.state().tabs.find((tab) => f.viewOf(contents) && tab.id === tabIds(f)[f.host.children.indexOf(f.viewOf(contents))])?.label
+  const labelOf = (contents) => f.state().tabs.find((tab) => f.viewOf(contents) && tab.id === tabIds(f)[f.host.children.filter((view) => view.webContents !== f.strip).indexOf(f.viewOf(contents))])?.label
   const url = `${BASE}/clients/42?view=policies`
   assert.equal(f.tabs.linkLabel(event, { href: url, label: '  Acme\n Holdings ' }), true)
   const tab = f.open(url)
@@ -713,11 +753,11 @@ test('the synchronous link-label reply is always sent: true only when stored', (
   const source = fs.readFileSync(require.resolve('../src/main'), 'utf8')
   const handler = source.slice(source.indexOf("ipcMain.on('link-label'"), source.indexOf("ipcMain.on('tabs:command'"))
   const handlers = new Map()
-  const context = { ipcMain: { on: (channel, fn) => handlers.set(channel, fn) }, tabWindow: null }
+  const context = { ipcMain: { on: (channel, fn) => handlers.set(channel, fn) }, tabWindows: null }
   vm.createContext(context)
   vm.runInContext(handler, context)
   const reply = (tabWindow) => {
-    context.tabWindow = tabWindow
+    context.tabWindows = tabWindow
     const event = {}
     handlers.get('link-label')(event, { href: 'x', label: 'y' })
     return event.returnValue
@@ -735,9 +775,11 @@ function tabMenu(f, id, point = { x: 120, y: 20 }) {
   const menu = f.menus.length > before ? f.menus.at(-1) : null
   return {
     shown, menu,
-    items: menu?.template.map(({ label, enabled }) => [label, enabled]),
+    // The link items; the window item is checked on its own.
+    items: menu?.template.slice(0, 2).map(({ label, enabled }) => [label, enabled]),
     copy: () => menu.template[0].click(),
     open: () => menu.template[1].click(),
+    newWindow: menu?.template.find((item) => item.label === 'Open in new window'),
   }
 }
 
@@ -1078,6 +1120,528 @@ test('a restored tab that fails to attach is undone; Home and earlier tabs stay'
   assert.deepEqual(added.map((tab) => tab.url), [`${BASE}/emails`], 'stops at the failure')
   assert.deepEqual(tabIds(f), [1, added[0].id], 'no orphan in the strip')
   assert.deepEqual(f.tabs.getSessionState(), { tabs: [{ url: `${BASE}/emails` }] })
-  assert.equal(f.host.children.length, 2, 'the failed view was removed')
+  assert.equal(f.host.children.length, 3, 'the failed view was removed (strip, Home, one tab)')
   assert.deepEqual(reports.at(-1), { tabs: [{ url: `${BASE}/emails` }] })
+})
+
+// --- Several windows: Open in new window ----------------------------------
+
+const KEY_NEW_WINDOW = { type: 'keyDown', key: 'N', code: 'KeyN', control: true, shift: true }
+const press = (contents, input) => {
+  let prevented = false
+  contents.emit('before-input-event', { preventDefault() { prevented = true } }, input)
+  return prevented
+}
+// The strip of any tab window, as the shell page sends from it.
+const stripOf = (tabWindow) => tabWindow.strip
+const eventFrom = (tabWindow) => ({ sender: stripOf(tabWindow), senderFrame: stripOf(tabWindow).mainFrame })
+const stateOf = (tabWindow) => stripOf(tabWindow).sent.filter(([channel]) => channel === 'tabs:state').at(-1)?.[1]
+const valid = (f, contents) => f.security.validateSender({ sender: contents, senderFrame: contents.mainFrame })
+
+function moveFixture() {
+  const f = fixture({ registry: true })
+  const a = f.open(`${BASE}/clients/1`)
+  const b = f.open(`${BASE}/emails?folder=inbox`)
+  b.emit('page-title-updated', {}, 'Inbox')
+  f.flush()
+  return { f, a, b, ids: tabIds(f) }
+}
+
+test('open in new window moves the live page into a new window with its own strip, without reloading', () => {
+  const { f, a, b, ids } = moveFixture()
+  f.tabs.select(ids[2])
+  f.flush()
+  const loads = b.loads.length
+  const listeners = b.listenerCount('before-input-event')
+  assert.equal(f.tabWindows.moveToNewWindow(f.tabs, ids[2]), true)
+  f.flush()
+  const [primary, second] = f.tabWindows.all()
+  assert.equal(primary, f.tabs)
+  // Same page, not reloaded, now under the new window's strip.
+  assert.equal(b.loads.length, loads)
+  assert.equal(b.isDestroyed(), false)
+  assert.equal(f.viewOf(b), undefined)
+  assert.equal(second.window.children.some((view) => view.webContents === b), true)
+  assert.equal(b.listenerCount('before-input-event'), listeners, 'the old window left no handlers behind')
+  // The new strip shows the tab, selected, with no Home; the main strip lost it.
+  const moved = stateOf(second)
+  assert.equal(moved.hasHome, false)
+  assert.deepEqual(moved.tabs.map(({ label, home }) => [label, home]), [['Inbox', false]])
+  assert.equal(moved.selectedId, moved.tabs[0].id)
+  assert.equal(second.window.titles.at(-1), 'Inbox')
+  assert.deepEqual(f.state().tabs.map(({ id }) => id), [1, ids[1]])
+  assert.equal(f.state().hasHome, true)
+  // The main window selects a neighbour without taking focus from the new one.
+  assert.equal(f.state().selectedId, ids[1])
+  assert.equal(f.viewOf(a).visible, true)
+  // Same theme and title-bar overlay as the window it came from.
+  assert.deepEqual(second.window.options.titleBarOverlay, { ...THEME_COLORS.light, height: 40 })
+  assert.equal(second.window.options.webPreferences.sandbox, true)
+  // Shown once its strip has loaded, or after the fallback.
+  assert.equal(second.window.visible, false)
+  second.strip.emit('did-finish-load')
+  assert.equal(second.window.visible, true)
+  f.clock.advance(SHOW_FALLBACK_MS)
+  // The page's title and loading now reach only its new window.
+  b.emit('page-title-updated', {}, 'Inbox (3)')
+  f.flush()
+  assert.equal(stateOf(second).tabs[0].label, 'Inbox (3)')
+  assert.equal(f.state().tabs.some((tab) => tab.label === 'Inbox (3)'), false)
+})
+
+test('a moved page keeps its authority until its new window closes, not its old one', () => {
+  const { f, b, ids } = moveFixture()
+  f.tabWindows.moveToNewWindow(f.tabs, ids[2])
+  f.flush()
+  const second = f.tabWindows.all()[1]
+  assert.equal(valid(f, b), true)
+  // The page's unsaved-work prompt belongs to its new window.
+  b.veto = true
+  second.closeTab(stateOf(second).tabs[0].id)
+  assert.equal(f.dialogs.at(-1)[0], second.window)
+  b.veto = false
+  // Closing the window it came from does not take its authority.
+  f.host.destroy()
+  assert.equal(valid(f, b), true)
+  second.window.destroy()
+  assert.equal(valid(f, b), false)
+})
+
+test('Home, a closing tab, the only tab of a secondary window and a busy page stay put', () => {
+  const { f, a, ids } = moveFixture()
+  assert.equal(f.tabs.movable(1), false)
+  assert.equal(f.tabWindows.moveToNewWindow(f.tabs, 1), false)
+  assert.equal(tabMenu(f, 1).newWindow.enabled, false)
+  // Ctrl+Shift+N on Home does nothing, but the key is still taken.
+  assert.equal(press(f.tabs.home, KEY_NEW_WINDOW), true)
+  assert.equal(f.tabWindows.all().length, 1)
+  // A closing tab.
+  a.veto = true
+  f.tabs.closeTab(ids[1])
+  assert.equal(f.tabs.movable(ids[1]), true, 'Stay ended the close')
+  // A quit in progress.
+  f.app.quitting = true
+  assert.equal(f.tabs.movable(ids[1]), false)
+  f.app.quitting = false
+  // The only tab of a secondary window: moving it would only replace its window.
+  f.tabWindows.moveToNewWindow(f.tabs, ids[2])
+  f.flush()
+  const second = f.tabWindows.all()[1]
+  const only = stateOf(second).tabs[0].id
+  assert.equal(second.movable(only, { newWindow: true }), false)
+  assert.equal(second.movable(only), true, 'it can still join another window')
+  assert.equal(f.tabWindows.moveToNewWindow(second, only), false)
+  assert.equal(tabMenuOf(f, second, only).newWindow.enabled, false)
+  assert.equal(f.tabWindows.all().length, 2)
+  // A page main reports busy (a Save As dialog open) waits for it.
+  let busy = true
+  const other = f.makeWindow({ primary: false, canMove: (contents) => !(busy && contents === a) })
+  other.adoptTab(f.tabs.detachTab(ids[1]))
+  const extra = f.open(`${BASE}/clients/8`)
+  other.adoptTab(f.tabs.detachTab(tabIds(f)[1]))
+  f.flush()
+  const [aId, extraId] = stateOf(other).tabs.map(({ id }) => id)
+  assert.equal(other.isTab(extra), true)
+  assert.equal(other.movable(aId, { newWindow: true }), false)
+  assert.equal(tabMenuOf(f, other, aId).newWindow.enabled, false)
+  assert.equal(other.movable(extraId, { newWindow: true }), true)
+  busy = false
+  assert.equal(other.movable(aId, { newWindow: true }), true)
+})
+
+test('the tab menu and Ctrl+Shift+N both move the selected tab', () => {
+  const { f, a, b, ids } = moveFixture()
+  const item = tabMenu(f, ids[1]).newWindow
+  assert.equal(item.enabled, true)
+  assert.equal(item.accelerator, 'CmdOrCtrl+Shift+N')
+  assert.equal(item.registerAccelerator, false)
+  item.click()
+  f.flush()
+  assert.equal(f.tabWindows.all().length, 2)
+  assert.equal(f.tabWindows.isTab(a), true)
+  assert.equal(f.tabs.isTab(a), false)
+  // The shortcut acts on the selected tab of the window it was pressed in.
+  f.tabs.select(ids[2])
+  assert.equal(press(b, KEY_NEW_WINDOW), true)
+  f.flush()
+  assert.equal(f.tabWindows.all().length, 3)
+  assert.equal(f.tabs.isTab(b), false)
+  assert.deepEqual(f.state().tabs.map(({ id }) => id), [1])
+  // A menu left open while its tab moved does nothing.
+  const c = f.open(`${BASE}/clients/9`)
+  const stale = tabMenu(f, tabIds(f)[1]).newWindow
+  f.tabWindows.moveToNewWindow(f.tabs, tabIds(f)[1])
+  stale.click()
+  f.flush()
+  assert.equal(f.tabWindows.all().length, 4)
+  assert.equal(f.tabWindows.isTab(c), true)
+})
+
+test('a secondary window closes when its last tab closes or moves away', () => {
+  const { f, a, b, ids } = moveFixture()
+  f.tabWindows.moveToNewWindow(f.tabs, ids[1])
+  f.flush()
+  const second = f.tabWindows.all()[1]
+  // Move the second tab into it by hand, then split them again.
+  const moved = f.tabs.detachTab(ids[2])
+  second.adoptTab(moved)
+  f.flush()
+  assert.deepEqual(stateOf(second).tabs.map(({ label }) => label), ['Client', 'Inbox'])
+  f.tabWindows.moveToNewWindow(second, stateOf(second).tabs[1].id)
+  f.flush()
+  const third = f.tabWindows.all()[2]
+  assert.equal(third.isTab(b), true)
+  // Closing the last tab closes its window.
+  a.destroy()
+  f.flush()
+  assert.equal(second.window.isDestroyed(), true)
+  assert.deepEqual(f.tabWindows.all(), [f.tabs, third])
+  // Moving its last tab into another window does too.
+  f.tabs.adoptTab(third.detachTab(stateOf(third).tabs[0].id))
+  third.closeIfEmpty()
+  assert.equal(third.window.isDestroyed(), true)
+  assert.equal(f.tabs.isTab(b), true)
+  assert.deepEqual(f.tabWindows.all(), [f.tabs])
+})
+
+test('a failed move puts the tab back where it was, as it was', () => {
+  const { f, b, ids } = moveFixture()
+  f.tabs.select(ids[2])
+  f.flush()
+  const before = tabIds(f)
+  // The new window cannot take the page (it went away first).
+  const original = f.makeWindow
+  const failing = f.tabWindows
+  let created = null
+  const registry = createTabWindows({
+    create: (options) => {
+      created = original(options)
+      created.adoptTab = () => { throw new Error('boom') }
+      return created
+    },
+  })
+  assert.ok(failing)
+  // Use the main window as the source through a second registry.
+  assert.equal(registry.moveToNewWindow(f.tabs, ids[2]), false)
+  f.flush()
+  assert.equal(created.window.isDestroyed(), true)
+  assert.equal(b.isDestroyed(), false)
+  assert.equal(f.tabs.isTab(b), true)
+  assert.equal(tabIds(f).length, before.length)
+  assert.equal(f.state().tabs.at(-1).label, 'Inbox', 'back in its place')
+  assert.equal(f.state().selectedId, tabIds(f).at(-1), 'and selected again')
+  assert.equal(valid(f, b), true)
+  assert.equal(f.viewOf(b).visible, true)
+})
+
+test('each strip commands only its own window, and new tabs open in their opener\'s window', () => {
+  const { f, a, b, ids } = moveFixture()
+  f.tabWindows.moveToNewWindow(f.tabs, ids[2])
+  f.flush()
+  const second = f.tabWindows.all()[1]
+  const movedId = stateOf(second).tabs[0].id
+  // Ids are per window: the main strip cannot reach the moved tab.
+  assert.equal(f.tabWindows.stripCommand(f.stripEvent(), 'close', 999), false)
+  assert.equal(f.tabWindows.stripState(eventFrom(second)).tabs.length, 1)
+  assert.equal(f.tabWindows.stripCommand(eventFrom(second), 'home'), false)
+  assert.equal(f.tabWindows.stripCommand({ sender: b, senderFrame: b.mainFrame }, 'new'), false)
+  assert.equal(f.tabWindows.stripState({ sender: a, senderFrame: a.mainFrame }), null)
+  // A tab opened from the moved page joins it; one from Home stays in main.
+  const child = f.tabWindows.openTab({ opener: b, url: `${BASE}/emails/7`, background: true, options: {} })
+  f.flush()
+  assert.equal(second.isTab(child), true)
+  assert.equal(f.tabs.isTab(child), false)
+  const fromHome = f.tabWindows.openTab({ opener: f.tabs.home, url: `${BASE}/clients/5`, background: true, options: {} })
+  assert.equal(f.tabs.isTab(fromHome), true)
+  // Theme reports repaint the window that owns the page.
+  f.tabWindows.reportTheme(b, 'dark')
+  f.flush()
+  assert.equal(stateOf(second).theme, 'dark')
+  assert.equal(f.state().theme, 'light')
+  // The + button in a secondary window opens Home's page there.
+  f.tabWindows.stripCommand(eventFrom(second), 'new')
+  f.flush()
+  assert.equal(stateOf(second).tabs.length, 3)
+  // Positions count Home as 0 in every window: dropping at 1 is first.
+  const last = stateOf(second).tabs.at(-1).id
+  assert.equal(f.tabWindows.stripCommand(eventFrom(second), 'move', last, { position: 1 }), true)
+  f.flush()
+  assert.equal(stateOf(second).tabs[0].id, last)
+  assert.ok(movedId)
+  // Dialogs for a tab page belong to its window.
+  assert.equal(f.tabWindows.windowFor(b), second.window)
+  assert.equal(f.tabWindows.windowFor(a), f.host)
+  // The updater's view reaches every strip.
+  const sent = stripOf(second).sent.length
+  f.tabWindows.refreshUpdate()
+  f.flush()
+  assert.ok(stripOf(second).sent.length > sent)
+})
+
+test('a link label waits in the window that opens its tab, and leaves with a moved page', () => {
+  const { f, b, ids } = moveFixture()
+  const url = `${BASE}/emails/42`
+  const event = { sender: b, senderFrame: b.mainFrame }
+  assert.equal(f.tabWindows.linkLabel(event, { href: url, label: 'Quote request' }), true)
+  // The page moves before it opens anything: the label goes with nothing.
+  f.tabWindows.moveToNewWindow(f.tabs, ids[2])
+  f.flush()
+  const second = f.tabWindows.all()[1]
+  const opened = f.tabWindows.openTab({ opener: b, url, background: true, options: {} })
+  f.flush()
+  assert.equal(second.isTab(opened), true)
+  assert.equal(stateOf(second).tabs.at(-1).label, 'Email')
+  // A label sent from its new window names its next tab there.
+  assert.equal(f.tabWindows.linkLabel(event, { href: `${BASE}/emails/43`, label: 'Renewal' }), true)
+  f.tabWindows.openTab({ opener: b, url: `${BASE}/emails/43`, background: true, options: {} })
+  f.flush()
+  assert.equal(stateOf(second).tabs.at(-1).label, 'Renewal')
+  assert.equal(b.listenerCount('did-start-navigation') >= 1, true)
+})
+
+test('startup tabs see every window\'s tabs, main first; restored labels reach a moved tab', () => {
+  const { f, ids } = moveFixture()
+  const restored = f.tabs.restoreTabs([{ url: `${BASE}/clients/77` }])
+  f.flush()
+  f.tabWindows.moveToNewWindow(f.tabs, ids[1])
+  f.flush()
+  assert.deepEqual(f.tabWindows.getSessionState().tabs.map(({ url }) => url),
+    [`${BASE}/emails?folder=inbox`, `${BASE}/clients/77`, `${BASE}/clients/1`])
+  assert.deepEqual(f.sessions.at(-1).tabs.map(({ url }) => url), f.tabWindows.getSessionState().tabs.map(({ url }) => url))
+  // A restored tab moved before it ever loaded loads once, in its new window.
+  const restoredId = restored[0].id
+  f.tabWindows.moveToNewWindow(f.tabs, restoredId)
+  f.flush()
+  const third = f.tabWindows.all()[2]
+  assert.equal(third.tabCount(), 1)
+  assert.equal(f.tabWindows.labelRestored([{ url: `${BASE}/clients/77`, title: 'Acme' }]).labeled, 0, 'it loaded on selection')
+  assert.equal(f.tabWindows.home, f.tabs.home)
+})
+
+test('the strip covers the window only while the selected tab shows the failure panel', () => {
+  const f = fixture()
+  const tab = f.open(`${BASE}/clients/1`, { background: false })
+  const stripView = f.viewOf(f.strip)
+  assert.deepEqual(stripView.bounds, { x: 0, y: 0, width: 1200, height: 40 })
+  tab.emit('did-fail-load', {}, -106, 'INTERNET_DISCONNECTED', `${BASE}/clients/1`, true)
+  assert.equal(f.viewOf(tab).visible, false)
+  assert.deepEqual(stripView.bounds, { x: 0, y: 0, width: 1200, height: 800 })
+  // Home selected: the strip is a bar again, and Home shows.
+  f.tabs.selectHome()
+  assert.deepEqual(stripView.bounds, { x: 0, y: 0, width: 1200, height: 40 })
+  assert.equal(f.viewOf(f.tabs.home).visible, true)
+  f.tabs.select(tabIds(f)[1])
+  assert.equal(stripView.bounds.height, 800)
+  f.tabs.stripCommand(f.stripEvent(), 'retry', tabIds(f)[1])
+  assert.equal(stripView.bounds.height, 40)
+  assert.equal(f.viewOf(tab).visible, true)
+})
+
+// --- Several windows: one close path (S) ------------------------------------
+
+const tick = () => new Promise((resolve) => setImmediate(resolve))
+const closeEvent = () => {
+  const event = { prevented: false, preventDefault() { event.prevented = true } }
+  return event
+}
+// Main with Home and one tab, and a secondary window holding two tabs.
+function twoWindows(options = {}) {
+  const f = fixture({ registry: true, ...options })
+  const mainTab = f.open(`${BASE}/clients/1`)
+  const a = f.open(`${BASE}/emails?folder=inbox`)
+  const b = f.open(`${BASE}/clients/2`)
+  f.tabWindows.moveToNewWindow(f.tabs, tabIds(f)[2])
+  f.flush()
+  const second = f.tabWindows.all()[1]
+  second.adoptTab(f.tabs.detachTab(tabIds(f)[2]), { select: false })
+  f.flush()
+  return { f, mainTab, a, b, second }
+}
+
+test('a secondary window\'s close button gives its tabs back to the main window, live', () => {
+  const { f, a, b, second } = twoWindows()
+  assert.deepEqual(stateOf(second).tabs.map(({ label }) => label), ['Email', 'Client'])
+  const loads = a.loads.length + b.loads.length
+  f.host.visible = false
+  const event = closeEvent()
+  second.window.emit('close', event)
+  f.flush()
+  assert.equal(event.prevented, true, 'the window waits until its tabs have moved')
+  assert.equal(second.window.isDestroyed(), true)
+  assert.deepEqual(f.tabWindows.all(), [f.tabs])
+  // After the main window's own tabs, in order; the tab that was selected
+  // there is selected here, and the main window comes forward.
+  assert.deepEqual(f.state().tabs.map(({ label }) => label), ['Brinq', 'Client', 'Email', 'Client'])
+  assert.equal(f.tabs.isTab(a) && f.tabs.isTab(b), true)
+  assert.equal(f.state().selectedId, tabIds(f)[2])
+  assert.equal(f.host.visible, true)
+  assert.equal(a.loads.length + b.loads.length, loads, 'nothing reloaded')
+  assert.equal(f.dialogs.length, 0, 'nothing asked')
+  assert.equal(valid(f, a), true)
+})
+
+test('while any page\'s close is unanswered, no tab moves in any window, close button included', () => {
+  const { f, a, b, second } = twoWindows()
+  a.hang = true
+  second.closeTab(stateOf(second).tabs[0].id)
+  assert.equal(f.tabs.movable(tabIds(f)[1]), false)
+  assert.equal(f.tabWindows.moveToNewWindow(f.tabs, tabIds(f)[1]), false)
+  assert.equal(tabMenu(f, tabIds(f)[1]).newWindow.enabled, false)
+  const held = closeEvent()
+  second.window.emit('close', held)
+  f.flush()
+  assert.equal(held.prevented, true)
+  assert.equal(second.isTab(b) && second.isTab(a), true, 'nothing moved')
+  // The page lets go; its window still has the other tab, which the next
+  // close moves back.
+  a.destroy()
+  f.flush()
+  assert.equal(f.tabs.movable(tabIds(f)[1]), true)
+  second.window.emit('close', closeEvent())
+  f.flush()
+  assert.equal(f.tabs.isTab(b), true)
+  assert.equal(second.window.isDestroyed(), true)
+})
+
+test('during a quit no tab moves and no new window opens', () => {
+  const { f } = moveFixture()
+  f.app.quitting = true
+  assert.equal(f.tabs.movable(tabIds(f)[1]), false)
+  assert.equal(f.tabWindows.moveToNewWindow(f.tabs, tabIds(f)[1]), false)
+  assert.equal(f.tabWindows.quitting(), true)
+  assert.equal(f.tabWindows.all().length, 1)
+})
+
+test('a move that fails leaves the source exactly as it was: no neighbour loads', () => {
+  const f = fixture({ registry: true })
+  const live = f.open(`${BASE}/clients/1`)
+  const [restored] = f.tabs.restoreTabs([{ url: `${BASE}/clients/2` }])
+  f.flush()
+  // The live tab is selected, the restored one after it waits unloaded.
+  f.tabs.select(tabIds(f)[1])
+  f.flush()
+  const restoredPage = [...f.host.children].map((view) => view.webContents).find((wc) => !wc.loads.length && wc !== f.strip)
+  const registry = createTabWindows({
+    create: (options) => {
+      const made = f.makeWindow(options)
+      made.adoptTab = () => { throw new Error('boom') }
+      return made
+    },
+  })
+  assert.equal(registry.moveToNewWindow(f.tabs, tabIds(f)[1]), false)
+  f.flush()
+  assert.equal(restoredPage.loads.length, 0, 'the restored neighbour was never selected')
+  assert.equal(f.tabs.isTab(live), true)
+  assert.equal(f.state().selectedId, tabIds(f)[1])
+  assert.ok(restored)
+})
+
+test('Brinq does not quit while another window has tabs; given back, it quits from the main window as before', async () => {
+  const { f, a, b, second } = twoWindows({ choice: 0 })
+  assert.equal(f.tabWindows.blocksQuit(), true)
+  // Closing the other window gives its tabs back; then nothing blocks.
+  second.window.emit('close', closeEvent())
+  f.flush()
+  assert.equal(f.tabWindows.blocksQuit(), false)
+  a.veto = true
+  b.veto = true
+  f.app.quitting = true
+  f.host.emit('close', closeEvent())
+  await tick()
+  f.flush()
+  assert.equal(a.isDestroyed() && b.isDestroyed() && f.tabs.home.isDestroyed(), true)
+  assert.deepEqual(f.dialogs.map(([owner]) => owner), [f.host, f.host], 'one prompt per page, in the main window')
+  assert.equal(f.app.quitRequests, 1)
+})
+
+test('an empty secondary window never blocks a quit, and a secondary window never runs a close loop', () => {
+  const { f, a, b, second } = twoWindows()
+  f.app.quitting = true
+  const held = closeEvent()
+  second.window.emit('close', held)
+  assert.equal(held.prevented, true, 'with tabs it waits (the quit guard refuses such a quit first)')
+  assert.equal(a.closes.length + b.closes.length, 0, 'and asks no page')
+  f.app.quitting = false
+  a.destroy()
+  b.destroy()
+  f.flush()
+  assert.equal(second.window.isDestroyed(), true)
+  assert.equal(f.tabWindows.blocksQuit(), false)
+})
+
+test('during a quit, + and Ctrl+T open nothing and the link menu cannot open a tab', () => {
+  const { f } = moveFixture()
+  const before = tabIds(f).length
+  f.app.quitting = true
+  f.tabWindows.stripCommand(f.stripEvent(), 'new')
+  press(f.tabs.home, { type: 'keyDown', key: 't', code: 'KeyT', control: true })
+  f.flush()
+  assert.equal(tabIds(f).length, before)
+  assert.equal(f.tabWindows.canOpenTab(), false)
+  f.app.quitting = false
+  assert.equal(f.tabWindows.canOpenTab(), true)
+})
+
+test('a window activated by the system gives keyboard focus back to the strip or the selected page', () => {
+  const { f, a, ids } = moveFixture()
+  f.tabs.select(ids[1])
+  f.flush()
+  const focused = a.focused
+  // Windows focused the window's own, empty page.
+  f.host.webContents.isFocused = () => true
+  f.host.emit('focus')
+  f.flush()
+  assert.equal(a.focused, focused + 1)
+  // The strip had focus last: it gets it back.
+  let stripFocus = 0
+  f.strip.focus = () => { stripFocus++ }
+  f.strip.emit('focus')
+  f.host.emit('focus')
+  f.flush()
+  assert.equal(stripFocus, 1)
+  // Focus already in a child view: nothing changes.
+  f.host.webContents.isFocused = () => false
+  f.host.emit('focus')
+  f.flush()
+  assert.equal(stripFocus, 1)
+  assert.equal(a.focused, focused + 1)
+})
+
+test('keyboard reordering works in a window without Home', () => {
+  const { f, second } = twoWindows()
+  const [first, last] = stateOf(second).tabs.map(({ id }) => id)
+  second.select(first)
+  second.dispatch('move-right')
+  f.flush()
+  assert.deepEqual(stateOf(second).tabs.map(({ id }) => id), [last, first])
+  second.dispatch('move-left')
+  f.flush()
+  assert.deepEqual(stateOf(second).tabs.map(({ id }) => id), [first, last])
+  second.dispatch('move-left')
+  f.flush()
+  assert.deepEqual(stateOf(second).tabs.map(({ id }) => id), [first, last], 'already first')
+})
+
+test('a failed move keeps the tab\'s id and its place among the tabs it opened', () => {
+  const f = fixture({ registry: true })
+  const parent = f.open(`${BASE}/clients/1`)
+  const parentId = tabIds(f)[1]
+  f.open(`${BASE}/clients/1/a`, { opener: parent })
+  const registry = createTabWindows({
+    create: (options) => {
+      const made = f.makeWindow(options)
+      made.adoptTab = () => { throw new Error('boom') }
+      return made
+    },
+  })
+  assert.equal(registry.moveToNewWindow(f.tabs, parentId), false)
+  f.flush()
+  assert.equal(tabIds(f)[1], parentId, 'same id, same place')
+  // A new link from the parent still lands after its earlier child.
+  f.open(`${BASE}/clients/1/b`, { opener: parent })
+  f.flush()
+  assert.deepEqual(f.tabs.getSessionState().tabs.map(({ url }) => url),
+    [`${BASE}/clients/1`, `${BASE}/clients/1/a`, `${BASE}/clients/1/b`])
+  assert.equal(valid(f, parent), true)
+  assert.equal(f.viewOf(parent).webContents, parent)
 })

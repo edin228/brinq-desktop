@@ -19,7 +19,7 @@ const path = require('path')
 const { pathToFileURL } = require('url')
 const { autoUpdater } = require('electron-updater')
 const config = require('./config')
-const { isMode, modeUrl, visibleBounds, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue } = require('./window-state')
+const { isMode, modeUrl, visibleBounds, nextWindowBounds, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue } = require('./window-state')
 const { createWindowSecurity } = require('./window-security')
 const {
   isSafeOpenFilename,
@@ -41,10 +41,11 @@ const { createUpdateSchedule } = require('./update-schedule')
 const { sanitizedLogger } = require('./update-log')
 const { guardWindowUnload } = require('./unload-guard')
 const { createTabWindow } = require('./tab-window')
+const { createTabWindows } = require('./tab-windows')
 const { createLinkMenu } = require('./link-menu')
 const { createNativeNotifier } = require('./native-notifications')
 const { installBrowserSignIn } = require('./browser-sign-in')
-const { quitApp, installQuitApp } = require('./quit-app')
+const { quitApp, installQuitApp, installQuitGuard, OTHER_WINDOWS_NOTICE } = require('./quit-app')
 const { installStartupTabs } = require('./startup-tabs')
 
 // Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
@@ -77,10 +78,46 @@ const windowSecurity = createWindowSecurity({
 })
 
 // The main window hosts the tab strip; Home is its permanent base tab.
+// tabWindow is that window; tabWindows also holds the secondary windows
+// tabs were moved to, and routes each request to the window it belongs to.
 let mainWindow = null
 let tabWindow = null
 let tray = null
 const navigationQueue = createNavigationQueue()
+let createTabWindowWith = null
+const tabWindows = createTabWindows({
+  create: (options) => createTabWindowWith(options),
+  placement: (source, open) => {
+    const displays = screen.getAllDisplays().map((display) => display.workArea)
+    return nextWindowBounds({
+      saved: config.getSecondaryWindowBounds(), source, open, workAreas: displays,
+      primaryArea: screen.getPrimaryDisplay().workArea,
+    })
+  },
+  onTabsChanged: (state) => startupTabs.onTabsChanged(state),
+  isQuitting: () => !!app.isQuitting,
+  // A tab with a Save As dialog open stays in its window.
+  canMove: (contents) => !saveDialogs.has(contents),
+})
+windowSecurity.setTabHost(tabWindows)
+// Brinq quits only from its main window: while another Brinq window has
+// tabs, the quit is refused with a notice. Installed before the updater's
+// and startup tabs' before-quit listeners, so a refused quit saves nothing.
+installQuitGuard({
+  app,
+  blocked: () => tabWindows.blocksQuit(),
+  onRefused: () => {
+    // An update restart refused here (its own check passed a moment
+    // before) is postponed now, not when its watchdog gives up.
+    updates.cancelQuit()
+    showMainWindow()
+    const owner = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined
+    Promise.resolve(owner ? dialog.showMessageBox(owner, OTHER_WINDOWS_NOTICE) : dialog.showMessageBox(OTHER_WINDOWS_NOTICE)).catch(() => {})
+  },
+})
+// Pages with a Save As dialog open; such a tab stays in its window until the
+// dialog closes, since the dialog belongs to that window.
+const saveDialogs = new Map()
 
 // Right-click on a Brinq link (sidebar navigation included): Open in new tab
 // or Copy link. Pages are checked when the menu is requested, not at creation.
@@ -88,9 +125,9 @@ const linkMenu = createLinkMenu({
   security: windowSecurity,
   Menu,
   clipboard,
-  openTab: (args) => tabWindow?.openTab(args),
-  canOpenTab: () => !!tabWindow,
-  windowFor: (contents) => tabWindow?.windowFor(contents) || BrowserWindow.fromWebContents(contents),
+  openTab: (args) => tabWindows.openTab(args),
+  canOpenTab: () => tabWindows.canOpenTab(),
+  windowFor: (contents) => tabWindows.windowFor(contents) || BrowserWindow.fromWebContents(contents),
 })
 app.on('web-contents-created', (_event, contents) => linkMenu.attach(contents))
 
@@ -110,13 +147,15 @@ const logFile = (fields) => require('electron-log').info(`[file] ${fields.mode} 
 const updates = createUpdateStatus({
   app, updater: autoUpdater, log: logUpdate,
   onCheckEnd: (result) => updateSchedule.record(result),
+  // Other Brinq windows with tabs postpone the restart before anything closes.
+  restartBlocked: () => tabWindows.blocksQuit(),
   abandonClose: () => {
-    tabWindow?.abandonQuit()
+    tabWindows.abandonQuit()
     startupTabs.resume()
   },
   onChange: (state) => {
     if (tray) updateTrayMenu()
-    tabWindow?.refreshUpdate()
+    tabWindows.refreshUpdate()
     // Every validated app page, whether a tab or a pop-out window.
     for (const contents of windowSecurity.appContents()) contents.send('update-status', state)
   },
@@ -352,11 +391,18 @@ const fileActions = createFileActions({
   baseUrl: BASE_URL,
   security: windowSecurity,
   tempDir: BRINQ_TEMP_DIR,
-  showSaveDialog: (contents, options) => {
-    // Tab pages belong to the main window, which fromWebContents cannot see.
-    const owner = tabWindow?.windowFor(contents) || BrowserWindow.fromWebContents(contents)
+  showSaveDialog: async (contents, options) => {
+    // A tab page belongs to its tab window, which fromWebContents cannot see.
+    const owner = tabWindows.windowFor(contents) || BrowserWindow.fromWebContents(contents)
     if (!owner || owner.isDestroyed()) return { canceled: true }
-    return dialog.showSaveDialog(owner, options)
+    saveDialogs.set(contents, (saveDialogs.get(contents) || 0) + 1)
+    try {
+      return await dialog.showSaveDialog(owner, options)
+    } finally {
+      const left = saveDialogs.get(contents) - 1
+      if (left > 0) saveDialogs.set(contents, left)
+      else saveDialogs.delete(contents)
+    }
   },
   openPath: (file) => shell.openPath(file),
   openEmailFile: (file, stillAuthorized) => openEmailFile(file, { showError: false, stillAuthorized }),
@@ -812,22 +858,47 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
   const bounds = visibleBounds(config.getWindowBounds(), screen.getAllDisplays().map((display) => display.workArea), screen.getPrimaryDisplay().workArea)
   let firstHomeUrl = approvedAppUrl(initialUrl) ? initialUrl : navigationQueue.hasPending() ? modeUrl(BASE_URL, config.getMode(), true) : getModeUrl()
 
-  tabWindow = createTabWindow({
+  // Every tab window shares these settings; only the main one has Home.
+  createTabWindowWith = (options) => {
+    const created = buildTabWindow(options)
+    // A secondary window's place is remembered for the next one.
+    if (!options.primary) {
+      const save = () => {
+        const host = created.window
+        if (!host.isDestroyed() && !host.isMinimized() && !host.isMaximized() && !host.isFullScreen()) {
+          config.setSecondaryWindowBounds(host.getBounds())
+        }
+      }
+      created.window.on('resize', save)
+      created.window.on('move', save)
+    }
+    return created
+  }
+  const buildTabWindow = ({
+    primary, bounds: windowBounds, theme, onNewWindow, onCloseWindow, beforeQuitClose, canMove, movesHeld, onTabsChanged,
+  }) => createTabWindow({
     electron: { BrowserWindow, WebContentsView, dialog, Menu, clipboard },
     security: windowSecurity,
-    bounds,
+    bounds: windowBounds,
     icon: WINDOW_ICON_PATH,
     preloadPath: PRELOAD_PATH,
     shellPreloadPath: SHELL_PRELOAD_PATH,
     shellUrl: SHELL_URL,
     openExternal: (url) => shell.openExternal(url),
-    theme: config.getTheme(),
-    // + and Ctrl+T open the page Home is showing.
-    newTabUrl: (home) => {
-      const url = home && !home.isDestroyed() ? home.getURL() : ''
+    theme,
+    primary,
+    onNewWindow,
+    onCloseWindow,
+    beforeQuitClose,
+    canMove,
+    movesHeld,
+    // + and Ctrl+T open the page Home is showing, in any window.
+    newTabUrl: () => {
+      const home = homeContents()
+      const url = home ? home.getURL() : ''
       return approvedAppUrl(url) ? url : getModeUrl()
     },
-    onTheme: (theme) => config.setTheme(theme),
+    onTheme: (value) => config.setTheme(value),
     onHome: (contents, lastUrl) => {
       const target = approvedAppUrl(lastUrl) ? lastUrl : firstHomeUrl || getModeUrl()
       firstHomeUrl = null
@@ -842,8 +913,9 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
       if (command === 'restart-update') updates.restart()
       else updates.check({ manual: true })
     },
-    // Startup tabs record the tab list (addresses only) for next launch.
-    onTabsChanged: (state) => startupTabs.onTabsChanged(state),
+    // Startup tabs record every window's tabs (addresses only), through
+    // tabWindows, for next launch.
+    onTabsChanged,
     onQuitStopped: () => {
       updates.cancelQuit()
       startupTabs.resume()
@@ -853,12 +925,12 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
       else showMainWindow()
     },
   })
+  tabWindow = tabWindows.addPrimary({ bounds, theme: config.getTheme() })
   const window = tabWindow.window
   mainWindow = window
-  windowSecurity.setTabHost(tabWindow)
 
-  window.once('ready-to-show', () => {
-    if (showOnReady && !recoveryWindow) window.show()
+  tabWindow.onceReady(() => {
+    if (showOnReady && !recoveryWindow && !window.isDestroyed()) window.show()
   })
 
   // Save window bounds on move/resize
@@ -874,7 +946,6 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
     if (mainWindow === window) {
       mainWindow = null
       tabWindow = null
-      windowSecurity.setTabHost(null)
     }
   })
 }
@@ -883,7 +954,8 @@ function createWindow({ showOnReady = true, initialUrl = null } = {}) {
 // focused window anywhere else (email pop-outs, viewers).
 function buildAppMenu() {
   const run = (action, apply) => (_item, window) => {
-    if (window && window === mainWindow && tabWindow) return tabWindow.dispatch(action)
+    const owner = window ? tabWindows.forHost(window) : null
+    if (owner) return owner.dispatch(action)
     const contents = window?.webContents
     if (contents && !contents.isDestroyed()) apply(contents)
   }
@@ -1055,7 +1127,7 @@ installQuitApp({ ipcMain, app, security: windowSecurity })
 // Registered after the updater, so its blocked-installer quit is already
 // prevented when the recorder decides whether this quit saves the tabs.
 const startupTabs = installStartupTabs({
-  ipcMain, app, security: windowSecurity, config, tabWindow: () => tabWindow, baseUrl: BASE_URL,
+  ipcMain, app, security: windowSecurity, config, tabWindow: () => tabWindows, baseUrl: BASE_URL,
   desktopState: () => desktopState(),
   log: (category) => require('electron-log').warn(`[startup-tabs] ${category}`),
 })
@@ -1075,24 +1147,25 @@ ipcMain.on('email-listener-state', (event, channel, active) => {
 // repaints the header. The strip's own commands are checked in tab-window.
 ipcMain.on('theme-changed', (event, theme) => {
   if (!validateSender(event)) return
-  tabWindow?.reportTheme(event.sender, theme)
+  tabWindows.reportTheme(event.sender, theme)
 })
 // A page names the tab its Ctrl/middle-click or Ctrl+Enter is about to open.
 // The page waits for this reply, so always answer, even on errors.
 ipcMain.on('link-label', (event, payload) => {
   let stored = false
   try {
-    stored = !!tabWindow?.linkLabel(event, payload)
+    stored = !!tabWindows.linkLabel(event, payload)
   } catch {
     stored = false
   } finally {
     event.returnValue = stored
   }
 })
+// Each strip commands only its own window's tabs.
 ipcMain.on('tabs:command', (event, command, id, options) => {
-  tabWindow?.stripCommand(event, command, id, options)
+  tabWindows.stripCommand(event, command, id, options)
 })
-ipcMain.handle('tabs:state', (event) => tabWindow?.stripState(event) ?? null)
+ipcMain.handle('tabs:state', (event) => tabWindows.stripState(event))
 
 ipcMain.on('set-mode', (event, mode) => {
   if (!validateSender(event)) return

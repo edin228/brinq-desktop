@@ -265,3 +265,48 @@ test('app page enumeration covers tabs and app windows, never viewers or present
   popout.webContents.emit('destroyed')
   assert.deepEqual(f.policy.appContents(), [f.wc])
 })
+
+test('a moved tab page keeps its document authority; it ends with its new window only', () => {
+  const f = fixture('app', 'http://localhost:3004/clients/1')
+  const other = f.windowAt('http://localhost:3004/clients/2')
+  const started = f.policy.captureSender(f.event)
+  assert.equal(f.policy.reassign(f.wc, other), true)
+  // Same document: work it started stays valid.
+  assert.equal(started(), true)
+  assert.equal(f.policy.reassign(f.wc, other), true, 'idempotent')
+  // The old window closing no longer revokes it.
+  f.window.destroyed = true
+  f.window.emit('closed')
+  assert.equal(f.policy.validateSender(f.event), true)
+  // The new one does.
+  other.destroyed = true
+  other.emit('closed')
+  assert.equal(f.policy.validateSender(f.event), false)
+  assert.equal(started(), false)
+})
+
+test('only registered app pages can be reassigned, and only to a live window', () => {
+  const viewer = fixture('viewer', 'http://localhost:3004/viewer/1')
+  assert.equal(viewer.policy.reassign(viewer.wc, viewer.windowAt()), false)
+  const app = fixture('app', 'http://localhost:3004/clients/1')
+  const gone = app.windowAt()
+  gone.destroyed = true
+  assert.equal(app.policy.reassign(app.wc, gone), false)
+  assert.equal(app.policy.reassign(app.windowAt().webContents, app.windowAt()), false, 'never registered')
+  assert.equal(app.policy.validateSender(app.event), true)
+})
+
+test('while Brinq quits, a page cannot open a tab: refused before Electron prepares a page', () => {
+  const f = fixture('app')
+  const host = tabHost()
+  let quitting = true
+  host.quitting = () => quitting
+  f.policy.setTabHost(host)
+  const open = { url: 'http://localhost:3004/clients/42', disposition: 'foreground-tab', referrer: { url: f.wc.getURL(), policy: 'default' }, frameName: '', features: '' }
+  assert.deepEqual(f.wc.popup(open), { action: 'deny' })
+  assert.equal(host.calls.length, 0)
+  // A named pop-out is not a tab: it keeps its own window, as before.
+  assert.equal(f.wc.popup({ ...open, frameName: 'email-1', features: 'width=900' }).action, 'allow')
+  quitting = false
+  assert.equal(f.wc.popup(open).action, 'allow')
+})

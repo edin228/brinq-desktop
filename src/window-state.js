@@ -28,6 +28,30 @@ function visibleBounds(saved, workAreas, primaryArea = workAreas[0]) {
   }
 }
 
+// Where a new secondary window opens: the last place one was left (on any
+// monitor still connected), else beside the window the tab came from. One
+// already open at that spot pushes the new one down and right; the result
+// is then kept on a monitor.
+const CASCADE = 32
+function nextWindowBounds({ saved, source, open = [], workAreas, primaryArea = workAreas[0] }) {
+  const valid = (bounds) => !!bounds && ['x', 'y', 'width', 'height'].every((key) => Number.isSafeInteger(bounds[key])) &&
+    bounds.width > 0 && bounds.height > 0
+  const start = valid(saved) ? { ...saved }
+    : valid(source) ? { ...source, x: source.x + CASCADE, y: source.y + CASCADE } : null
+  if (!start) return visibleBounds(null, workAreas, primaryArea)
+  const taken = open.filter(valid)
+  const free = (bounds) => !taken.some((other) => other.x === bounds.x && other.y === bounds.y)
+  const at = (offset) => visibleBounds({ x: start.x + offset, y: start.y + offset, width: start.width, height: start.height }, workAreas, primaryArea)
+  // Checked after keeping it on a monitor: at an edge the cascade turns back.
+  for (const direction of [1, -1]) {
+    for (let step = 0; step < 20; step++) {
+      const candidate = at(direction * step * CASCADE)
+      if (free(candidate)) return candidate
+    }
+  }
+  return at(0)
+}
+
 const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/
 
 // brinq://sign-in?code=…&state=… is the browser sign-in callback. Anything
@@ -101,4 +125,4 @@ function createNavigationQueue() {
   }
 }
 
-module.exports = { isMode, modeUrl, visibleBounds, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue }
+module.exports = { isMode, modeUrl, visibleBounds, nextWindowBounds, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue }

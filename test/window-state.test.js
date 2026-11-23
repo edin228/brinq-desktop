@@ -1,6 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { visibleBounds, modeUrl, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue } = require('../src/window-state')
+const { visibleBounds, nextWindowBounds, modeUrl, parseProtocolUrl, incomingNavigationUrl, createNavigationQueue } = require('../src/window-state')
 const primary = { x: 0, y: 0, width: 1920, height: 1040 }
 const left = { x: -1600, y: -200, width: 1600, height: 900 }
 
@@ -170,4 +170,26 @@ test('a link that never navigates keeps Home listening, and delivers each payloa
   queue.drain(next, send)
   assert.deepEqual(sent.at(-1), ['mailto', { subject: 'next page' }])
   assert.equal(queue.hasPending(), false)
+})
+
+test('a new window opens where the last one was left, cascades past an open one, and stays on a monitor', () => {
+  const areas = [primary, left]
+  const saved = { x: -1500, y: -100, width: 900, height: 700 }
+  // The remembered spot, on the monitor left of the primary.
+  assert.deepEqual(nextWindowBounds({ saved, workAreas: areas, primaryArea: primary }), saved)
+  // A window already there pushes the next one down and right.
+  assert.deepEqual(nextWindowBounds({ saved, open: [saved], workAreas: areas, primaryArea: primary }),
+    { x: -1468, y: -68, width: 900, height: 700 })
+  // No remembered spot: beside the window the tab came from.
+  assert.deepEqual(nextWindowBounds({ source: { x: 100, y: 50, width: 1200, height: 800 }, workAreas: areas, primaryArea: primary }),
+    { x: 132, y: 82, width: 1200, height: 800 })
+  // At the monitor's edge the cascade turns back instead of landing on it.
+  const edge = { x: 1920 - 900, y: 1040 - 700, width: 900, height: 700 }
+  assert.deepEqual(nextWindowBounds({ saved: edge, open: [edge], workAreas: areas, primaryArea: primary }),
+    { x: edge.x - 32, y: edge.y - 32, width: 900, height: 700 })
+  // The remembered monitor was unplugged: centered on the primary.
+  assert.deepEqual(nextWindowBounds({ saved, workAreas: [primary], primaryArea: primary }),
+    { x: 510, y: 170, width: 900, height: 700 })
+  // Nothing usable: the default size, centered.
+  assert.deepEqual(nextWindowBounds({ saved: { x: 'a' }, workAreas: [primary] }), visibleBounds(null, [primary]))
 })

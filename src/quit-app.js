@@ -14,4 +14,29 @@ function installQuitApp({ ipcMain, app, security }) {
   })
 }
 
-module.exports = { quitApp, installQuitApp }
+// Brinq quits only from its main window: while another Brinq window has
+// tabs, a quit is refused before anything closes or is saved, and
+// `onRefused` tells the person why. Install it before the other
+// before-quit listeners (the updater's, startup tabs'), which skip a quit
+// that is already refused.
+function installQuitGuard({ app, blocked, onRefused = () => {} }) {
+  app.on('before-quit', (event) => {
+    if (event.defaultPrevented || !blocked()) return
+    event.preventDefault()
+    app.isQuitting = false
+    onRefused()
+  })
+}
+
+// The notice for a refused quit, on the main window.
+const OTHER_WINDOWS_NOTICE = {
+  type: 'info',
+  buttons: ['OK'],
+  defaultId: 0,
+  noLink: true,
+  title: 'Brinq has other windows open',
+  message: 'Brinq has other windows open',
+  detail: 'Close your other Brinq windows first, then quit again. Their tabs go back to this window when you close them.',
+}
+
+module.exports = { quitApp, installQuitApp, installQuitGuard, OTHER_WINDOWS_NOTICE }

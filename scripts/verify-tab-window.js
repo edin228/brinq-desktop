@@ -52,10 +52,12 @@ if (argv.includes('--visual-only')) {
 }
 
 // --- Electron verification -------------------------------------------------
-const { app, BrowserWindow, WebContentsView, Menu, clipboard, ipcMain, webContents: allContents } = require('electron')
+const { app, BrowserWindow, WebContentsView, Menu, clipboard, ipcMain, desktopCapturer, webContents: allContents } = require('electron')
 const { pathToFileURL } = require('url')
 const { createWindowSecurity } = require('../src/window-security')
 const { createTabWindow } = require('../src/tab-window')
+const { createTabWindows } = require('../src/tab-windows')
+const { installQuitGuard } = require('../src/quit-app')
 
 const page = (title, body, script = '') => `<!doctype html><html class="light"><head><meta charset="utf-8"><title>${title}</title>
 <style>body{font:14px sans-serif;margin:20px} a,button,input{display:block;margin:8px 0;padding:6px}</style></head>
@@ -91,6 +93,13 @@ const ROUTES = {
   '/slow-client': page('brinq', '<p>Loading client</p>', `setTimeout(() => { document.title = 'brinq | Acme Holdings, LLC' }, 1500)`),
   '/slow-other': page('brinq', '<p>Loading</p>'),
   '/slow-search': page('brinq', '<p>Loading</p>'),
+  // Open in new window: a page with state of its own, a colour the screen
+  // capture can find, a child link and unsaved work once typed into.
+  '/stateful': `<!doctype html><html><head><meta charset="utf-8"><title>brinq | Stateful</title>
+<style>html,body{margin:0;height:100%;background:#ff00aa;font:14px sans-serif} input,button{display:block;margin:20px}</style></head>
+<body><input id="text"><button id="child" onclick="window.open('/clients/9','_blank','noopener,noreferrer')">Child</button>
+<script>window.state = Math.random(); document.getElementById('text').addEventListener('input', () => {
+  window.onbeforeunload = (event) => { event.preventDefault(); event.returnValue = '' } })</script></body></html>`,
   '/dirty': page('brinq | Draft', '<input id="draft" value="">', `
     document.getElementById('draft').addEventListener('input', () => {
       window.onbeforeunload = (event) => { event.preventDefault(); event.returnValue = '' }
@@ -114,7 +123,8 @@ async function main() {
   const security = createWindowSecurity({ baseUrl: base, preloadPath: path.join(ROOT, 'src', 'preload.js'), openExternal: () => {} })
   const answers = []
   const prompts = []
-  const dialog = { showMessageBoxSync: (_owner, options) => { prompts.push(options.message); return answers.shift() ?? 1 } }
+  const promptOwners = []
+  const dialog = { showMessageBoxSync: (owner, options) => { prompts.push(options.message); promptOwners.push(owner); return answers.shift() ?? 1 } }
   const themes = []
   let quitStops = 0
   // The real Menu and clipboard; each menu is kept to read and close it.
@@ -124,6 +134,7 @@ async function main() {
       const menu = Menu.buildFromTemplate(template)
       const record = { menu, shown: false }
       menu.once('menu-will-show', () => { record.shown = true })
+      menu.once('menu-will-close', () => { record.closed = true })
       const popup = menu.popup.bind(menu)
       menu.popup = (options) => { record.options = options; popup(options) }
       menus.push(record)
@@ -131,41 +142,54 @@ async function main() {
     },
   }
   const opened = []
-  const tabs = createTabWindow({
-    electron: { BrowserWindow, WebContentsView, dialog, Menu: recordingMenu, clipboard },
-    openExternal: (url) => { opened.push(url) },
-    security,
-    bounds: { width: 1200, height: 800, x: 0, y: 0 },
-    preloadPath: path.join(ROOT, 'src', 'preload.js'),
-    shellPreloadPath: path.join(ROOT, 'src', 'shell-preload.js'),
-    shellUrl,
-    theme: 'light',
-    newTabUrl: (home) => home.getURL(),
-    onTheme: (theme) => themes.push(theme),
-    onHome: (contents) => contents.loadURL(`${base}/home`),
-    // The same quit wiring main.js uses, with the real app.quit().
+  // Windows are made the way main.js makes them: through tabWindows.
+  let tabs = null
+  const tabWindows = createTabWindows({
+    // The registry's own options (primary, bounds, theme and the move, close
+    // and quit hooks) go through as main.js passes them.
+    create: ({ theme, ...registryOptions }) => createTabWindow({
+      ...registryOptions,
+      electron: { BrowserWindow, WebContentsView, dialog, Menu: recordingMenu, clipboard },
+      openExternal: (url) => { opened.push(url) },
+      security,
+
+      preloadPath: path.join(ROOT, 'src', 'preload.js'),
+      shellPreloadPath: path.join(ROOT, 'src', 'shell-preload.js'),
+      shellUrl,
+      theme,
+      newTabUrl: () => tabs.home.getURL(),
+      onTheme: (value) => themes.push(value),
+      onHome: (contents) => contents.loadURL(`${base}/home`),
+      // The same quit wiring main.js uses, with the real app.quit().
+      isQuitting: () => !!app.isQuitting,
+      requestQuit: () => app.quit(),
+      onQuitStopped: () => { quitStops++; app.isQuitting = false; tabs.window.show() },
+    }),
+    placement: (source) => ({ ...source, x: source.x + 640, y: source.y + 60, width: 900, height: 700 }),
     isQuitting: () => !!app.isQuitting,
-    requestQuit: () => app.quit(),
-    onQuitStopped: () => { quitStops++; app.isQuitting = false; tabs.window.show() },
   })
-  app.on('before-quit', () => { app.isQuitting = true })
+  tabs = tabWindows.addPrimary({ bounds: { width: 1200, height: 800, x: 0, y: 0 }, theme: 'light' })
+  // As main.js: no quit while another window has tabs (registered first).
+  let quitsRefused = 0
+  installQuitGuard({ app, blocked: () => tabWindows.blocksQuit(), onRefused: () => { quitsRefused++ } })
+  app.on('before-quit', (event) => { if (!event.defaultPrevented) app.isQuitting = true })
   app.on('window-all-closed', () => {})
   // Same forwarding as main.js, with timings for the label-to-open gap.
   const labelTimes = []
   const openTimes = []
   ipcMain.on('link-label', (event, payload) => {
     let stored = false
-    try { stored = !!tabs.linkLabel(event, payload) } catch { stored = false } finally { event.returnValue = stored }
+    try { stored = !!tabWindows.linkLabel(event, payload) } catch { stored = false } finally { event.returnValue = stored }
     if (stored) labelTimes.push(performance.now())
   })
   security.setTabHost({
-    available: tabs.available,
-    openTab: (args) => { openTimes.push(performance.now()); return tabs.openTab(args) },
+    available: tabWindows.available,
+    openTab: (args) => { openTimes.push(performance.now()); return tabWindows.openTab(args) },
   })
-  ipcMain.on('tabs:command', (event, command, id, options) => tabs.stripCommand(event, command, id, options))
-  ipcMain.handle('tabs:state', (event) => tabs.stripState(event))
+  ipcMain.on('tabs:command', (event, command, id, options) => tabWindows.stripCommand(event, command, id, options))
+  ipcMain.handle('tabs:state', (event) => tabWindows.stripState(event))
   ipcMain.on('theme-changed', (event, theme) => {
-    if (security.validateSender(event)) tabs.reportTheme(event.sender, theme)
+    if (security.validateSender(event)) tabWindows.reportTheme(event.sender, theme)
   })
   const host = tabs.window
   host.show()
@@ -184,7 +208,7 @@ async function main() {
     }
     return false
   }
-  const stripState = () => host.webContents.executeJavaScript(`({
+  const stripState = () => tabs.strip.executeJavaScript(`({
     labels: [...document.querySelectorAll('.tab-label')].map((node) => node.textContent),
     selected: document.querySelector('.home').getAttribute('aria-selected') === 'true' ? 'home'
       : document.querySelector('.tab.selected .tab-label')?.textContent ?? null,
@@ -213,6 +237,142 @@ async function main() {
     require('child_process').execFileSync(process.env.XDOTOOL, ['mousemove', x, y, 'keydown', 'ctrl', 'click', '1', 'keyup', 'ctrl'])
   }
 
+  // A pixel of the screen, read through the real compositor: proves what a
+  // window actually shows, not only what its pages hold.
+  const screenPixel = async (x, y) => {
+    const [source] = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1600, height: 1000 } })
+    const bitmap = source.thumbnail.toBitmap()
+    const { width } = source.thumbnail.getSize()
+    const at = (y * width + x) * 4
+    return [bitmap[at + 2], bitmap[at + 1], bitmap[at]]
+  }
+  const stripOf = (tabWindow) => tabWindow.strip
+  const stripDom = (tabWindow) => stripOf(tabWindow).executeJavaScript(`({
+    labels: [...document.querySelectorAll('.tab-label')].map((node) => node.textContent),
+    home: !document.querySelector('.home').hidden && getComputedStyle(document.querySelector('.home')).display !== 'none',
+    selected: document.querySelector('.tab.selected .tab-label')?.textContent ?? null,
+  })`)
+
+  async function openInNewWindow() {
+    const windowsBefore = BrowserWindow.getAllWindows().length
+    const page = tabs.openTab({ opener: tabs.home, url: `${base}/stateful`, options: { webPreferences: {} }, referrer: { url: '', policy: 'default' }, background: false })
+    await until(() => !page.isLoading() && page.getURL().endsWith('/stateful'))
+    await click(page, '#text')
+    for (const keyCode of ['h', 'i']) page.sendInputEvent({ type: 'char', keyCode })
+    await until(() => page.executeJavaScript('document.getElementById("text").value === "hi"'))
+    const state = await page.executeJavaScript('window.state')
+    const requested = requests['/stateful']
+    const id = tabs.stripState({ sender: tabs.strip, senderFrame: tabs.strip.mainFrame }).selectedId
+    // The tab menu offers it; Ctrl+Shift+N in the page does it.
+    await tabs.strip.executeJavaScript(`document.querySelector('.tab.selected').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 200, clientY: 20, button: 2 }))`)
+    await until(() => menus.at(-1)?.shown)
+    const item = menus.at(-1).menu.items.find((entry) => entry.label === 'Open in new window')
+    check('the tab menu offers Open in new window, enabled, with its shortcut', item?.enabled === true && item.accelerator === 'CmdOrCtrl+Shift+N')
+    menus.at(-1).menu.closePopup(host)
+    await wait(200)
+    page.focus()
+    for (const type of ['keyDown', 'keyUp']) page.sendInputEvent({ type, keyCode: 'N', modifiers: ['control', 'shift'] })
+    check('Ctrl+Shift+N opens a new Brinq window', await until(() => BrowserWindow.getAllWindows().length === windowsBefore + 1))
+    const second = tabWindows.all()[1]
+    check('the new window shows', await until(() => second.window.isVisible()))
+    check('the page moved, not copied: same document, typed text kept',
+      second.isTab(page) && !tabs.isTab(page) && (await page.executeJavaScript('[window.state, document.getElementById("text").value]')).join() === [state, 'hi'].join())
+    check('the move made no request (no reload)', requests['/stateful'] === requested, `${requests['/stateful']} vs ${requested}`)
+    check('the new strip shows the tab and no Home', await until(async () => {
+      const dom = await stripDom(second)
+      return dom.labels.join() === 'Stateful' && !dom.home && dom.selected === 'Stateful'
+    }))
+    check('the main strip no longer shows it', !(await stripDom(tabs)).labels.includes('Stateful'))
+    check('the moved page keeps its native authority', security.validateSender({ sender: page, senderFrame: page.mainFrame }))
+    check('the window title follows the moved tab', await until(() => second.window.getTitle() === 'Stateful', 2000), second.window.getTitle())
+    check('the new window has the same strip, and its own page stays empty',
+      second.strip.getURL() === shellUrl && second.window.webContents.getURL() === '')
+    // What the new window actually paints: the page's own colour below its strip.
+    second.window.moveTop()
+    second.window.focus()
+    await wait(600)
+    const content = second.window.getContentBounds()
+    // Sampled where only the new window is: Xvfb has no window manager to stack them.
+    const magenta = (value) => value[0] > 230 && value[1] < 30 && value[2] > 150
+    const sample = () => screenPixel(content.x + content.width - 60, content.y + 300)
+    let pixel = await sample()
+    const timeline = [[0, pixel]]
+    for (const ms of [500, 1000, 2000]) {
+      if (magenta(pixel)) break
+      await wait(ms)
+      pixel = await sample()
+      timeline.push([ms, pixel])
+    }
+    if (!magenta(pixel)) {
+      const view = second.window.contentView.children.find((child) => child.webContents === page)
+      view.setVisible(false)
+      await wait(200)
+      view.setVisible(true)
+      await wait(500)
+      timeline.push(['toggled', await sample()])
+      page.invalidate()
+      await wait(500)
+      timeline.push(['invalidated', await sample()])
+      second.window.setSize(901, 700)
+      await wait(500)
+      timeline.push(['resized', await sample()])
+    }
+    console.log('PAINT TIMELINE', JSON.stringify(timeline))
+    check('the new window paints the moved page', pixel[0] > 230 && pixel[1] < 30 && pixel[2] > 150,
+      JSON.stringify({
+        pixel, content, main: host.getContentBounds(), visible: second.window.isVisible(),
+        views: second.window.contentView.children.map((view) => ({ bounds: view.getBounds(), visible: view.getVisible?.(), page: view.webContents === page })),
+        viewport: await page.executeJavaScript('[innerWidth, innerHeight, getComputedStyle(document.body).backgroundColor]'),
+        samples: [await screenPixel(content.x + 100, content.y + 100), await screenPixel(content.x + 100, content.y + 20), await screenPixel(content.x + 450, content.y + 650)],
+      }))
+    check('keyboard focus is in the moved page', await until(() => page.isFocused(), 2000))
+    // Links from the moved page open in its window.
+    await click(page, '#child')
+    check('a tab the moved page opens joins its window', await until(() => second.tabCount() === 2 && !tabs.isTab(allContents.getAllWebContents().find((wc) => wc.getURL().endsWith('/clients/9')))))
+    await until(async () => (await stripDom(second)).labels.length === 2)
+    // Its unsaved-work prompt belongs to the new window.
+    second.select((await second.stripState({ sender: stripOf(second), senderFrame: stripOf(second).mainFrame })).tabs[0].id)
+    const pageId = second.stripState({ sender: stripOf(second), senderFrame: stripOf(second).mainFrame }).tabs[0].id
+    answers.push(1)
+    const promptsBefore = prompts.length
+    second.closeTab(pageId)
+    await until(() => prompts.length === promptsBefore + 1)
+    check('closing the moved tab asks in its new window, and Stay keeps it',
+      promptOwners.at(-1) === second.window && !page.isDestroyed(), String(promptOwners.at(-1)?.id))
+    // Its close button gives both tabs back to the main window, live.
+    await wait(300)
+    const promptsBeforeX = prompts.length
+    second.window.close()
+    const gaveBack = await until(() => second.window.isDestroyed() && tabs.isTab(page))
+    check('the close button gives its tabs back to the main window', gaveBack && tabWindows.all().length === 1 && prompts.length === promptsBeforeX,
+      JSON.stringify({ destroyed: second.window.isDestroyed(), inMain: tabs.isTab(page), inSecond: !second.window.isDestroyed() && second.isTab(page),
+        windows: tabWindows.all().length, prompts: prompts.slice(promptsBeforeX), closing: tabWindows.all().map((each) => each.closingIds()) }))
+    check('the page came back unchanged and unreloaded',
+      (await page.executeJavaScript('[window.state, document.getElementById("text").value]')).join() === [state, 'hi'].join() &&
+      requests['/stateful'] === requested)
+    check('the main strip shows them again, the page selected', await until(async () => {
+      const dom = await stripDom(tabs)
+      return dom.labels.includes('Stateful') && dom.labels.includes('/clients/9') && dom.selected === 'Stateful'
+    }))
+    const back = tabs.window.getContentBounds()
+    await wait(400)
+    check('the main window paints the page that came back', (await screenPixel(back.x + 300, back.y + 300))[1] < 30)
+    // Out again, then closing its last tab closes the window.
+    tabs.window.focus()
+    page.focus()
+    for (const type of ['keyDown', 'keyUp']) page.sendInputEvent({ type, keyCode: 'N', modifiers: ['control', 'shift'] })
+    await until(() => tabWindows.all().length === 2)
+    const third = tabWindows.all()[1]
+    await until(() => third.window.isVisible())
+    answers.push(0)
+    third.closeTab(third.tabIds()[0])
+    check('closing its last tab closes the window', await until(() => third.window.isDestroyed() && page.isDestroyed()),
+      JSON.stringify({ window: third.window.isDestroyed(), page: page.isDestroyed(), prompts: prompts.slice(promptsBefore) }))
+    const child = allContents.getAllWebContents().find((wc) => !wc.isDestroyed() && wc.getURL().endsWith('/clients/9'))
+    if (child) { child.close(); await until(() => child.isDestroyed()) }
+    check('the main window and Home are untouched', !host.isDestroyed() && !tabs.home.isDestroyed() && tabWindows.all().length === 1)
+  }
+
   try {
     await until(() => tabs.home.getURL().endsWith('/home') && !tabs.home.isLoading())
     await until(async () => (await stripState()).selected === 'home')
@@ -229,7 +389,7 @@ async function main() {
     check('a background tab lays out at full size', hiddenSize[0] === 1200 && hiddenSize[1] === 760, JSON.stringify(hiddenSize))
     host.setContentSize(1000, 700)
     await wait(300)
-    tabs.select(await host.webContents.executeJavaScript('Number(document.querySelector(".tab .tab-select").id.slice(4))'))
+    tabs.select(await tabs.strip.executeJavaScript('Number(document.querySelector(".tab .tab-select").id.slice(4))'))
     const shownSize = await until(async () => JSON.stringify(await clientTab.executeJavaScript('[innerWidth, innerHeight]')) === '[1000,660]')
     check('a background tab takes the current size when shown', shownSize)
     host.setContentSize(1200, 800)
@@ -245,9 +405,9 @@ async function main() {
 
     if (process.env.XDOTOOL) {
       // Real pointer drag in the strip: first tab to the end.
-      const stripOrder = () => host.webContents.executeJavaScript(`[...document.querySelectorAll('.tab-select')].map((node) => node.id)`)
+      const stripOrder = () => tabs.strip.executeJavaScript(`[...document.querySelectorAll('.tab-select')].map((node) => node.id)`)
       const before = await stripOrder()
-      const boxes = await host.webContents.executeJavaScript(`[...document.querySelectorAll('.tab')].map((node) => { const box = node.getBoundingClientRect(); return [Math.round(box.x + 40), Math.round(box.y + box.height / 2)] })`)
+      const boxes = await tabs.strip.executeJavaScript(`[...document.querySelectorAll('.tab')].map((node) => { const box = node.getBoundingClientRect(); return [Math.round(box.x + 40), Math.round(box.y + box.height / 2)] })`)
       const content = host.getContentBounds()
       const [fromX, y] = boxes[0]
       const toX = boxes[boxes.length - 1][0] + 60
@@ -262,9 +422,9 @@ async function main() {
 
       // Plain real clicks select, including a press that wobbles under the
       // drag threshold.
-      const selectedId = () => host.webContents.executeJavaScript(`document.querySelector('.tab.selected .tab-select')?.id ?? 'home'`)
+      const selectedId = () => tabs.strip.executeJavaScript(`document.querySelector('.tab.selected .tab-select')?.id ?? 'home'`)
       const after = await stripOrder()
-      const centers = await host.webContents.executeJavaScript(`[...document.querySelectorAll('.tab')].map((node) => { const box = node.getBoundingClientRect(); return [Math.round(box.x + 60), Math.round(box.y + box.height / 2)] })`)
+      const centers = await tabs.strip.executeJavaScript(`[...document.querySelectorAll('.tab')].map((node) => { const box = node.getBoundingClientRect(); return [Math.round(box.x + 60), Math.round(box.y + box.height / 2)] })`)
       xdo('mousemove', content.x + centers[0][0], content.y + centers[0][1], 'click', '1')
       check('a plain click selects a tab', await until(async () => (await selectedId()) === after[0]))
       xdo('mousemove', content.x + centers[1][0], content.y + centers[1][1], 'mousedown', '1')
@@ -305,7 +465,7 @@ async function main() {
     await click(dirtyTab, '#draft')
     dirtyTab.sendInputEvent({ type: 'char', keyCode: 'x' })
     await until(() => dirtyTab.executeJavaScript('document.getElementById("draft").value === "x"'))
-    const dirtyId = (await host.webContents.executeJavaScript('Number(document.querySelector(".tab.selected .tab-select").id.slice(4))'))
+    const dirtyId = (await tabs.strip.executeJavaScript('Number(document.querySelector(".tab.selected .tab-select").id.slice(4))'))
     answers.push(1)
     tabs.closeTab(dirtyId)
     await wait(800)
@@ -325,7 +485,7 @@ async function main() {
     check('a background tab does not repaint the header', (await stripState()).theme === 'dark')
 
     // Tab menu: real right-clicks and keys in the strip, real menu and clipboard.
-    const stripPoint = (selector) => host.webContents.executeJavaScript(`(() => {
+    const stripPoint = (selector) => tabs.strip.executeJavaScript(`(() => {
       const box = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect()
       return { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2), left: Math.round(box.left), bottom: Math.round(box.bottom) }
     })()`)
@@ -338,14 +498,14 @@ async function main() {
     }
     const rightClick = async (selector) => {
       const { x, y } = await stripPoint(selector)
-      for (const type of ['mouseDown', 'mouseUp']) host.webContents.sendInputEvent({ type, x, y, button: 'right', clickCount: 1 })
+      for (const type of ['mouseDown', 'mouseUp']) tabs.strip.sendInputEvent({ type, x, y, button: 'right', clickCount: 1 })
       return { x, y }
     }
     // The client tab moves to a call recording without a full navigation.
     const recording = `${base}/clients/1/calls/rec_9?standalone=full&t=95#transcript`
     await clientTab.executeJavaScript(`history.pushState(null, '', ${JSON.stringify(recording.slice(base.length))}); document.title = 'brinq | Call recording'`)
     await until(async () => clientTab.getURL() === recording && (await stripState()).labels.includes('Call recording'))
-    const clientSelector = await host.webContents.executeJavaScript(
+    const clientSelector = await tabs.strip.executeJavaScript(
       `'#' + [...document.querySelectorAll('.tab-select')].find((node) => node.textContent === 'Call recording').id`)
     await clipboard.writeText('before')
     const at = await rightClick(clientSelector)
@@ -353,7 +513,7 @@ async function main() {
     check('right-clicking a tab opens its menu at the pointer', clientMenu && clientMenu.options.window === host &&
       clientMenu.options.x === at.x && clientMenu.options.y === at.y, JSON.stringify(clientMenu?.options && { x: clientMenu.options.x, y: clientMenu.options.y, at }))
     check('the menu has Copy link and Open in browser, both enabled',
-      JSON.stringify(clientMenu?.menu.items.map(({ label, enabled }) => [label, enabled])) === JSON.stringify([['Copy link', true], ['Open in browser', true]]))
+      JSON.stringify(clientMenu?.menu.items.slice(0, 2).map(({ label, enabled }) => [label, enabled])) === JSON.stringify([['Copy link', true], ['Open in browser', true]]))
     clientMenu?.menu.items[0].click()
     const copiedText = async (expected) => (await until(async () => (await clipboard.readText()) === expected, 2000)) || clipboard.readText()
     check('Copy link puts the page\'s browser link on the clipboard', (await copiedText(`${base}/clients/1/calls/rec_9?t=95#transcript`)) === true)
@@ -367,13 +527,13 @@ async function main() {
     const homeCopy = await copiedText(`${base}/home`)
     check('Home has the menu too, with its page as the link', menus.length === 2 && homeCopy === true, String(homeCopy))
     // Keyboard: the Menu key and Shift+F10 open it once, below the focused tab.
-    await host.webContents.executeJavaScript(`document.querySelector(${JSON.stringify(clientSelector)}).focus()`)
-    host.webContents.focus()
+    await tabs.strip.executeJavaScript(`document.querySelector(${JSON.stringify(clientSelector)}).focus()`)
+    tabs.strip.focus()
     const below = await stripPoint(`.tab:has(> ${clientSelector})`)
     // Synthetic input has no Menu key; that press uses real X input.
     const keys = [['Shift+F10', () => {
-      host.webContents.sendInputEvent({ type: 'rawKeyDown', keyCode: 'F10', modifiers: ['shift'] })
-      host.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'F10', modifiers: ['shift'] })
+      tabs.strip.sendInputEvent({ type: 'rawKeyDown', keyCode: 'F10', modifiers: ['shift'] })
+      tabs.strip.sendInputEvent({ type: 'keyUp', keyCode: 'F10', modifiers: ['shift'] })
     }]]
     if (process.env.XDOTOOL) keys.push(['the Menu key', () => require('child_process').execFileSync(process.env.XDOTOOL, ['key', 'Menu'])])
     else console.log('SKIP the Menu key: set XDOTOOL to a real input tool')
@@ -390,12 +550,13 @@ async function main() {
     // A menu request with no pointer, such as a screen reader's, comes the
     // way Chromium sends the Menu key's: a PointerEvent with button -1.
     const beforeAssistive = menus.length
-    await host.webContents.executeJavaScript(`document.querySelector(${JSON.stringify(clientSelector)}).dispatchEvent(new PointerEvent('contextmenu', { bubbles: true, cancelable: true, button: -1 }))`)
+    await tabs.strip.executeJavaScript(`document.querySelector(${JSON.stringify(clientSelector)}).dispatchEvent(new PointerEvent('contextmenu', { bubbles: true, cancelable: true, button: -1 }))`)
     const assistive = await takeMenu(beforeAssistive + 1)
     check('a menu request without a pointer opens below the tab', assistive && assistive.options.x === below.left && assistive.options.y === below.bottom,
       JSON.stringify(assistive?.options && [assistive.options.x, assistive.options.y]))
     tabs.selectHome()
 
+    console.log('MENUS OPEN before labels', JSON.stringify(menus.map((record) => [record.shown, !!record.closed])))
     // Link labels name background tabs before their pages do.
     await tabs.home.loadURL(`${base}/labels`)
     const labelsBefore = labelTimes.length
@@ -490,17 +651,41 @@ async function main() {
     tabs.closeTab(restored[0].id)
     await until(() => loadedA.isDestroyed())
 
+    await openInNewWindow()
+
     // A real app.quit() with a hidden tab holding unsaved work.
     const quitTab = tabs.openTab({ opener: tabs.home, url: `${base}/dirty`, options: { webPreferences: {} }, referrer: { url: '', policy: 'default' }, background: false })
     await until(() => !quitTab.isLoading())
     await click(quitTab, '#draft')
     quitTab.sendInputEvent({ type: 'char', keyCode: 'y' })
     await until(() => quitTab.executeJavaScript('document.getElementById("draft").value === "y"'))
+    // A second window with unsaved work of its own (set up first: moving the
+    // selected tab out selects its neighbour, which would load a restored one).
+    const elsewhere = tabs.openTab({ opener: tabs.home, url: `${base}/stateful`, options: { webPreferences: {} }, referrer: { url: '', policy: 'default' }, background: false })
+    await until(() => !elsewhere.isLoading() && elsewhere.getURL().endsWith('/stateful'))
+    await click(elsewhere, '#text')
+    elsewhere.sendInputEvent({ type: 'char', keyCode: 'z' })
+    await until(() => elsewhere.executeJavaScript('document.getElementById("text").value === "z"'))
+    tabWindows.moveToNewWindow(tabs, tabs.stripState({ sender: tabs.strip, senderFrame: tabs.strip.mainFrame }).selectedId)
+    const quitSecond = tabWindows.all()[1]
+    await until(() => quitSecond?.window.isVisible())
     // Two restored tabs after the guarded one; quitting must not load them.
     tabs.restoreTabs(['/restored-c', '/restored-d'].map((route) => ({ url: `${base}${route}`, label: route })))
     tabs.selectHome()
+    // A quit while the other window has tabs is refused before anything closes.
+    const promptsBeforeRefused = prompts.length
+    app.quit()
+    await wait(500)
+    check('a quit is refused while another window has tabs, and nothing closes',
+      quitsRefused === 1 && !app.isQuitting && prompts.length === promptsBeforeRefused &&
+      !quitSecond.window.isDestroyed() && !elsewhere.isDestroyed() && !quitTab.isDestroyed() && !tabs.home.isDestroyed())
+    // Its close button gives the tab back; then the quit runs as before.
+    quitSecond.window.close()
+    await until(() => quitSecond.window.isDestroyed() && tabs.isTab(elsewhere))
+    tabs.selectHome()
     host.hide()
     const promptsBeforeQuit = prompts.length
+    const ownersBeforeQuit = promptOwners.length
     answers.push(1)
     app.quit()
     const quitStopped = await until(() => quitStops === 1)
@@ -508,17 +693,21 @@ async function main() {
       JSON.stringify({ quitStops, destroyed: quitTab.isDestroyed(), quitting: app.isQuitting, prompts: prompts.length, answers }))
     check('the stopped quit shows the window and the tab with unsaved work', host.isVisible() && tabs.isTab(quitTab))
     check('Stay prompted once and loaded no restored tab', prompts.length === promptsBeforeQuit + 1 && !requests['/restored-c'] && !requests['/restored-d'])
+    check('the prompts came in the main window, which now holds the given-back tab',
+      tabs.isTab(elsewhere) && !elsewhere.isDestroyed() && promptOwners.slice(ownersBeforeQuit).every((owner) => owner === host))
     let quitState = null
     app.once('will-quit', (event) => {
       // Keep the harness alive to report; record what quitting left behind.
       event.preventDefault()
       quitState = { host: host.isDestroyed(), tabs: tabPages().length, home: tabs.home.isDestroyed() }
     })
-    answers.push(0)
+    answers.push(0, 0)
     app.quit()
     check('Leave completes the quit after every tab and Home closed', await until(() => quitState !== null),
       JSON.stringify(quitState))
-    check('quit left no pages and closed the window', quitState?.host === true && quitState?.tabs === 0 && quitState?.home === true)
+    check('quit left no pages and closed the window', quitState?.host === true && quitState?.tabs === 0 && quitState?.home === true &&
+      elsewhere.isDestroyed())
+    check('each page with unsaved work was asked once, one at a time', prompts.length === promptsBeforeQuit + 3, String(prompts.length - promptsBeforeQuit))
     check('closing the selected guarded tab during quit loaded neither restored neighbour', !requests['/restored-c'] && !requests['/restored-d'], JSON.stringify(requests))
   } catch (error) {
     check('harness completed', false, error?.stack || String(error))
