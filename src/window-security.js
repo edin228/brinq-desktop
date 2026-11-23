@@ -89,17 +89,24 @@ function createWindowSecurity({ baseUrl, preloadPath, openExternal }) {
     ownedBy.get(entry.owner)?.delete(wc)
   }
 
+  function pagesOf(owner) {
+    if (!ownedBy.has(owner)) {
+      const pages = new Set()
+      ownedBy.set(owner, pages)
+      // Only pages this window still owns lose their authority with it.
+      owner.once('closed', () => {
+        for (const page of [...pages]) if (entries.get(page)?.owner === owner) forget(page)
+      })
+    }
+    return ownedBy.get(owner)
+  }
+
   // `owner` is the window whose lifetime bounds this page's authority.
   function register(wc, role, url, owner) {
     const entry = { owner, role, url, generation: 0, navigating: false }
     entries.set(wc, entry)
     wc.once('destroyed', () => { if (entries.get(wc) === entry) forget(wc) })
-    if (!ownedBy.has(owner)) {
-      const pages = new Set()
-      ownedBy.set(owner, pages)
-      owner.once('closed', () => { for (const page of [...pages]) forget(page) })
-    }
-    ownedBy.get(owner).add(wc)
+    pagesOf(owner).add(wc)
     wc.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
       if (isMainFrame && !isInPlace) { entry.generation++; entry.navigating = true }
     })
@@ -178,8 +185,22 @@ function createWindowSecurity({ baseUrl, preloadPath, openExternal }) {
     return [...entries.keys()].filter((wc) => validateSender({ sender: wc, senderFrame: wc.mainFrame }))
   }
 
+  // A tab page moved to another window keeps its document and its authority,
+  // which from now on ends with the new window instead of the old one. The
+  // generation stays: the document did not change, so work it already
+  // started (a download) stays valid.
+  function reassign(wc, owner) {
+    const entry = entries.get(wc)
+    if (!entry || !APP_ROLES.includes(entry.role) || !owner || owner.isDestroyed()) return false
+    if (entry.owner === owner) return true
+    ownedBy.get(entry.owner)?.delete(wc)
+    entry.owner = owner
+    pagesOf(owner).add(wc)
+    return true
+  }
+
   return {
-    register, validateSender, validateViewerSender, captureSender, appContents, isAppUrl,
+    register, reassign, validateSender, validateViewerSender, captureSender, appContents, isAppUrl,
     setTabHost(host) { tabHost = host },
   }
 }

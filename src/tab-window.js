@@ -1,8 +1,10 @@
 const { HOME_ID, createTabList, tabKind, pageTitle, tabLabel, linkLabelText, shareableUrl, shortcutAction } = require('./tabs')
 const { confirmLeave } = require('./unload-guard')
 
-// Owns the main window: a local tab strip in the window's own page and one
-// WebContentsView per Brinq tab below it. Home is the permanent base tab.
+// Owns one Brinq window: a local tab strip in the window's own page and one
+// WebContentsView per Brinq tab below it. In the main (primary) window Home
+// is the permanent base tab; a secondary window holds only tabs moved to it
+// and closes when its last tab goes.
 const STRIP_HEIGHT = 40
 // Native overlay colors match the web theme's layer-0 and regular text.
 const THEME_COLORS = {
@@ -35,6 +37,10 @@ function createTabWindow({
   updateView = () => null, onUpdateCommand = () => {},
   // Startup tabs: receives the tab list (addresses only) after each change.
   onTabsChanged = () => {},
+  // Several windows: only the primary window has Home. onNewWindow(id) asks
+  // to move a tab of this window into a new window; canMove(contents) says
+  // whether main has something open for that page (a Save As dialog).
+  primary = true, onNewWindow = () => false, canMove = () => true,
 }) {
   const appPreferences = () => ({
     preload: preloadPath, contextIsolation: true, nodeIntegration: false,
@@ -57,7 +63,7 @@ function createTabWindow({
     },
   })
   const strip = host.webContents
-  const list = createTabList()
+  const list = createTabList({ home: primary })
   const entries = new Map()
   const byContents = new Map()
   let pushScheduled = false
@@ -65,9 +71,10 @@ function createTabWindow({
   let quitting = null
   // Each quit's close loop; abandonQuit() retires the current one.
   let quitAttempt = 0
-  // One pending link label per opener page: its latest gesture.
+  // One pending link label per opener page: its latest gesture. Each watched
+  // opener maps to the removal of its listeners.
   const linkLabels = new Map()
-  const watchedOpeners = new WeakSet()
+  const watchedOpeners = new Map()
 
   const alive = () => !disposed && !host.isDestroyed()
   const entryFor = (contents) => byContents.get(contents)
@@ -77,7 +84,8 @@ function createTabWindow({
     return {
       platform,
       theme,
-      selectedId: list.selected(),
+      hasHome: primary,
+      selectedId: list.selected() ?? null,
       tabs: list.ids().filter((id) => entries.has(id)).map((id) => {
         const entry = entries.get(id)
         return {
@@ -188,6 +196,10 @@ function createTabWindow({
     const entry = entryFor(contents) || selectedEntry()
     if (action === 'new') return newTab()
     if (action === 'close') return entry && closeTab(entry.id)
+    if (action === 'new-window') {
+      const target = selectedEntry()
+      return !!target && movable(target, { newWindow: true }) && onNewWindow(target.id)
+    }
     if (action === 'move-left' || action === 'move-right') {
       const id = list.selected()
       const position = list.ids().indexOf(id) + (action === 'move-left' ? -1 : 1)
@@ -268,9 +280,13 @@ function createTabWindow({
       else push()
     }
     entry.settle?.(true)
+    // Its last tab closed: a secondary window goes too.
+    if (!primary && entries.size === 0) schedule(closeIfEmpty)
   }
 
-  function attach(entry) {
+  // `adopted`: the page moved here from another window. It keeps its
+  // security registration, which now belongs to this window.
+  function attach(entry, { adopted = false } = {}) {
     const { contents, view } = entry
     entries.set(entry.id, entry)
     byContents.set(contents, entry)
@@ -280,8 +296,23 @@ function createTabWindow({
     host.contentView.addChildView(view)
     layout()
     view.setVisible(false)
-    contents.on('before-input-event', (event, input) => onInput(event, input, contents))
-    contents.on('page-title-updated', (_event, title) => {
+    entry.unbind = bind(entry)
+    if (adopted) {
+      if (!security.reassign(contents, host)) throw new Error('The tab page is no longer registered.')
+    } else security.register(contents, entry.id === HOME_ID ? 'main' : 'app', undefined, host)
+  }
+
+  // This window's handlers for one tab page. Returns their removal, so a tab
+  // that moves to another window leaves nothing bound to this one.
+  function bind(entry) {
+    const { contents } = entry
+    const removals = []
+    const on = (name, listener) => {
+      contents.on(name, listener)
+      removals.push(() => contents.removeListener(name, listener))
+    }
+    on('before-input-event', (event, input) => onInput(event, input, contents))
+    on('page-title-updated', (_event, title) => {
       entry.title = title
       // The page named itself; the link's name is no longer needed.
       if (pageTitle(title)) entry.provisional = null
@@ -293,12 +324,12 @@ function createTabWindow({
       if (security.isAppUrl(url)) entry.url = url
       push()
     }
-    contents.on('did-navigate', (_event, url) => committed(url))
-    contents.on('did-navigate-in-page', (_event, url, isMainFrame) => { if (isMainFrame) committed(url) })
-    contents.on('did-start-loading', () => { entry.loading = true; push() })
-    contents.on('did-stop-loading', () => { entry.loading = false; push() })
-    contents.on('did-finish-load', () => requestTheme(entry))
-    contents.on('will-prevent-unload', (event) => {
+    on('did-navigate', (_event, url) => committed(url))
+    on('did-navigate-in-page', (_event, url, isMainFrame) => { if (isMainFrame) committed(url) })
+    on('did-start-loading', () => { entry.loading = true; push() })
+    on('did-stop-loading', () => { entry.loading = false; push() })
+    on('did-finish-load', () => requestTheme(entry))
+    on('will-prevent-unload', (event) => {
       if (confirmTabLeave(entry)) {
         event.preventDefault()
         return
@@ -308,7 +339,7 @@ function createTabWindow({
       entry.settle?.(false)
     })
     if (entry.id !== HOME_ID) {
-      contents.on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
+      on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
         if (!isMainFrame || code === -3 || entry.closing) return
         if (url && security.isAppUrl(url)) entry.url = url
         entry.failed = 'load'
@@ -316,7 +347,7 @@ function createTabWindow({
         showSelected()
         push()
       })
-      contents.on('render-process-gone', () => {
+      on('render-process-gone', () => {
         if (entry.closing) return
         entry.failed = 'crash'
         entry.loading = false
@@ -324,8 +355,20 @@ function createTabWindow({
         push()
       })
     }
-    contents.once('destroyed', () => forget(entry))
-    security.register(contents, entry.id === HOME_ID ? 'main' : 'app', undefined, host)
+    // Emitted once; a plain listener so a move can remove it.
+    on('destroyed', () => forget(entry))
+    return () => { for (const remove of removals.splice(0)) remove() }
+  }
+
+  // Undoes attach without closing the page: the view, the maps, the list and
+  // this window's handlers. The caller decides what happens to the page.
+  function unattach(entry) {
+    entries.delete(entry.id)
+    byContents.delete(entry.contents)
+    if (entry.id !== HOME_ID) list.remove(entry.id)
+    try { entry.unbind?.() } catch {}
+    entry.unbind = null
+    try { host.contentView.removeChildView(entry.view) } catch {}
   }
 
   function addTab({ contents: guest = null, webPreferences, url, afterId, background, id: fixedId, provisional = null, lazy = false }) {
@@ -347,10 +390,7 @@ function createTabWindow({
     } catch (error) {
       // A view that failed to attach must not linger in the strip or the
       // session list: undo every step attach may have taken.
-      entries.delete(id)
-      byContents.delete(entry.contents)
-      if (id !== HOME_ID) list.remove(id)
-      try { host.contentView.removeChildView(view) } catch {}
+      unattach(entry)
       try { if (!entry.contents.isDestroyed()) entry.contents.close() } catch {}
       push()
       throw error
@@ -408,11 +448,26 @@ function createTabWindow({
 
   function watchOpener(opener) {
     if (watchedOpeners.has(opener)) return
-    watchedOpeners.add(opener)
     const forget = () => linkLabels.delete(opener)
-    opener.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => { if (isMainFrame) forget() })
-    opener.on('did-navigate-in-page', (_event, _url, isMainFrame) => { if (isMainFrame) forget() })
-    opener.once('destroyed', forget)
+    const started = (_event, _url, _inPlace, isMainFrame) => { if (isMainFrame) forget() }
+    const inPage = (_event, _url, isMainFrame) => { if (isMainFrame) forget() }
+    const destroyed = () => unwatchOpener(opener)
+    opener.on('did-start-navigation', started)
+    opener.on('did-navigate-in-page', inPage)
+    opener.on('destroyed', destroyed)
+    watchedOpeners.set(opener, () => {
+      opener.removeListener('did-start-navigation', started)
+      opener.removeListener('did-navigate-in-page', inPage)
+      opener.removeListener('destroyed', destroyed)
+    })
+  }
+
+  // Drops an opener's pending label and this window's listeners on it.
+  function unwatchOpener(opener) {
+    linkLabels.delete(opener)
+    const remove = watchedOpeners.get(opener)
+    watchedOpeners.delete(opener)
+    try { remove?.() } catch {}
   }
 
   // The next tab this opener opens takes its pending label, once, and only
@@ -456,6 +511,70 @@ function createTabWindow({
     entry.focusAfterClose = focus
     requestClose(entry)
     return true
+  }
+
+  // A tab can move to another window when it is an ordinary tab with a live
+  // page that is not closing, reloading after a failure or showing a native
+  // dialog, outside a quit. Into a new window, not the only tab of a
+  // secondary window: that would only replace its window.
+  function movable(entry, { newWindow = false } = {}) {
+    return !!entry && alive() && entry.id !== HOME_ID && entries.get(entry.id) === entry &&
+      !entry.closing && !entry.retrying && !quitBlocked() && !entry.contents.isDestroyed() &&
+      !(newWindow && !primary && entries.size < 2) && canMove(entry.contents)
+  }
+
+  // Takes a tab out of this window without closing its page. Returns what
+  // adoptTab needs, or null when the tab cannot move. Never settles a close
+  // and never rebuilds Home: the page is still open, elsewhere.
+  function detachTab(id) {
+    const entry = entries.get(id)
+    if (!movable(entry)) return null
+    // Positions count Home as 0 in every window (see tabs.js).
+    const position = list.ids().indexOf(id) + (primary ? 0 : 1)
+    const selected = list.selected() === id
+    unwatchOpener(entry.contents)
+    unattach(entry)
+    if (selected && entries.has(list.selected())) select(list.selected(), { focus: false })
+    else push()
+    return {
+      position, selected,
+      record: {
+        view: entry.view, contents: entry.contents, url: entry.url, title: entry.title,
+        loading: entry.loading, failed: entry.failed, theme: entry.theme, stayedAt: entry.stayedAt,
+        pending: entry.pending, restored: entry.restored,
+        provisional: entry.provisional, provisionalUrl: entry.provisionalUrl,
+      },
+    }
+  }
+
+  // Adds a page detached from another window (or put back after a failed
+  // move) as a new tab with an id of this window. Throws, leaving this
+  // window as it was, if the page cannot be attached here.
+  function adoptTab(moved, { position, select: selectIt = true } = {}) {
+    if (!alive() || quitBlocked() || !moved?.record || moved.record.contents.isDestroyed()) {
+      throw new Error('This window cannot take the tab.')
+    }
+    const record = moved.record
+    const id = list.add()
+    if (position !== undefined) list.move(id, position)
+    const entry = {
+      ...record, id, closing: false, retrying: false,
+    }
+    try {
+      attach(entry, { adopted: true })
+    } catch (error) {
+      unattach(entry)
+      push()
+      throw error
+    }
+    if (selectIt) select(id)
+    else { showSelected(); push() }
+    return id
+  }
+
+  // A secondary window with no tabs left closes.
+  function closeIfEmpty() {
+    if (!primary && alive() && entries.size === 0) host.close()
   }
 
   // Reorders a tab; Home keeps the first position.
@@ -583,9 +702,18 @@ function createTabWindow({
       x < 0 || x > width || y < 0 || y > STRIP_HEIGHT) return false
     const link = shareLink(entries.get(id))
     const quietly = (action) => () => { try { Promise.resolve(action()).catch(() => {}) } catch {} }
+    const entry = entries.get(id)
     Menu.buildFromTemplate([
       { label: 'Copy link', enabled: !!link, click: quietly(() => clipboard.writeText(link)) },
       { label: 'Open in browser', enabled: !!link, click: quietly(() => openExternal(link)) },
+      { type: 'separator' },
+      // The shortcut is handled with the other tab keys; the menu only shows it.
+      {
+        label: 'Open in new window', accelerator: 'CmdOrCtrl+Shift+N', registerAccelerator: false,
+        enabled: movable(entry, { newWindow: true }),
+        // Checked again on click: the tab may have changed while the menu was open.
+        click: quietly(() => { if (entries.get(id) === entry && movable(entry, { newWindow: true })) onNewWindow(id) }),
+      },
     ]).popup({
       window: host, x, y, sourceType: keyboard ? 'keyboard' : 'mouse',
       // A click left the strip focused: give focus back to the page, as a
@@ -601,7 +729,7 @@ function createTabWindow({
   function stripCommand(event, command, id, options) {
     if (!validStripSender(event)) return false
     if (command === 'new') return newTab(), true
-    if (command === 'home') return select(HOME_ID, { focus: options?.focus === true })
+    if (command === 'home') return primary && select(HOME_ID, { focus: options?.focus === true })
     if (command === 'reload') return dispatch('reload'), true
     if (command === 'restart-update' || command === 'retry-update') return onUpdateCommand(command), true
     if (!Number.isSafeInteger(id) || !entries.has(id)) return false
@@ -657,6 +785,7 @@ function createTabWindow({
   let home = null
   let lastHomeUrl = null
   function createHome(url = null) {
+    if (!primary) return
     home = addTab({ id: HOME_ID, webPreferences: appPreferences(), url, background: true })
     showSelected()
     onHome(home.contents, url)
@@ -666,6 +795,7 @@ function createTabWindow({
 
   function dispose() {
     if (disposed) return
+    for (const opener of [...watchedOpeners.keys()]) unwatchOpener(opener)
     linkLabels.clear()
     for (const entry of entries.values()) {
       if (!entry.contents.isDestroyed()) entry.contents.close()
@@ -676,14 +806,15 @@ function createTabWindow({
 
   return {
     window: host,
-    get home() { return home.contents },
+    primary,
+    get home() { return home?.contents ?? null },
     available: alive,
     openTab,
     newTab,
     select,
     selectHome: () => select(HOME_ID),
     // After a stopped quit closed Home, bring it back on its last page.
-    ensureHome() { if (alive() && !entries.has(HOME_ID)) createHome(lastHomeUrl) },
+    ensureHome() { if (primary && alive() && !entries.has(HOME_ID)) createHome(lastHomeUrl) },
     dispatch,
     closeTab,
     closeAllForQuit,
@@ -701,6 +832,19 @@ function createTabWindow({
     restoreTabs,
     labelRestored,
     getSessionState: sessionState,
+    // Several windows.
+    movable: (id, options) => movable(entries.get(id), options),
+    detachTab,
+    adoptTab,
+    closeIfEmpty,
+    // Keyboard focus to the selected page, unless it shows the failed panel.
+    focusSelected() {
+      const entry = selectedEntry()
+      if (alive() && entry && !entry.failed && !entry.contents.isDestroyed()) entry.contents.focus()
+    },
+    tabCount: () => entries.size,
+    theme: () => theme,
+    unwatchOpener,
   }
 }
 

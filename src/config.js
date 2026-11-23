@@ -21,6 +21,9 @@ module.exports = {
   setTheme: (theme) => { if (isTheme(theme)) store.set('theme', theme) },
   getWindowBounds: () => store.get('windowBounds'),
   setWindowBounds: (bounds) => store.set('windowBounds', bounds),
+  // Where the last secondary window was; read through nextWindowBounds.
+  getSecondaryWindowBounds: () => store.get('secondaryWindowBounds'),
+  setSecondaryWindowBounds: (bounds) => store.set('secondaryWindowBounds', bounds),
   // Startup tabs. A corrupt value means Home only, or no saved session.
   getStartup: () => parseStartup(store.get('startup')),
   getLastSession: () => parseSession(store.get('lastSession')),

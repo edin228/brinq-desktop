@@ -2,11 +2,14 @@
 
 const HOME_ID = 1
 
-// Home is permanent at position 1. Tab ids are never reused.
-function createTabList() {
-  let ids = [HOME_ID]
-  let selected = HOME_ID
+// Home is permanent at position 1. Tab ids are never reused. A list without
+// Home (a secondary window) starts empty; its ids still start after HOME_ID,
+// so id 1 always means Home, and positions still count Home as 0.
+function createTabList({ home = true } = {}) {
+  let ids = home ? [HOME_ID] : []
+  let selected = home ? HOME_ID : undefined
   let nextId = HOME_ID + 1
+  const first = home ? 1 : 0
   // Remembers each tab's opener only to keep a run of opened tabs in click order.
   const openedFrom = new Map()
 
@@ -17,6 +20,7 @@ function createTabList() {
     return true
   }
   const step = (delta) => {
+    if (!ids.length) return selected
     const index = ids.indexOf(selected)
     selected = ids[(index + delta + ids.length) % ids.length]
     return selected
@@ -48,7 +52,8 @@ function createTabList() {
       if (shouldSelect) selected = id
       return id
     },
-    // Returns false for Home or unknown ids. Selection moves right, else left.
+    // Returns false for Home or unknown ids. Selection moves right, else left;
+    // a list without Home can become empty (nothing selected).
     remove(id) {
       if (id === HOME_ID || !has(id)) return false
       const index = ids.indexOf(id)
@@ -62,7 +67,7 @@ function createTabList() {
     move(id, position) {
       if (id === HOME_ID || !has(id) || !Number.isSafeInteger(position)) return false
       const without = ids.filter((value) => value !== id)
-      const index = Math.min(Math.max(position, 1), without.length)
+      const index = Math.min(Math.max(position - (home ? 0 : 1), first), without.length)
       if (ids.indexOf(id) === index) return false
       ids = [...without.slice(0, index), id, ...without.slice(index)]
       openedFrom.delete(id)
@@ -167,6 +172,7 @@ function shortcutAction(input, platform = process.platform) {
   if (key === 'PageUp') return shift ? 'move-left' : 'previous'
   if (lower === 't' && !shift) return once('new')
   if (lower === 'w' && !shift) return once('close')
+  if (lower === 'n' && shift) return once('new-window')
   if (lower === 'r') return shift ? 'reload-hard' : 'reload'
   if (lower === 'i' && shift) return 'devtools'
   if (/^Digit[1-9]$/.test(code) && !shift) return `select-${code.slice(5)}`

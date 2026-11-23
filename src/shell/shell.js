@@ -36,7 +36,9 @@ const updateStatus = document.querySelector('.update-status')
 const panel = document.querySelector('.panel')
 const retryButton = panel.querySelector('.retry')
 const tabElements = new Map()
-let state = { tabs: [], selectedId: 1 }
+let state = { tabs: [], selectedId: 1, hasHome: true }
+// Only the main window has Home; a secondary window's strip has tabs only.
+const hasHome = () => state.hasHome !== false
 let focusedId = null
 // The update view last shown, and a failure message the user dismissed.
 let updateView = null
@@ -107,7 +109,7 @@ function updateTab(element, tab, selected) {
 
 // Keyboard order follows the tabs as displayed, including reorders.
 function focusable() {
-  return [homeButton, ...tabsElement.querySelectorAll('.tab-select')]
+  return [...(hasHome() ? [homeButton] : []), ...tabsElement.querySelectorAll('.tab-select')]
 }
 
 function idOf(button) {
@@ -116,7 +118,7 @@ function idOf(button) {
 
 // One tab in the list is tabbable: the focused one, else the selected one.
 function updateRovingFocus() {
-  const current = focusedId !== null && (focusedId === 1 || tabElements.has(focusedId)) ? focusedId : state.selectedId
+  const current = focusedId !== null && ((focusedId === 1 && hasHome()) || tabElements.has(focusedId)) ? focusedId : state.selectedId
   for (const button of focusable()) button.tabIndex = idOf(button) === current ? 0 : -1
 }
 
@@ -147,6 +149,7 @@ function render(next) {
   root.dataset.platform = next.platform || ''
   renderUpdate(next.update)
   const home = next.tabs.find((tab) => tab.home)
+  homeButton.hidden = !hasHome()
   homeButton.setAttribute('aria-selected', String(next.selectedId === 1))
   homeButton.title = home && home.label !== 'Brinq' ? `Home: ${home.label}` : 'Home'
 
@@ -169,7 +172,7 @@ function render(next) {
     tabElements.delete(id)
     if (hadFocus) {
       focusedId = next.selectedId
-      ;(tabElements.get(next.selectedId)?.select || homeButton).focus()
+      ;(tabElements.get(next.selectedId)?.select || focusable()[0])?.focus()
     }
   }
   updateRovingFocus()
@@ -342,7 +345,7 @@ document.querySelector('.tablist').addEventListener('keydown', (event) => {
     if (id === 1) bridge.home(false)
     else bridge.select(id, false)
     return
-  } else if (event.key === 'Delete' && index > 0) {
+  } else if (event.key === 'Delete' && idOf(buttons[index]) !== 1) {
     event.preventDefault()
     bridge.close(idOf(buttons[index]))
     return
@@ -373,9 +376,9 @@ document.querySelector('.tablist').addEventListener('focusin', (event) => {
 // A failed tab's panel is part of this page, so F6 there moves between the
 // header and the panel's Try again.
 bridge.onFocusRequest?.((mode) => {
-  const header = focusable().find((button) => button.tabIndex === 0) || homeButton
+  const header = focusable().find((button) => button.tabIndex === 0) || focusable()[0]
   if (mode === 'toggle' && !panel.hidden && !panel.contains(document.activeElement)) retryButton.focus()
-  else header.focus()
+  else header?.focus()
 })
 
 bridge.onState(render)

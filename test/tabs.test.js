@@ -208,3 +208,37 @@ test('a shared link drops only the desktop standalone parameter', () => {
     assert.equal(share(url), null, String(url))
   }
 })
+
+test('a list without Home (a secondary window) starts empty, never uses id 1 and can empty out', () => {
+  const tabs = createTabList({ home: false })
+  assert.deepEqual(tabs.ids(), [])
+  assert.equal(tabs.selected(), undefined)
+  const a = tabs.add({ select: true })
+  const b = tabs.add()
+  const c = tabs.add()
+  assert.ok(a > HOME_ID)
+  assert.deepEqual(tabs.ids(), [a, b, c])
+  // Positions still count Home as 0, as the strip sends them: 1 is first.
+  assert.equal(tabs.move(c, 1), true)
+  assert.deepEqual(tabs.ids(), [c, a, b])
+  assert.equal(tabs.move(c, 0), false, 'already first')
+  assert.equal(tabs.move(a, 3), true)
+  assert.deepEqual(tabs.ids(), [c, b, a])
+  // Ctrl+1 picks the first tab, Ctrl+9 the last.
+  assert.equal(tabs.idAtPosition(1), c)
+  assert.equal(tabs.idAtPosition(9), a)
+  assert.equal(tabs.next(), c)
+  for (const id of [c, b, a]) assert.equal(tabs.remove(id), true)
+  assert.deepEqual(tabs.ids(), [])
+  assert.equal(tabs.selected(), undefined)
+  assert.equal(tabs.next(), undefined)
+})
+
+test('Ctrl+Shift+N (Cmd on macOS) opens the tab in a new window, once per press', () => {
+  const key = { type: 'keyDown', key: 'N', code: 'KeyN', shift: true }
+  assert.equal(shortcutAction({ ...key, control: true }, 'win32'), 'new-window')
+  assert.equal(shortcutAction({ ...key, meta: true }, 'darwin'), 'new-window')
+  assert.equal(shortcutAction({ ...key, control: true, isAutoRepeat: true }, 'win32'), null)
+  assert.equal(shortcutAction({ ...key, control: true, alt: true }, 'win32'), null)
+  assert.equal(shortcutAction({ ...key, shift: false, key: 'n', control: true }, 'win32'), null)
+})
