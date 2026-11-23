@@ -1503,121 +1503,6 @@ test('while any page\'s close is unanswered, no tab moves in any window, close b
   assert.equal(second.window.isDestroyed(), true)
 })
 
-test('a quit is not held by a close still being answered in the main window', async () => {
-  const { f, mainTab, a, b, second } = twoWindows({ choice: 0 })
-  mainTab.hang = true
-  f.tabs.closeTab(tabIds(f)[1])
-  f.app.quitting = true
-  f.host.emit('close', closeEvent())
-  await tick()
-  f.flush()
-  assert.equal(f.tabs.isTab(a) && f.tabs.isTab(b), true, 'the secondary tabs moved to main')
-  assert.equal(second.window.isDestroyed(), true)
-  // Today's loop asks the main window's tab again, then goes on.
-  mainTab.destroy()
-  await tick()
-  await tick()
-  f.flush()
-  assert.equal(a.isDestroyed() && b.isDestroyed(), true)
-  assert.equal(f.app.quitRequests, 1)
-})
-
-test('a quit moves every secondary window\'s tabs to the main window, then asks one page at a time there', async () => {
-  const { f, mainTab, a, b, second } = twoWindows({ choice: 0 })
-  a.veto = true
-  b.veto = true
-  f.app.quitting = true
-  // Electron asks every window to close; a secondary window with tabs waits.
-  const secondary = closeEvent()
-  second.window.emit('close', secondary)
-  assert.equal(secondary.prevented, true)
-  assert.equal(second.isTab(a), true, 'its close button path does not run during a quit')
-  const main = closeEvent()
-  f.host.emit('close', main)
-  assert.equal(main.prevented, true)
-  await tick()
-  await tick()
-  f.flush()
-  assert.equal(second.window.isDestroyed(), true, 'emptied, it closed')
-  assert.equal(a.isDestroyed() && b.isDestroyed() && mainTab.isDestroyed() && f.tabs.home.isDestroyed(), true)
-  // Each prompt came in the main window, one per page with unsaved work.
-  assert.deepEqual(f.dialogs.map(([owner]) => owner), [f.host, f.host])
-  assert.equal(f.app.quitRequests, 1)
-})
-
-test('Stay during a quit keeps every tab, now in the main window', async () => {
-  const { f, mainTab, a, b, second } = twoWindows({ choice: 1 })
-  b.veto = true
-  f.app.quitting = true
-  second.window.emit('close', closeEvent())
-  f.host.emit('close', closeEvent())
-  await tick()
-  await tick()
-  f.flush()
-  assert.equal(f.app.stopped, 1)
-  assert.equal(f.app.quitRequests, 0)
-  assert.equal(second.window.isDestroyed(), true)
-  assert.equal(f.tabs.isTab(b) && !b.isDestroyed(), true)
-  assert.equal(f.dialogs.length, 1)
-  assert.equal(f.dialogs[0][0], f.host)
-  // The loop closed the tabs before the guarded one, in strip order.
-  assert.equal(mainTab.isDestroyed() && a.isDestroyed(), true)
-  assert.equal(f.tabs.home.isDestroyed(), false)
-})
-
-test('a quit waits for a close already being answered in a secondary window; Stay there stops it', async () => {
-  const { f, a, b, second } = twoWindows()
-  a.hang = true
-  second.closeTab(stateOf(second).tabs[0].id)
-  f.app.quitting = true
-  second.window.emit('close', closeEvent())
-  f.host.emit('close', closeEvent())
-  await tick()
-  assert.equal(second.isTab(b), true, 'nothing moved yet')
-  assert.equal(a.closes.length, 1, 'the page is not asked again')
-  // The page answers Stay (its own prompt, already shown).
-  a.emit('will-prevent-unload', { preventDefault() {} })
-  await tick()
-  await tick()
-  assert.equal(f.app.stopped, 1)
-  assert.equal(f.app.quitRequests, 0)
-  assert.equal(second.isTab(a) && second.isTab(b), true, 'the stopped quit moved nothing')
-  assert.equal(f.tabs.home.isDestroyed(), false)
-
-  // Next time the page lets go: the quit goes on.
-  const g = twoWindows()
-  g.a.hang = true
-  g.second.closeTab(stateOf(g.second).tabs[0].id)
-  g.f.app.quitting = true
-  g.f.host.emit('close', closeEvent())
-  await tick()
-  g.a.destroy()
-  await tick()
-  await tick()
-  g.f.flush()
-  assert.equal(g.b.isDestroyed(), true)
-  assert.equal(g.f.app.quitRequests, 1)
-})
-
-test('an abandoned quit lets go of a close it was waiting for in a secondary window', async () => {
-  const { f, a, second } = twoWindows()
-  a.hang = true
-  second.closeTab(stateOf(second).tabs[0].id)
-  f.app.quitting = true
-  f.host.emit('close', closeEvent())
-  await tick()
-  f.tabWindows.abandonQuit()
-  await tick()
-  await tick()
-  assert.equal(f.app.stopped, 1)
-  assert.equal(second.isTab(a), true)
-  // The unanswered page still cannot move: a late answer would follow it.
-  assert.equal(f.tabWindows.moveToNewWindow(f.tabs, tabIds(f)[1]), false)
-  a.destroy()
-  f.flush()
-  assert.equal(f.tabWindows.moveToNewWindow(f.tabs, tabIds(f)[1]), true)
-})
-
 test('during a quit no tab moves and no new window opens', () => {
   const { f } = moveFixture()
   f.app.quitting = true
@@ -1649,4 +1534,114 @@ test('a move that fails leaves the source exactly as it was: no neighbour loads'
   assert.equal(f.tabs.isTab(live), true)
   assert.equal(f.state().selectedId, tabIds(f)[1])
   assert.ok(restored)
+})
+
+test('Brinq does not quit while another window has tabs; given back, it quits from the main window as before', async () => {
+  const { f, a, b, second } = twoWindows({ choice: 0 })
+  assert.equal(f.tabWindows.blocksQuit(), true)
+  // Closing the other window gives its tabs back; then nothing blocks.
+  second.window.emit('close', closeEvent())
+  f.flush()
+  assert.equal(f.tabWindows.blocksQuit(), false)
+  a.veto = true
+  b.veto = true
+  f.app.quitting = true
+  f.host.emit('close', closeEvent())
+  await tick()
+  f.flush()
+  assert.equal(a.isDestroyed() && b.isDestroyed() && f.tabs.home.isDestroyed(), true)
+  assert.deepEqual(f.dialogs.map(([owner]) => owner), [f.host, f.host], 'one prompt per page, in the main window')
+  assert.equal(f.app.quitRequests, 1)
+})
+
+test('an empty secondary window never blocks a quit, and a secondary window never runs a close loop', () => {
+  const { f, a, b, second } = twoWindows()
+  f.app.quitting = true
+  const held = closeEvent()
+  second.window.emit('close', held)
+  assert.equal(held.prevented, true, 'with tabs it waits (the quit guard refuses such a quit first)')
+  assert.equal(a.closes.length + b.closes.length, 0, 'and asks no page')
+  f.app.quitting = false
+  a.destroy()
+  b.destroy()
+  f.flush()
+  assert.equal(second.window.isDestroyed(), true)
+  assert.equal(f.tabWindows.blocksQuit(), false)
+})
+
+test('during a quit, + and Ctrl+T open nothing and the link menu cannot open a tab', () => {
+  const { f } = moveFixture()
+  const before = tabIds(f).length
+  f.app.quitting = true
+  f.tabWindows.stripCommand(f.stripEvent(), 'new')
+  press(f.tabs.home, { type: 'keyDown', key: 't', code: 'KeyT', control: true })
+  f.flush()
+  assert.equal(tabIds(f).length, before)
+  assert.equal(f.tabWindows.canOpenTab(), false)
+  f.app.quitting = false
+  assert.equal(f.tabWindows.canOpenTab(), true)
+})
+
+test('a window activated by the system gives keyboard focus back to the strip or the selected page', () => {
+  const { f, a, ids } = moveFixture()
+  f.tabs.select(ids[1])
+  f.flush()
+  const focused = a.focused
+  // Windows focused the window's own, empty page.
+  f.host.webContents.isFocused = () => true
+  f.host.emit('focus')
+  f.flush()
+  assert.equal(a.focused, focused + 1)
+  // The strip had focus last: it gets it back.
+  let stripFocus = 0
+  f.strip.focus = () => { stripFocus++ }
+  f.strip.emit('focus')
+  f.host.emit('focus')
+  f.flush()
+  assert.equal(stripFocus, 1)
+  // Focus already in a child view: nothing changes.
+  f.host.webContents.isFocused = () => false
+  f.host.emit('focus')
+  f.flush()
+  assert.equal(stripFocus, 1)
+  assert.equal(a.focused, focused + 1)
+})
+
+test('keyboard reordering works in a window without Home', () => {
+  const { f, second } = twoWindows()
+  const [first, last] = stateOf(second).tabs.map(({ id }) => id)
+  second.select(first)
+  second.dispatch('move-right')
+  f.flush()
+  assert.deepEqual(stateOf(second).tabs.map(({ id }) => id), [last, first])
+  second.dispatch('move-left')
+  f.flush()
+  assert.deepEqual(stateOf(second).tabs.map(({ id }) => id), [first, last])
+  second.dispatch('move-left')
+  f.flush()
+  assert.deepEqual(stateOf(second).tabs.map(({ id }) => id), [first, last], 'already first')
+})
+
+test('a failed move keeps the tab\'s id and its place among the tabs it opened', () => {
+  const f = fixture({ registry: true })
+  const parent = f.open(`${BASE}/clients/1`)
+  const parentId = tabIds(f)[1]
+  f.open(`${BASE}/clients/1/a`, { opener: parent })
+  const registry = createTabWindows({
+    create: (options) => {
+      const made = f.makeWindow(options)
+      made.adoptTab = () => { throw new Error('boom') }
+      return made
+    },
+  })
+  assert.equal(registry.moveToNewWindow(f.tabs, parentId), false)
+  f.flush()
+  assert.equal(tabIds(f)[1], parentId, 'same id, same place')
+  // A new link from the parent still lands after its earlier child.
+  f.open(`${BASE}/clients/1/b`, { opener: parent })
+  f.flush()
+  assert.deepEqual(f.tabs.getSessionState().tabs.map(({ url }) => url),
+    [`${BASE}/clients/1`, `${BASE}/clients/1/a`, `${BASE}/clients/1/b`])
+  assert.equal(valid(f, parent), true)
+  assert.equal(f.viewOf(parent).webContents, parent)
 })

@@ -1,7 +1,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
-const { createUpdateStatus } = require('../src/update-status')
+const { createUpdateStatus, headerView, MESSAGES } = require('../src/update-status')
 const { guardWindowUnload } = require('../src/unload-guard')
 
 // A page window guarded the way main.js guards every window. Its page holds
@@ -21,7 +21,7 @@ function unloadVeto(webContents) {
   return event.defaultPrevented
 }
 
-function fixture({ packaged = true, dirty = false, leave = false, installFailure = false, asyncInstallFailure = false, onRestore = () => {}, onAbandon = () => {} } = {}) {
+function fixture({ packaged = true, dirty = false, leave = false, installFailure = false, asyncInstallFailure = false, onRestore = () => {}, onAbandon = () => {}, restartBlocked } = {}) {
   const app = new EventEmitter()
   app.isPackaged = packaged
   const updater = new EventEmitter()
@@ -74,6 +74,7 @@ function fixture({ packaged = true, dirty = false, leave = false, installFailure
     app, updater, schedule: (fn) => scheduled.push(fn), onChange: (state) => changes.push(state), restoreWindow: () => { restored++; onRestore() },
     now: () => clock.now + clock.wallShift, monotonic: () => clock.now, setTimer, clearTimer,
     abandonClose: () => { abandoned++; onAbandon() },
+    ...(restartBlocked && { restartBlocked }),
   })
   const { window, prompts } = guardedWindow(new EventEmitter(), () => owner, leave)
   windows.push(window)
@@ -837,4 +838,33 @@ test('Stay during an update restart keeps the saved startup tabs and resumes sav
   startup.recorder.onTabsChanged({ tabs: [...startup.tabs] })
   startup.runTimers()
   assert.equal(startup.store.lastSession.tabs.length, 3)
+})
+
+test('other Brinq windows with tabs postpone a restart before anything closes', () => {
+  let blocked = true
+  const f = fixture({ restartBlocked: () => blocked })
+  f.updater.emit('update-downloaded', { version: '2.0.0' })
+  const result = f.owner.restart()
+  f.flush()
+  assert.equal(result.ok, false)
+  assert.equal(result.error, MESSAGES.otherWindows)
+  assert.equal(MESSAGES.otherWindows, 'Update postponed. Close your other Brinq windows first.')
+  assert.equal(f.quits, 0, 'no window was asked to close')
+  assert.equal(f.installs, 0)
+  assert.deepEqual(headerView(f.owner.getState()), { view: 'ready', note: 'Update postponed', noteDetail: MESSAGES.otherWindows })
+  // Once those windows are closed, Update works again.
+  blocked = false
+  assert.equal(f.owner.restart().ok, true)
+  f.flush()
+  assert.equal(f.installs, 1)
+})
+
+test('a restart is not armed while an ordinary quit is closing windows', () => {
+  const f = fixture()
+  f.updater.emit('update-downloaded', { version: '2.0.0' })
+  f.app.isQuitting = true
+  assert.equal(f.owner.restart().ok, false)
+  f.flush()
+  assert.equal(f.installs, 0)
+  assert.equal(f.quits, 0)
 })

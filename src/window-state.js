@@ -40,12 +40,16 @@ function nextWindowBounds({ saved, source, open = [], workAreas, primaryArea = w
     : valid(source) ? { ...source, x: source.x + CASCADE, y: source.y + CASCADE } : null
   if (!start) return visibleBounds(null, workAreas, primaryArea)
   const taken = open.filter(valid)
-  for (let step = 0; step < 20 && taken.some((bounds) => bounds.x === start.x && bounds.y === start.y); step++) {
-    start.x += CASCADE
-    start.y += CASCADE
+  const free = (bounds) => !taken.some((other) => other.x === bounds.x && other.y === bounds.y)
+  const at = (offset) => visibleBounds({ x: start.x + offset, y: start.y + offset, width: start.width, height: start.height }, workAreas, primaryArea)
+  // Checked after keeping it on a monitor: at an edge the cascade turns back.
+  for (const direction of [1, -1]) {
+    for (let step = 0; step < 20; step++) {
+      const candidate = at(direction * step * CASCADE)
+      if (free(candidate)) return candidate
+    }
   }
-  const { x, y, width, height } = start
-  return visibleBounds({ x, y, width, height }, workAreas, primaryArea)
+  return at(0)
 }
 
 const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/

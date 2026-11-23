@@ -42,9 +42,9 @@ function createTabWindow({
   // whether main has something open for that page (a Save As dialog).
   primary = true, onNewWindow = () => false, canMove = () => true,
   // A secondary window's close button gives its tabs back to the main
-  // window (onCloseWindow). A quit first runs beforeQuitClose in the main
-  // window, which moves every secondary window's tabs there; false stops it.
-  onCloseWindow = () => {}, beforeQuitClose = async () => true,
+  // window (onCloseWindow). Brinq does not quit while a secondary window
+  // has tabs (main.js), so only the main window's quit loop closes tabs.
+  onCloseWindow = () => {},
   // True while any page in any window waits for its close to be answered:
   // no tab moves then, so a late answer never lands on a moved tab.
   movesHeld = () => false,
@@ -233,7 +233,8 @@ function createTabWindow({
     }
     if (action === 'move-left' || action === 'move-right') {
       const id = list.selected()
-      const position = list.ids().indexOf(id) + (action === 'move-left' ? -1 : 1)
+      // Positions count Home as 0 in every window (see tabs.js).
+      const position = list.ids().indexOf(id) + (primary ? 0 : 1) + (action === 'move-left' ? -1 : 1)
       return moveTab(id, position)
     }
     if (action === 'next') return select(list.next())
@@ -310,7 +311,7 @@ function createTabWindow({
       else if (wasSelected && entries.has(list.selected())) select(list.selected(), { focus: entry.focusAfterClose !== false })
       else push()
     }
-    settle(entry, true)
+    entry.settle?.(true)
     // Its last tab closed: a secondary window goes too.
     if (!primary && entries.size === 0) schedule(closeIfEmpty)
   }
@@ -343,6 +344,7 @@ function createTabWindow({
       removals.push(() => contents.removeListener(name, listener))
     }
     on('before-input-event', (event, input) => onInput(event, input, contents))
+    on('focus', () => { stripHadFocus = false })
     on('page-title-updated', (_event, title) => {
       entry.title = title
       // The page named itself; the link's name is no longer needed.
@@ -367,7 +369,7 @@ function createTabWindow({
       }
       entry.closing = false
       entry.stayedAt = now()
-      settle(entry, false)
+      entry.settle?.(false)
     })
     if (entry.id !== HOME_ID) {
       on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
@@ -393,10 +395,12 @@ function createTabWindow({
 
   // Undoes attach without closing the page: the view, the maps, the list and
   // this window's handlers. The caller decides what happens to the page.
-  function unattach(entry) {
+  // `keepInList`: a staged move keeps the tab's place (and its opener run)
+  // until it commits, so undoing it restores the tab exactly.
+  function unattach(entry, { keepInList = false } = {}) {
     entries.delete(entry.id)
     byContents.delete(entry.contents)
-    if (entry.id !== HOME_ID) list.remove(entry.id)
+    if (entry.id !== HOME_ID && !keepInList) list.remove(entry.id)
     try { entry.unbind?.() } catch {}
     entry.unbind = null
     try { host.contentView.removeChildView(entry.view) } catch {}
@@ -409,7 +413,7 @@ function createTabWindow({
       : new WebContentsView({ webPreferences: { ...webPreferences, ...appPreferences() } })
     const id = fixedId ?? list.add({ afterId })
     const entry = {
-      id, view, contents: view.webContents, url, title: '', loading: !guest && !lazy, failed: null, waiters: [],
+      id, view, contents: view.webContents, url, title: '', loading: !guest && !lazy, failed: null,
       theme: null, closing: false, retrying: false, stayedAt: 0,
       // A restored tab waits, unloaded, until it is first selected.
       pending: lazy, restored: false,
@@ -511,7 +515,8 @@ function createTabWindow({
   }
 
   function newTab() {
-    if (!alive()) return
+    // A quit is closing tabs: + and Ctrl+T wait until it ends.
+    if (!alive() || quitBlocked()) return
     const url = newTabUrl(entries.get(HOME_ID)?.contents)
     const entry = addTab({ url, afterId: null, background: false })
     entry.contents.loadURL(url).catch(() => {})
@@ -559,26 +564,39 @@ function createTabWindow({
   // and never rebuilds Home: the page is still open, elsewhere.
   //
   // Staged: nothing a person could notice happens until `commit()` (the
-  // move succeeded); before it, adoptTab can put the tab back unchanged.
-  // `merging`: the main window is taking the tab back (close button or a
-  // quit), which a quit does not stop.
+  // move succeeded). Until then the tab keeps its id and place in this
+  // window's list, and `undo()` puts it back exactly as it was.
+  // `merging`: a secondary window is giving its tabs back to the main
+  // window (its close button), which also takes its only tab.
   function detachTab(id, { merging = false } = {}) {
     const entry = entries.get(id)
     const ok = merging
-      ? !!entry && alive() && entry.id !== HOME_ID && !entry.closing && !entry.contents.isDestroyed() && canMove(entry.contents)
+      ? !!entry && alive() && entry.id !== HOME_ID && !entry.closing && !entry.contents.isDestroyed() &&
+        !quitBlocked() && canMove(entry.contents)
       : movable(entry)
     if (!ok) return null
-    // Positions count Home as 0 in every window (see tabs.js).
-    const position = list.ids().indexOf(id) + (primary ? 0 : 1)
     const selected = list.selected() === id
-    unattach(entry)
+    unattach(entry, { keepInList: true })
     return {
-      position, selected,
+      selected,
       commit() {
+        list.remove(id)
         unwatchOpener(entry.contents)
         if (!alive()) return
         if (selected && entries.has(list.selected())) select(list.selected(), { focus: false })
         else { showSelected(); push() }
+      },
+      // Throws if this window can no longer show the tab.
+      undo() {
+        if (!alive() || entry.contents.isDestroyed()) throw new Error('The window that had the tab is gone.')
+        try {
+          attach(entry, { adopted: true })
+        } catch (error) {
+          unattach(entry)
+          throw error
+        }
+        showSelected()
+        push()
       },
       record: {
         view: entry.view, contents: entry.contents, url: entry.url, title: entry.title,
@@ -589,19 +607,16 @@ function createTabWindow({
     }
   }
 
-  // Adds a page detached from another window (or put back after a failed
-  // move) as a new tab with an id of this window. Throws, leaving this
-  // window as it was, if the page cannot be attached here.
-  function adoptTab(moved, { position, select: selectIt = true, merging = false } = {}) {
-    if (!alive() || (!merging && quitBlocked()) || !moved?.record || moved.record.contents.isDestroyed()) {
+  // Adds a page detached from another window as a new tab with an id of
+  // this window, after its tabs. Throws, leaving this window as it was, if
+  // the page cannot be attached here.
+  function adoptTab(moved, { select: selectIt = true } = {}) {
+    if (!alive() || quitBlocked() || !moved?.record || moved.record.contents.isDestroyed()) {
       throw new Error('This window cannot take the tab.')
     }
     const record = moved.record
     const id = list.add()
-    if (position !== undefined) list.move(id, position)
-    const entry = {
-      ...record, id, closing: false, retrying: false, waiters: [],
-    }
+    const entry = { ...record, id, closing: false, retrying: false }
     try {
       attach(entry, { adopted: true })
     } catch (error) {
@@ -626,26 +641,12 @@ function createTabWindow({
     return true
   }
 
-  // Everyone waiting for a tab's close hears its one result: closed
-  // (true) or kept (false, Stay or an abandoned quit).
-  function settle(entry, closed) {
-    for (const waiter of entry.waiters.splice(0)) waiter(closed)
-  }
-
   function closeAndWait(entry) {
     return new Promise((resolve) => {
-      entry.waiters.push(resolve)
+      entry.settle = (closed) => { entry.settle = null; resolve(closed) }
       if (entry.contents.isDestroyed()) return forget(entry)
       requestClose(entry)
     })
-  }
-
-  // Joins a close already under way without asking the page again.
-  function whenClosed(id) {
-    const entry = entries.get(id)
-    if (!entry) return Promise.resolve(true)
-    if (!entry.closing) return Promise.resolve(false)
-    return new Promise((resolve) => entry.waiters.push(resolve))
   }
 
   // Quit closes every tab, Home last, one at a time so each unsaved-work
@@ -654,9 +655,6 @@ function createTabWindow({
     if (quitting) return quitting
     const attempt = ++quitAttempt
     const current = (async () => {
-      // The main window first takes every secondary window's tabs, so this
-      // one loop asks every page, one at a time.
-      if (!(await beforeQuitClose()) || !isQuitting() || attempt !== quitAttempt) return false
       const order = [...list.ids().filter((id) => id !== HOME_ID), HOME_ID]
       for (const id of order) {
         // Another window (an email pop-out) may have stopped the quit, or
@@ -675,12 +673,10 @@ function createTabWindow({
   // A page that never answers its unsaved-work check holds the close loop.
   // Give up on it, so the next quit or update asks every page again.
   function abandonQuit() {
-    // Waiters go in every window: a secondary window's may belong to the
-    // main window's quit.
-    for (const entry of entries.values()) settle(entry, false)
     if (!quitting) return
     quitAttempt++
     quitting = null
+    for (const entry of entries.values()) entry.settle?.(false)
     if (!isQuitting()) resumeSelected()
   }
 
@@ -811,6 +807,17 @@ function createTabWindow({
   strip.on('will-navigate', (event) => event.preventDefault())
   strip.on('will-redirect', (event) => event.preventDefault())
   strip.on('before-input-event', (event, input) => onInput(event, input, strip))
+  // Windows gives keyboard focus to a window's own page when it is
+  // activated (Alt+Tab, the taskbar, the tray). That page is empty here, so
+  // focus goes back where it was: the strip, or the selected page.
+  let stripHadFocus = false
+  strip.on('focus', () => { stripHadFocus = true })
+  host.on('focus', () => schedule(() => {
+    if (!alive() || !host.webContents.isFocused()) return
+    const entry = selectedEntry()
+    if (stripHadFocus || !entry || entry.failed || entry.contents.isDestroyed()) strip.focus()
+    else entry.contents.focus()
+  }))
   // Keep the selected tab's name as the window title: the strip page's own
   // title must not replace it, also when it loads after the first tab.
   strip.on('page-title-updated', (event) => event.preventDefault())
@@ -937,7 +944,6 @@ function createTabWindow({
     selectedId: () => list.selected(),
     // Tabs whose close was asked for and has not been answered yet.
     closingIds: () => [...entries.values()].filter((entry) => entry.closing).map((entry) => entry.id),
-    whenClosed,
     theme: () => theme,
     unwatchOpener,
   }

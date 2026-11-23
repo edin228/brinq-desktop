@@ -87,3 +87,32 @@ test('Quit from the page saves startup tabs before any window closes', () => {
   handlers.get('quit-app')({ sender: home })
   assert.deepEqual(saved, [[false, { userId: 'u-1', tabs: [{ url: `${BASE}/clients/1` }] }]], 'saved once, before closing, although isQuitting was already set')
 })
+
+test('Brinq does not quit while another Brinq window has tabs: refused before anything else runs', () => {
+  const { EventEmitter } = require('node:events')
+  const { installQuitGuard, OTHER_WINDOWS_NOTICE } = require('../src/quit-app')
+  const app = new EventEmitter()
+  let blocked = true
+  let refused = 0
+  installQuitGuard({ app, blocked: () => blocked, onRefused: () => { refused++ } })
+  // A later listener (startup tabs, the updater) sees the quit refused.
+  const later = []
+  app.on('before-quit', (event) => later.push(event.defaultPrevented))
+  const quit = () => {
+    const event = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true } }
+    app.isQuitting = true
+    app.emit('before-quit', event)
+    return event
+  }
+  assert.equal(quit().defaultPrevented, true)
+  assert.equal(app.isQuitting, false)
+  assert.equal(refused, 1)
+  assert.deepEqual(later, [true])
+  blocked = false
+  assert.equal(quit().defaultPrevented, false)
+  assert.equal(app.isQuitting, true)
+  assert.equal(refused, 1)
+  assert.deepEqual(OTHER_WINDOWS_NOTICE.buttons, ['OK'])
+  assert.equal(OTHER_WINDOWS_NOTICE.title, 'Brinq has other windows open')
+  assert.equal(OTHER_WINDOWS_NOTICE.detail, 'Close your other Brinq windows first, then quit again. Their tabs go back to this window when you close them.')
+})

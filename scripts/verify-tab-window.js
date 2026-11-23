@@ -57,6 +57,7 @@ const { pathToFileURL } = require('url')
 const { createWindowSecurity } = require('../src/window-security')
 const { createTabWindow } = require('../src/tab-window')
 const { createTabWindows } = require('../src/tab-windows')
+const { installQuitGuard } = require('../src/quit-app')
 
 const page = (title, body, script = '') => `<!doctype html><html class="light"><head><meta charset="utf-8"><title>${title}</title>
 <style>body{font:14px sans-serif;margin:20px} a,button,input{display:block;margin:8px 0;padding:6px}</style></head>
@@ -168,7 +169,10 @@ async function main() {
     isQuitting: () => !!app.isQuitting,
   })
   tabs = tabWindows.addPrimary({ bounds: { width: 1200, height: 800, x: 0, y: 0 }, theme: 'light' })
-  app.on('before-quit', () => { app.isQuitting = true })
+  // As main.js: no quit while another window has tabs (registered first).
+  let quitsRefused = 0
+  installQuitGuard({ app, blocked: () => tabWindows.blocksQuit(), onRefused: () => { quitsRefused++ } })
+  app.on('before-quit', (event) => { if (!event.defaultPrevented) app.isQuitting = true })
   app.on('window-all-closed', () => {})
   // Same forwarding as main.js, with timings for the label-to-open gap.
   const labelTimes = []
@@ -668,6 +672,17 @@ async function main() {
     // Two restored tabs after the guarded one; quitting must not load them.
     tabs.restoreTabs(['/restored-c', '/restored-d'].map((route) => ({ url: `${base}${route}`, label: route })))
     tabs.selectHome()
+    // A quit while the other window has tabs is refused before anything closes.
+    const promptsBeforeRefused = prompts.length
+    app.quit()
+    await wait(500)
+    check('a quit is refused while another window has tabs, and nothing closes',
+      quitsRefused === 1 && !app.isQuitting && prompts.length === promptsBeforeRefused &&
+      !quitSecond.window.isDestroyed() && !elsewhere.isDestroyed() && !quitTab.isDestroyed() && !tabs.home.isDestroyed())
+    // Its close button gives the tab back; then the quit runs as before.
+    quitSecond.window.close()
+    await until(() => quitSecond.window.isDestroyed() && tabs.isTab(elsewhere))
+    tabs.selectHome()
     host.hide()
     const promptsBeforeQuit = prompts.length
     const ownersBeforeQuit = promptOwners.length
@@ -678,9 +693,8 @@ async function main() {
       JSON.stringify({ quitStops, destroyed: quitTab.isDestroyed(), quitting: app.isQuitting, prompts: prompts.length, answers }))
     check('the stopped quit shows the window and the tab with unsaved work', host.isVisible() && tabs.isTab(quitTab))
     check('Stay prompted once and loaded no restored tab', prompts.length === promptsBeforeQuit + 1 && !requests['/restored-c'] && !requests['/restored-d'])
-    check('the quit first moved the other window\'s tab into the main window, asking in the main window',
-      quitSecond.window.isDestroyed() && tabs.isTab(elsewhere) && !elsewhere.isDestroyed() &&
-      promptOwners.slice(ownersBeforeQuit).every((owner) => owner === host))
+    check('the prompts came in the main window, which now holds the given-back tab',
+      tabs.isTab(elsewhere) && !elsewhere.isDestroyed() && promptOwners.slice(ownersBeforeQuit).every((owner) => owner === host))
     let quitState = null
     app.once('will-quit', (event) => {
       // Keep the harness alive to report; record what quitting left behind.

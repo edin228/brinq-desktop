@@ -6,6 +6,7 @@ const MESSAGES = {
   restarting: 'Updating… Brinq will reopen.',
   postponed: 'Update postponed. Some tabs may have closed.',
   stalled: "Update postponed. A window didn't close. Try again when you're ready.",
+  otherWindows: 'Update postponed. Close your other Brinq windows first.',
   already: 'Brinq is already restarting to update.',
   notReady: 'Download an update before restarting.',
   check: "Brinq couldn't check for updates. It will try again. You can keep working.",
@@ -51,6 +52,9 @@ function createUpdateStatus({
   monotonic = () => performance.now(),
   // The watchdog gives up a stalled restart: drop the stuck close loop too.
   abandonClose = () => {},
+  // A reason the restart cannot start now (other Brinq windows have tabs),
+  // or null. Checked before any window closes.
+  restartBlocked = () => null,
 }) {
   let state = app.isPackaged
     ? { status: 'idle' }
@@ -283,6 +287,14 @@ function createUpdateStatus({
   function restart() {
     if (restartPending || installing) return { ok: false, state: getState(), error: MESSAGES.already }
     if (state.status !== 'ready') return { ok: false, state: getState(), error: MESSAGES.notReady }
+    // An ordinary quit is already closing windows: never arm the installer
+    // in the middle of it.
+    if (app.isQuitting) return { ok: false, state: getState() }
+    if (restartBlocked()) {
+      log('restart-postponed', { message: MESSAGES.otherWindows })
+      publish({ status: 'ready', version: state.version, message: MESSAGES.otherWindows })
+      return { ok: false, state: getState(), error: MESSAGES.otherWindows }
+    }
     // Before any window closes: a missing installer must not cost the
     // user their tabs.
     try { checkInstaller() } catch (error) {
@@ -320,7 +332,7 @@ function createUpdateStatus({
 function headerView(state) {
   if (state.status === 'ready') {
     if (state.phase === 'restarting') return { view: 'restarting' }
-    const postponed = state.message === MESSAGES.postponed || state.message === MESSAGES.stalled
+    const postponed = [MESSAGES.postponed, MESSAGES.stalled, MESSAGES.otherWindows].includes(state.message)
     return postponed ? { view: 'ready', note: 'Update postponed', noteDetail: state.message } : { view: 'ready' }
   }
   if (state.status === 'error' && (state.manual || state.failure === 'install')) {

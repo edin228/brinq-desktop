@@ -45,7 +45,7 @@ const { createTabWindows } = require('./tab-windows')
 const { createLinkMenu } = require('./link-menu')
 const { createNativeNotifier } = require('./native-notifications')
 const { installBrowserSignIn } = require('./browser-sign-in')
-const { quitApp, installQuitApp } = require('./quit-app')
+const { quitApp, installQuitApp, installQuitGuard, OTHER_WINDOWS_NOTICE } = require('./quit-app')
 const { installStartupTabs } = require('./startup-tabs')
 
 // Windows: set App User Model ID so notifications show "Brinq" not "electron.app.brinq"
@@ -100,6 +100,18 @@ const tabWindows = createTabWindows({
   canMove: (contents) => !saveDialogs.has(contents),
 })
 windowSecurity.setTabHost(tabWindows)
+// Brinq quits only from its main window: while another Brinq window has
+// tabs, the quit is refused with a notice. Installed before the updater's
+// and startup tabs' before-quit listeners, so a refused quit saves nothing.
+installQuitGuard({
+  app,
+  blocked: () => tabWindows.blocksQuit(),
+  onRefused: () => {
+    showMainWindow()
+    const owner = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined
+    Promise.resolve(owner ? dialog.showMessageBox(owner, OTHER_WINDOWS_NOTICE) : dialog.showMessageBox(OTHER_WINDOWS_NOTICE)).catch(() => {})
+  },
+})
 // Pages with a Save As dialog open; such a tab stays in its window until the
 // dialog closes, since the dialog belongs to that window.
 const saveDialogs = new Map()
@@ -111,7 +123,7 @@ const linkMenu = createLinkMenu({
   Menu,
   clipboard,
   openTab: (args) => tabWindows.openTab(args),
-  canOpenTab: () => tabWindows.available(),
+  canOpenTab: () => tabWindows.canOpenTab(),
   windowFor: (contents) => tabWindows.windowFor(contents) || BrowserWindow.fromWebContents(contents),
 })
 app.on('web-contents-created', (_event, contents) => linkMenu.attach(contents))
@@ -132,6 +144,8 @@ const logFile = (fields) => require('electron-log').info(`[file] ${fields.mode} 
 const updates = createUpdateStatus({
   app, updater: autoUpdater, log: logUpdate,
   onCheckEnd: (result) => updateSchedule.record(result),
+  // Other Brinq windows with tabs postpone the restart before anything closes.
+  restartBlocked: () => tabWindows.blocksQuit(),
   abandonClose: () => {
     tabWindows.abandonQuit()
     startupTabs.resume()

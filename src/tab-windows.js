@@ -3,14 +3,13 @@
 // window that owns its sender, and moves a live tab between windows.
 //
 // There is one close path, the main window's: a secondary window's close
-// button gives its tabs back to the main window, and a quit first moves
-// every secondary window's tabs there, then the main window's quit loop
-// asks every page, one at a time.
+// button gives its tabs back to the main window, and Brinq does not quit
+// while a secondary window has tabs (`blocksQuit`, used by main.js).
 //
 // `create(options)` builds one tab window (createTabWindow with main's
 // shared settings); the options this registry passes are `primary`,
-// `bounds`, `theme`, `onNewWindow`, `onCloseWindow`, `beforeQuitClose`,
-// `canMove`, `movesHeld` and `onTabsChanged`.
+// `bounds`, `theme`, `onNewWindow`, `onCloseWindow`, `canMove`,
+// `movesHeld` and `onTabsChanged`.
 
 // A new window shows when its strip has loaded, or after this at most.
 const SHOW_FALLBACK_MS = 1000
@@ -50,7 +49,6 @@ function createTabWindows({
       // Like any move, held while a page's close is unanswered; the person
       // can close the window again a moment later.
       onCloseWindow: () => { if (!anyClosing()) giveBack(tabWindow, { select: true }) },
-      beforeQuitClose: () => prepareQuit(),
       canMove,
       movesHeld: anyClosing,
       onTabsChanged: changed,
@@ -76,23 +74,22 @@ function createTabWindows({
     if (!moved) return null
     let movedId
     try {
-      movedId = target.adoptTab(moved, { select: false, merging })
+      movedId = target.adoptTab(moved, { select: false })
     } catch {
-      restore(source, moved)
+      restore(moved)
       return null
     }
     moved.commit()
     return movedId
   }
 
-  // A failed move puts the tab back. Should even that fail, the main window
-  // takes it; a page that no window can show is closed rather than left
-  // running unseen.
-  function restore(source, moved) {
-    const options = { position: moved.position, select: moved.selected, merging: true }
-    for (const [tabWindow, where] of [[source, options], [primary, { merging: true }]]) {
-      if (!alive(tabWindow)) continue
-      try { tabWindow.adoptTab(moved, where); return } catch {}
+  // A failed move puts the tab back exactly as it was. Should even that
+  // fail, the main window takes it; a page that no window can show is
+  // closed rather than left running unseen.
+  function restore(moved) {
+    try { moved.undo(); return } catch {}
+    if (alive(primary)) {
+      try { primary.adoptTab(moved, { select: false }); return } catch {}
     }
     try { if (!moved.record.contents.isDestroyed()) moved.record.contents.close() } catch {}
   }
@@ -132,9 +129,8 @@ function createTabWindows({
   }
 
   // A secondary window's tabs go back to the main window, after its tabs,
-  // in order (a quit has already waited for every unanswered close in
-  // secondary windows). The window closes once it has no tabs. Returns
-  // whether every tab moved.
+  // in order. The window closes once it has no tabs. Returns whether every
+  // tab moved.
   function giveBack(source, { select = false } = {}) {
     if (!alive(primary) || source === primary || !alive(source)) return false
     const selectedId = source.selectedId()
@@ -155,18 +151,6 @@ function createTabWindows({
     return all
   }
 
-  // Before the main window's quit loop: closes already under way in
-  // secondary windows finish first (Stay there stops the quit), then every
-  // secondary window's tabs move to the main window. False stops the quit.
-  async function prepareQuit() {
-    const pending = secondaries().flatMap((tabWindow) => tabWindow.closingIds().map((id) => tabWindow.whenClosed(id)))
-    if ((await Promise.all(pending)).some((closed) => !closed)) return false
-    if (!isQuitting()) return false
-    let all = true
-    for (const tabWindow of secondaries()) all = giveBack(tabWindow) && all
-    return all
-  }
-
   return {
     get primary() { return primary },
     // Home's page, for startup tabs.
@@ -176,11 +160,16 @@ function createTabWindows({
     forTab, forStrip, forHost,
     moveToNewWindow,
     giveBack,
+    // Brinq quits only from the main window: while a secondary window has
+    // tabs, a quit or update restart is refused (main.js says why).
+    blocksQuit: () => secondaries().some((tabWindow) => !tabWindow.window.isDestroyed() && tabWindow.tabCount() > 0),
     // window-security's tab host: a new tab opens in its opener's window;
     // anything that is not a tab (a pop-out) opens one in the main window.
     // During a quit no tab opens at all.
     available: () => alive(primary),
     quitting: () => isQuitting(),
+    // A link menu's Open in new tab: a tab can open now.
+    canOpenTab: () => alive(primary) && !isQuitting(),
     openTab(args) {
       const owner = forTab(args.opener)
       return (alive(owner) ? owner : primary).openTab(args)

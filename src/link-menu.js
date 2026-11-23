@@ -19,7 +19,7 @@ function createLinkMenu({ security, Menu, clipboard, openTab, canOpenTab = () =>
     const quietly = (action) => () => { try { Promise.resolve(action()).catch(() => {}) } catch {} }
     Menu.buildFromTemplate([
       // Like Ctrl+click and a browser's "Open link in new tab": a background tab.
-      { label: 'Open in new tab', enabled: canOpenTab(), click: quietly(() => { if (stillThere()) return openTab({ opener: contents, url: link, background: true }) }) },
+      { label: 'Open in new tab', enabled: canOpenTab(), click: quietly(() => { if (stillThere() && canOpenTab()) return openTab({ opener: contents, url: link, background: true }) }) },
       { label: 'Copy link', click: quietly(() => { if (stillThere()) return clipboard.writeText(shared) }) },
     ]).popup({ window: windowFor(contents) || undefined })
     return true

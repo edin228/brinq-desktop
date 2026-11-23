@@ -183,9 +183,10 @@ test('a new window opens where the last one was left, cascades past an open one,
   // No remembered spot: beside the window the tab came from.
   assert.deepEqual(nextWindowBounds({ source: { x: 100, y: 50, width: 1200, height: 800 }, workAreas: areas, primaryArea: primary }),
     { x: 132, y: 82, width: 1200, height: 800 })
-  // Cascading off the edge is clamped back onto the monitor.
+  // At the monitor's edge the cascade turns back instead of landing on it.
   const edge = { x: 1920 - 900, y: 1040 - 700, width: 900, height: 700 }
-  assert.deepEqual(nextWindowBounds({ saved: edge, open: [edge], workAreas: areas, primaryArea: primary }), edge)
+  assert.deepEqual(nextWindowBounds({ saved: edge, open: [edge], workAreas: areas, primaryArea: primary }),
+    { x: edge.x - 32, y: edge.y - 32, width: 900, height: 700 })
   // The remembered monitor was unplugged: centered on the primary.
   assert.deepEqual(nextWindowBounds({ saved, workAreas: [primary], primaryArea: primary }),
     { x: 510, y: 170, width: 900, height: 700 })
