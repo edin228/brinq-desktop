@@ -23,6 +23,20 @@ if (process.isMainFrame && location.protocol === 'file:') {
     reload: () => command('reload'),
     restartUpdate: () => command('restart-update'),
     retryUpdate: () => command('retry-update'),
+    // Dragging a tab out: the strip says which tab and when it was let go,
+    // never where; main reads the pointer itself.
+    dragStart: (id) => command('drag-start', id),
+    dragEnd: (id) => command('drag-end', id),
+    dragCancel: (id) => command('drag-cancel', id),
+    // As a drop target: main asks where a tab released at x (strip pixels)
+    // would go; the strip answers with a position among its tabs (or null)
+    // and the tab order it saw.
+    onSlotRequest(callback) {
+      const handler = (_event, request) => callback(request)
+      ipcRenderer.on('tabs:slot', handler)
+      return () => ipcRenderer.removeListener('tabs:slot', handler)
+    },
+    slot: (requestId, index, order) => command('slot', undefined, { requestId, index, order }),
     // F6: main asks the strip to take keyboard focus ('header'), or, for a
     // failed tab's panel, to move it between header and panel ('toggle').
     onFocusRequest(callback) {

@@ -193,3 +193,17 @@ test('a new window opens where the last one was left, cascades past an open one,
   // Nothing usable: the default size, centered.
   assert.deepEqual(nextWindowBounds({ saved: { x: 'a' }, workAreas: [primary] }), visibleBounds(null, [primary]))
 })
+
+test('a window made by a drop opens under the pointer, inside the monitor the pointer is on', () => {
+  const { boundsAtPoint } = require('../src/window-state')
+  const left = { x: -1920, y: 0, width: 1920, height: 1040 }
+  const size = { width: 1200, height: 800 }
+  // The tab sits under the pointer.
+  assert.deepEqual(boundsAtPoint({ size, point: { x: -1500, y: 200 }, workArea: left }), { width: 1200, height: 800, x: -1620, y: 180 })
+  // Near an edge it stays on that monitor, the pointer offset given up.
+  assert.deepEqual(boundsAtPoint({ size, point: { x: -10, y: 1030 }, workArea: left }), { width: 1200, height: 800, x: -1200, y: 240 })
+  assert.deepEqual(boundsAtPoint({ size, point: { x: -1919, y: 0 }, workArea: left }), { width: 1200, height: 800, x: -1920, y: 0 })
+  // Larger than the monitor: as large as it allows. A bad size: the default.
+  assert.deepEqual(boundsAtPoint({ size: { width: 4000, height: 3000 }, point: { x: 100, y: 100 }, workArea: { x: 0, y: 0, width: 1280, height: 720 } }), { width: 1280, height: 720, x: 0, y: 0 })
+  assert.deepEqual(boundsAtPoint({ size: null, point: { x: 500, y: 300 }, workArea: { x: 0, y: 0, width: 2560, height: 1400 } }), { width: 1200, height: 800, x: 380, y: 280 })
+})

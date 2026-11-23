@@ -21,6 +21,12 @@ const UNLOAD_SETTLE_MS = 250
 // synchronous IPC before the open request (measured gap: about 1 ms in
 // Electron 44); 2 s is a generous, reversible margin before it goes stale.
 const LINK_LABEL_MS = 2000
+// A tab dragged out of the strip: the strip reports the release, main
+// decides. A drag that never ends this long after it started is forgotten.
+const DRAG_SESSION_MS = 60000
+// Where a dropped tab lands is asked of the target strip before anything
+// moves; no answer in this time and the tab stays where it was.
+const SLOT_TIMEOUT_MS = 400
 const canonicalUrl = (value) => { try { return new URL(value).href } catch { return null } }
 
 function createTabWindow({
@@ -48,6 +54,9 @@ function createTabWindow({
   // True while any page in any window waits for its close to be answered:
   // no tab moves then, so a late answer never lands on a moved tab.
   movesHeld = () => false,
+  // A tab of this window was dragged out of its strip and released:
+  // onDragEnd(id) decides where it goes (tab-windows.js).
+  onDragEnd = () => {},
 }) {
   const appPreferences = () => ({
     preload: preloadPath, contextIsolation: true, nodeIntegration: false,
@@ -613,12 +622,16 @@ function createTabWindow({
   // Adds a page detached from another window as a new tab with an id of
   // this window, after its tabs. Throws, leaving this window as it was, if
   // the page cannot be attached here.
-  function adoptTab(moved, { select: selectIt = true } = {}) {
+  // `position`: the tab's place among this window's tabs (0 is the first
+  // tab after Home), as a drop's slot answer gave it.
+  function adoptTab(moved, { select: selectIt = true, position = null } = {}) {
     if (!alive() || quitBlocked() || !moved?.record || moved.record.contents.isDestroyed()) {
       throw new Error('This window cannot take the tab.')
     }
     const record = moved.record
     const id = list.add()
+    // Positions count Home as 0 in every window (see tabs.js).
+    if (Number.isSafeInteger(position) && position >= 0) list.move(id, position + 1)
     const entry = { ...record, id, closing: false, retrying: false }
     try {
       attach(entry, { adopted: true })
@@ -786,8 +799,102 @@ function createTabWindow({
     return true
   }
 
+  // Dragging a tab out of the strip. Main reads the pointer itself; the
+  // strip only says which of its tabs was dragged and when it was let go.
+  // A drag counts only inside a press main saw on this strip, and only for
+  // the strip document and tab it started with.
+  let pressed = false
+  let stripLoad = 0
+  let dragSession = null
+  // A released drag waiting for its target's answer. It stays live only
+  // while nothing here changed: a new drag, a reloaded strip, the window
+  // put away or closed, or the tab gone ends it.
+  let pendingDrop = null
+  function endDragSession() { dragSession = null }
+  function endPendingDrop() {
+    if (pendingDrop) pendingDrop.live = false
+    pendingDrop = null
+  }
+
+  function startDragSession(id) {
+    const entry = entries.get(id)
+    const armed = pressed
+    pressed = false
+    dragSession = null
+    endPendingDrop()
+    if (!armed || !movable(entry)) return false
+    const session = { entry, stripLoad }
+    dragSession = session
+    setTimer(() => { if (dragSession === session) dragSession = null }, DRAG_SESSION_MS)
+    return true
+  }
+
+  function finishDragSession(id) {
+    const session = dragSession
+    dragSession = null
+    if (!session || session.entry !== entries.get(id) || session.stripLoad !== stripLoad || !alive()) return false
+    endPendingDrop()
+    const drop = { live: true }
+    pendingDrop = drop
+    onDragEnd(id, () => drop.live && pendingDrop === drop && entries.get(id) === session.entry && alive())
+    return true
+  }
+
+  // As a drop target: asks this window's strip where a tab released at `x`
+  // (strip pixels from the window's left edge) would go among its tabs.
+  // Resolves to that position, or null: not over the tabs, no answer in
+  // time, an answer for another request or strip document, or one made
+  // against a tab order that is no longer this window's.
+  let slotRequest = null
+  let slotCount = 0
+  function settleSlot(value) { slotRequest?.settle(value) }
+  function requestSlot(x) {
+    return new Promise((resolve) => {
+      settleSlot(null)
+      if (!alive() || !ready || strip.isDestroyed() || !Number.isSafeInteger(x)) return resolve(null)
+      const request = {
+        requestId: ++slotCount, stripLoad,
+        settle(value) {
+          if (slotRequest !== request) return
+          slotRequest = null
+          resolve(value)
+        },
+      }
+      slotRequest = request
+      setTimer(() => request.settle(null), SLOT_TIMEOUT_MS)
+      strip.send('tabs:slot', { requestId: request.requestId, x })
+    })
+  }
+
+  function answerSlot(answer) {
+    const request = slotRequest
+    if (!request || !answer || typeof answer !== 'object' || answer.requestId !== request.requestId) return false
+    const order = list.ids().filter((id) => id !== HOME_ID && entries.has(id))
+    // Checked entry by entry against this window's own order (a sparse
+    // array would skip holes in its own every()).
+    const sameOrder = Array.isArray(answer.order) && answer.order.length === order.length &&
+      order.every((id, index) => answer.order[index] === id)
+    const { index } = answer
+    const valid = request.stripLoad === stripLoad && sameOrder &&
+      Number.isSafeInteger(index) && index >= 0 && index <= order.length
+    request.settle(valid ? index : null)
+    return true
+  }
+
+  // A reloaded or crashed strip, or a window put away, ends any drag and
+  // any drop waiting on this strip.
+  function stripChanged() {
+    stripLoad++
+    pressed = false
+    endDragSession()
+    endPendingDrop()
+    settleSlot(null)
+  }
+
   function stripCommand(event, command, id, options) {
     if (!validStripSender(event)) return false
+    if (command === 'slot') return answerSlot(options)
+    if (command === 'drag-cancel') return endDragSession(), true
     if (command === 'new') return newTab(), true
     if (command === 'home') return primary && select(HOME_ID, { focus: options?.focus === true })
     if (command === 'reload') return dispatch('reload'), true
@@ -798,6 +905,8 @@ function createTabWindow({
     if (command === 'retry') return retry(id), true
     if (command === 'move') return Number.isSafeInteger(options?.position) && moveTab(id, options.position)
     if (command === 'menu') return showTabMenu(id, options?.x, options?.y, options?.keyboard === true)
+    if (command === 'drag-start') return startDragSession(id)
+    if (command === 'drag-end') return finishDragSession(id)
     return false
   }
 
@@ -825,8 +934,19 @@ function createTabWindow({
   // title must not replace it, also when it loads after the first tab.
   strip.on('page-title-updated', (event) => event.preventDefault())
   host.on('page-title-updated', (event) => event.preventDefault())
+  // A drag starts only inside a press main itself saw on the strip.
+  strip.on('input-event', (_event, input) => {
+    if (input?.type === 'mouseDown') pressed = true
+    else if (input?.type === 'mouseUp') pressed = false
+  })
+  strip.on('did-start-loading', stripChanged)
+  host.on('hide', stripChanged)
+  host.on('minimize', stripChanged)
+  // A slot answer is for the window where it was asked: moved or resized
+  // since, its x no longer means the same place.
+  for (const name of ['move', 'resize']) host.on(name, () => settleSlot(null))
   const reloadStrip = () => { if (alive()) strip.loadURL(shellUrl).catch(() => {}) }
-  strip.on('render-process-gone', () => schedule(reloadStrip))
+  strip.on('render-process-gone', () => { stripChanged(); schedule(reloadStrip) })
   strip.on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
     if (isMainFrame && code !== -3 && url === shellUrl) schedule(reloadStrip)
   })
@@ -895,6 +1015,9 @@ function createTabWindow({
       if (!entry.contents.isDestroyed()) entry.contents.close()
     }
     readyCallbacks.length = 0
+    endDragSession()
+    endPendingDrop()
+    settleSlot(null)
     if (!strip.isDestroyed()) strip.close()
     disposed = true
   }
@@ -937,6 +1060,11 @@ function createTabWindow({
     detachTab,
     adoptTab,
     closeIfEmpty,
+    // Drops: the window's content area and its strip band (screen DIP),
+    // and where in its strip a dropped tab would go.
+    contentArea: () => (alive() ? host.getContentBounds() : null),
+    stripBand: STRIP_HEIGHT,
+    requestSlot,
     // Keyboard focus to the selected page, unless it shows the failed panel.
     focusSelected() {
       const entry = selectedEntry()
