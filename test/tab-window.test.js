@@ -170,6 +170,7 @@ function fixture({ platform = 'win32', theme = 'light', choice = 1, updateView, 
     cursorPoint: () => pointer.at,
     placeAt: (source, point) => ({ x: point.x - 120, y: point.y - 20, width: source.width, height: source.height }),
     canReceive: (window) => !pointer.busy.has(window),
+    canMove: (contents) => !pointer.busy.has(contents),
   }) : null
   const tabs = registry ? tabWindows.addPrimary({ bounds: { width: 1200, height: 800 }, theme }) : makeWindow()
   const host = windows[0]
@@ -1866,4 +1867,67 @@ test('while a drop waits for its answer, a quit, a close, a Save As or a hidden 
   f.pointer.busy.add(second.window)
   dragOut(f, f.tabs, id, into)
   assert.equal(second.strip.sent.filter(([channel]) => channel === 'tabs:slot').length, asked)
+})
+
+test('a released drop waiting for its answer ends when its own window changes, or a newer drag starts', async () => {
+  const { f, mainTab, second } = dropWindows()
+  const id = tabIds(f)[1]
+  const into = { x: 1300 + 250, y: 12 }
+  const stays = async () => { await settled(); f.flush(); assert.equal(f.tabs.isTab(mainTab), true) }
+  // The source window hidden (closed to the tray), minimized, or its strip
+  // reloaded, while the target thinks.
+  for (const change of [() => f.host.hide(), () => f.host.minimize(), () => f.strip.emit('did-start-loading')]) {
+    dragOut(f, f.tabs, id, into)
+    const asked = slotAsked(second)
+    change()
+    answerSlot(second, 0, second.tabIds(), asked.requestId)
+    await stays()
+    f.host.restore()
+    f.host.show()
+    f.strip.emit('did-finish-load')
+  }
+  // A Save As opened on the tab's page while the target thinks.
+  dragOut(f, f.tabs, id, into)
+  f.pointer.busy.add(mainTab)
+  answerSlot(second, 0)
+  await stays()
+  f.pointer.busy.clear()
+  // A newer drag starts before the older answer: the older one never moves.
+  dragOut(f, f.tabs, id, into)
+  const older = slotAsked(second)
+  f.strip.emit('input-event', {}, { type: 'mouseDown' })
+  assert.equal(f.tabs.stripCommand(eventFrom(f.tabs), 'drag-start', id), true)
+  answerSlot(second, 0, second.tabIds(), older.requestId)
+  await stays()
+  // A newer release wins over an older one still waiting.
+  f.tabs.stripCommand(eventFrom(f.tabs), 'drag-cancel', id)
+  dragOut(f, f.tabs, id, into)
+  const first = slotAsked(second)
+  dragOut(f, f.tabs, id, into)
+  const latest = slotAsked(second)
+  assert.notEqual(first.requestId, latest.requestId)
+  answerSlot(second, 0, second.tabIds(), first.requestId)
+  await stays()
+  answerSlot(second, 0, second.tabIds(), latest.requestId)
+  await settled()
+  f.flush()
+  assert.equal(second.isTab(mainTab), true, 'the latest release moved it')
+})
+
+test('a target window moved or resized before it answers gives no slot; a sparse order is no order', async () => {
+  const { f, mainTab, second } = dropWindows()
+  const id = tabIds(f)[1]
+  const into = { x: 1300 + 250, y: 12 }
+  const stays = async () => { await settled(); f.flush(); assert.equal(f.tabs.isTab(mainTab), true) }
+  for (const name of ['move', 'resize']) {
+    dragOut(f, f.tabs, id, into)
+    const asked = slotAsked(second)
+    second.window.emit(name)
+    answerSlot(second, 0, second.tabIds(), asked.requestId)
+    await stays()
+  }
+  dragOut(f, f.tabs, id, into)
+  const sparse = new Array(second.tabIds().length)
+  answerSlot(second, 0, sparse)
+  await stays()
 })

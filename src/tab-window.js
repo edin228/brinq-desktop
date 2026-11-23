@@ -806,13 +806,22 @@ function createTabWindow({
   let pressed = false
   let stripLoad = 0
   let dragSession = null
+  // A released drag waiting for its target's answer. It stays live only
+  // while nothing here changed: a new drag, a reloaded strip, the window
+  // put away or closed, or the tab gone ends it.
+  let pendingDrop = null
   function endDragSession() { dragSession = null }
+  function endPendingDrop() {
+    if (pendingDrop) pendingDrop.live = false
+    pendingDrop = null
+  }
 
   function startDragSession(id) {
     const entry = entries.get(id)
     const armed = pressed
     pressed = false
     dragSession = null
+    endPendingDrop()
     if (!armed || !movable(entry)) return false
     const session = { entry, stripLoad }
     dragSession = session
@@ -824,7 +833,10 @@ function createTabWindow({
     const session = dragSession
     dragSession = null
     if (!session || session.entry !== entries.get(id) || session.stripLoad !== stripLoad || !alive()) return false
-    onDragEnd(id)
+    endPendingDrop()
+    const drop = { live: true }
+    pendingDrop = drop
+    onDragEnd(id, () => drop.live && pendingDrop === drop && entries.get(id) === session.entry && alive())
     return true
   }
 
@@ -858,8 +870,10 @@ function createTabWindow({
     const request = slotRequest
     if (!request || !answer || typeof answer !== 'object' || answer.requestId !== request.requestId) return false
     const order = list.ids().filter((id) => id !== HOME_ID && entries.has(id))
+    // Checked entry by entry against this window's own order (a sparse
+    // array would skip holes in its own every()).
     const sameOrder = Array.isArray(answer.order) && answer.order.length === order.length &&
-      answer.order.every((id, index) => id === order[index])
+      order.every((id, index) => answer.order[index] === id)
     const { index } = answer
     const valid = request.stripLoad === stripLoad && sameOrder &&
       Number.isSafeInteger(index) && index >= 0 && index <= order.length
@@ -873,6 +887,7 @@ function createTabWindow({
     stripLoad++
     pressed = false
     endDragSession()
+    endPendingDrop()
     settleSlot(null)
   }
 
@@ -927,6 +942,9 @@ function createTabWindow({
   strip.on('did-start-loading', stripChanged)
   host.on('hide', stripChanged)
   host.on('minimize', stripChanged)
+  // A slot answer is for the window where it was asked: moved or resized
+  // since, its x no longer means the same place.
+  for (const name of ['move', 'resize']) host.on(name, () => settleSlot(null))
   const reloadStrip = () => { if (alive()) strip.loadURL(shellUrl).catch(() => {}) }
   strip.on('render-process-gone', () => { stripChanged(); schedule(reloadStrip) })
   strip.on('did-fail-load', (_event, code, _description, url, isMainFrame) => {
@@ -998,6 +1016,7 @@ function createTabWindow({
     }
     readyCallbacks.length = 0
     endDragSession()
+    endPendingDrop()
     settleSlot(null)
     if (!strip.isDestroyed()) strip.close()
     disposed = true

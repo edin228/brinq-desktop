@@ -59,7 +59,7 @@ function createTabWindows({
       canMove,
       movesHeld: anyClosing,
       onTabsChanged: changed,
-      onDragEnd: (id) => { dropTab(tabWindow, id).catch(() => {}) },
+      onDragEnd: (id, stillLive) => { dropTab(tabWindow, id, stillLive).catch(() => {}) },
     })
     windows.push(tabWindow)
     focusOrder.push(tabWindow)
@@ -170,24 +170,22 @@ function createTabWindows({
   // over its own strip nothing happens; anywhere else it opens in a new
   // window there (not the only tab of a secondary window: that snaps back).
   // Every refusal leaves the tab where it was.
-  let dropping = false
-  async function dropTab(source, id) {
-    if (dropping || !alive(source) || isQuitting() || !source.movable(id)) return false
+  // `stillLive()`: the source's word that this release still stands (no
+  // newer drag, no reload, not hidden or closed, same tab). Only the latest
+  // release counts.
+  let latestDrop = 0
+  async function dropTab(source, id, stillLive = () => true) {
+    const drop = ++latestDrop
+    if (!alive(source) || isQuitting() || !source.movable(id)) return false
     const point = cursorPoint()
     if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return false
     const target = stripAt(point)
     if (target === source) return false
     if (!target) return moveToNewWindow(source, id, { at: { x: Math.round(point.x), y: Math.round(point.y) } })
     if (!receives(target)) return false
-    dropping = true
-    let position
-    try {
-      position = await target.requestSlot(Math.round(point.x - target.contentArea().x))
-    } finally {
-      dropping = false
-    }
+    const position = await target.requestSlot(Math.round(point.x - target.contentArea().x))
     // Everything is checked again: the answer took a moment.
-    if (position === null || !alive(source) || !source.movable(id) || !receives(target)) return false
+    if (position === null || drop !== latestDrop || !stillLive() || !alive(source) || !source.movable(id) || !receives(target)) return false
     const movedId = moveTab(source, id, target, { position })
     if (movedId === null) return false
     target.select(movedId)
